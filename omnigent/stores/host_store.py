@@ -16,17 +16,26 @@ import json
 import logging
 from dataclasses import dataclass
 
-from sqlalchemy import Engine, select, update
+from sqlalchemy import Engine, or_, select, update
 from sqlalchemy import delete as sql_delete
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlHost,
+    SqlHostPermission,
     current_workspace_id,
 )
-from omnigent.db.enum_codecs import decode_host_status, encode_host_status
+from omnigent.db.enum_codecs import (
+    decode_host_permission_level,
+    decode_host_status,
+    encode_host_permission_level,
+    encode_host_status,
+)
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
 
 # A host is considered live only if its row was touched (connect or
@@ -81,6 +90,47 @@ class Host:
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+
+
+@dataclass
+class HostGrant:
+    """
+    An access grant letting a non-owner use someone else's host.
+
+    Ownership is never a grant — it stays ``Host.owner`` and is always
+    implicitly allowed, so a grant only ever widens access.
+
+    :param host_id: The shared host, e.g. ``"host_a1b2c3d4..."``.
+    :param user_id: The grantee, e.g. ``"bob@example.com"``.
+    :param level: ``"read"`` (visible in the picker, metadata readable)
+        or ``"use"`` (additionally launch sessions and browse files).
+    :param created_at: Unix epoch seconds the grant was made.
+    """
+
+    host_id: str
+    user_id: str
+    level: str
+    created_at: int
+
+
+# Access levels, ordered by privilege — compare codes to test "at least".
+HOST_LEVEL_READ = "read"
+HOST_LEVEL_USE = "use"
+
+
+def _row_to_grant(row: SqlHostPermission) -> HostGrant:
+    """
+    Convert a :class:`SqlHostPermission` ORM row to a :class:`HostGrant`.
+
+    :param row: The SQLAlchemy ORM row to convert.
+    :returns: A :class:`HostGrant` dataclass instance.
+    """
+    return HostGrant(
+        host_id=row.host_id,
+        user_id=row.user_id,
+        level=decode_host_permission_level(row.level),
+        created_at=row.created_at,
+    )
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -254,6 +304,17 @@ class HostStore:
                     )
                 # Known host_id (same owner, or reown opted in): update
                 # owner/name in case they changed, then refresh status and timestamp.
+                if row.owner != owner:
+                    # Ownership changed: the previous owner's sharing
+                    # decisions don't bind the new one, so drop the
+                    # grants rather than silently carrying a teammate's
+                    # access onto a machine that changed hands.
+                    session.execute(
+                        sql_delete(SqlHostPermission).where(
+                            SqlHostPermission.workspace_id == current_workspace_id(),
+                            SqlHostPermission.host_id == host_id,
+                        )
+                    )
                 row.owner = owner
                 row.name = name
                 row.status = encode_host_status("online")
@@ -389,6 +450,19 @@ class HostStore:
         session.add(new_row)
         session.flush()
 
+        # Repoint access grants at the rotated host_id. It is the same
+        # physical machine under a new id, so a teammate's access must
+        # survive the rotation rather than silently disappearing.
+        session.execute(
+            update(SqlHostPermission)
+            .where(
+                SqlHostPermission.workspace_id == current_workspace_id(),
+                SqlHostPermission.host_id == old_host_id,
+            )
+            .values(host_id=new_host_id)
+        )
+        session.flush()
+
         if bound_ids:
             session.execute(
                 update(SqlConversationMetadata)
@@ -459,6 +533,16 @@ class HostStore:
                 configured_harnesses=configured_harnesses_json,
             )
         )
+        if existing.owner != owner:
+            # The previous owner's sharing decisions don't bind the new
+            # one — drop the grants rather than let them silently carry
+            # a teammate's access across an ownership change.
+            session.execute(
+                sql_delete(SqlHostPermission).where(
+                    SqlHostPermission.workspace_id == current_workspace_id(),
+                    SqlHostPermission.host_id == host_id,
+                )
+            )
         return Host(
             host_id=host_id,
             name=name,
@@ -596,6 +680,168 @@ class HostStore:
                 .all()
             )
             return [_row_to_host(row) for row in rows]
+
+    def list_hosts_accessible_by(self, user_id: str) -> list[Host]:
+        """
+        List hosts the user owns OR has been granted access to.
+
+        Backs the host picker for shared team hosts: a host registered
+        by a teammate appears here once they grant this user access.
+        Ordered by ``updated_at`` descending, like :meth:`list_hosts`.
+
+        The grant join is an ``EXISTS`` against the
+        ``ix_host_permissions_user_id`` index, so this stays a single
+        index-served query rather than reading the workspace's hosts
+        and filtering in Python.
+
+        :param user_id: The caller, e.g. ``"bob@example.com"``.
+        :returns: List of :class:`Host` entities, owned and shared.
+        """
+        with self._session() as session:
+            grant_exists = (
+                select(SqlHostPermission.host_id)
+                .where(
+                    SqlHostPermission.workspace_id == current_workspace_id(),
+                    SqlHostPermission.user_id == user_id,
+                    SqlHostPermission.host_id == SqlHost.host_id,
+                )
+                .exists()
+            )
+            rows = (
+                session.query(SqlHost)
+                .filter(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    or_(SqlHost.owner == user_id, grant_exists),
+                )
+                .order_by(SqlHost.updated_at.desc())
+                .all()
+            )
+            return [_row_to_host(row) for row in rows]
+
+    def grant_host_access(self, host_id: str, user_id: str, level: str = HOST_LEVEL_USE) -> None:
+        """
+        Grant a user access to a host they do not own.
+
+        Upserts, so re-sharing changes the level instead of appending a
+        second grant, and two concurrent shares cannot lose one
+        another's write. The caller is responsible for authorization —
+        only the host's owner may share it.
+
+        Granting to the host's own owner is a no-op: ownership already
+        implies full access, and a redundant row would outlive an
+        ownership change.
+
+        :param host_id: The host to share, e.g. ``"host_a1b2c3d4..."``.
+        :param user_id: The grantee, e.g. ``"bob@example.com"``.
+        :param level: ``"read"`` or ``"use"`` (default). See
+            :class:`HostGrant`.
+        :raises ValueError: If *level* is not a known access level.
+        """
+        code = encode_host_permission_level(level)
+        with self._session() as session:
+            host = session.execute(
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+            ).scalar_one_or_none()
+            if host is None or host.owner == user_id:
+                return
+
+            values = {
+                "host_id": host_id,
+                "user_id": user_id,
+                "level": code,
+                "created_at": now_epoch(),
+            }
+            index_elements = ["workspace_id", "host_id", "user_id"]
+            dialect = self._engine.dialect.name
+            if dialect == "sqlite":
+                stmt = (
+                    sqlite_insert(SqlHostPermission)
+                    .values(**values)
+                    .on_conflict_do_update(index_elements=index_elements, set_={"level": code})
+                )
+            elif dialect == "mysql":
+                stmt = (
+                    mysql_insert(SqlHostPermission)
+                    .values(**values)
+                    .on_duplicate_key_update(level=code)
+                )
+            else:
+                stmt = (
+                    pg_insert(SqlHostPermission)
+                    .values(**values)
+                    .on_conflict_do_update(index_elements=index_elements, set_={"level": code})
+                )
+            session.execute(stmt)
+
+    def revoke_host_access(self, host_id: str, user_id: str) -> bool:
+        """
+        Revoke a user's granted access to a host.
+
+        A plain delete — it can never strip the owner, whose access is
+        ``hosts.owner``, not a grant. No-op when no grant exists.
+
+        :param host_id: The shared host, e.g. ``"host_a1b2c3d4..."``.
+        :param user_id: The grantee to revoke, e.g. ``"bob@example.com"``.
+        :returns: ``True`` if a grant was deleted, ``False`` if none existed.
+        """
+        with self._session() as session:
+            result = session.execute(
+                sql_delete(SqlHostPermission).where(
+                    SqlHostPermission.workspace_id == current_workspace_id(),
+                    SqlHostPermission.host_id == host_id,
+                    SqlHostPermission.user_id == user_id,
+                )
+            )
+            return result.rowcount > 0
+
+    def get_host_access_level(self, host_id: str, user_id: str) -> str | None:
+        """
+        Return a user's granted access level on a host, if any.
+
+        Grants only — an owner has no grant row, so callers must treat
+        ownership separately (see
+        :func:`omnigent.server.routes._host_launch.resolve_host_owner`).
+
+        :param host_id: The host, e.g. ``"host_a1b2c3d4..."``.
+        :param user_id: The user, e.g. ``"bob@example.com"``.
+        :returns: ``"read"`` / ``"use"``, or ``None`` if not granted.
+        """
+        with self._session() as session:
+            row = session.execute(
+                select(SqlHostPermission).where(
+                    SqlHostPermission.workspace_id == current_workspace_id(),
+                    SqlHostPermission.host_id == host_id,
+                    SqlHostPermission.user_id == user_id,
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            return decode_host_permission_level(row.level)
+
+    def list_host_grants(self, host_id: str) -> list[HostGrant]:
+        """
+        List every grant on a host, oldest first.
+
+        Powers the owner-facing "shared with" list. The owner is not
+        included — ownership is not a grant.
+
+        :param host_id: The host to query, e.g. ``"host_a1b2c3d4..."``.
+        :returns: List of :class:`HostGrant` objects.
+        """
+        with self._session() as session:
+            rows = (
+                session.query(SqlHostPermission)
+                .filter(
+                    SqlHostPermission.workspace_id == current_workspace_id(),
+                    SqlHostPermission.host_id == host_id,
+                )
+                .order_by(SqlHostPermission.created_at, SqlHostPermission.user_id)
+                .all()
+            )
+            return [_row_to_grant(row) for row in rows]
 
     def get_host(self, host_id: str) -> Host | None:
         """
@@ -759,6 +1005,15 @@ class HostStore:
                 sql_delete(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id == host_id,
+                )
+            )
+            # Grants are not FK-cascaded (Rule R032), so drop them here.
+            # A stale grant would otherwise silently re-authorize a
+            # teammate if this host_id were ever reused.
+            session.execute(
+                sql_delete(SqlHostPermission).where(
+                    SqlHostPermission.workspace_id == current_workspace_id(),
+                    SqlHostPermission.host_id == host_id,
                 )
             )
 

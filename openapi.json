@@ -5544,6 +5544,31 @@
         "title": "SetSharingRequest",
         "type": "object"
       },
+      "ShareHostRequest": {
+        "description": "Request body for `POST /v1/hosts/{host_id}/share`.",
+        "properties": {
+          "level": {
+            "default": "use",
+            "description": "`\"read\"` to let them see the host in their picker, or `\"use\"` (default) to additionally let them run sessions on it and browse its files.",
+            "enum": [
+              "read",
+              "use"
+            ],
+            "title": "Level",
+            "type": "string"
+          },
+          "user_id": {
+            "description": "The teammate to grant access to, e.g. `\"bob@example.com\"`.",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ],
+        "title": "ShareHostRequest",
+        "type": "object"
+      },
       "SkillSummary": {
         "description": "Safe subset of a discovered skill for API exposure.\n\nSurfaces the skill name and one-line description so clients\n(e.g. the web composer's slash-command menu) can list which\nskills the session has access to. The full skill `content`\nis intentionally omitted \u2014 it's only loaded server-side when\nthe harness invokes the skill, and it can be large.",
         "properties": {
@@ -6573,7 +6598,7 @@
     },
     "/v1/hosts": {
       "get": {
-        "description": "List all hosts owned by the authenticated user.\n\nReturns both online and offline hosts, with live runner\ninformation for online hosts.\n\n**Returns:** `{\"hosts\": [...]}` with host details.",
+        "description": "List the hosts the authenticated user can reach.\n\nHosts they own, plus hosts a teammate has shared with them\n(see `POST /hosts/{host_id}/share`). Returns both online and\noffline hosts, with live runner information for online hosts.\n\n**Returns:** `{\"hosts\": [...]}` with host details.",
         "operationId": "list_hosts_v1_hosts_get",
         "responses": {
           "200": {
@@ -6603,7 +6628,7 @@
     },
     "/v1/hosts/{host_id}": {
       "get": {
-        "description": "Get details for a single host.\n\n**Returns:** Host details dict.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist.",
+        "description": "Get details for a single host.\n\n**Returns:** Host details dict.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist; 403 if the caller neither owns it nor has been granted access.",
         "operationId": "get_host_v1_hosts__host_id__get",
         "parameters": [
           {
@@ -6950,6 +6975,168 @@
           }
         },
         "summary": "Launch Runner",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/share": {
+      "get": {
+        "description": "List who a host you own is shared with.\n\n**Returns:** `{\"shares\": [...]}`, oldest grant first. The owner is not listed \u2014 ownership is not a grant.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist; 403 if the caller does not own it.",
+        "operationId": "list_host_shares_v1_hosts__host_id__share_get",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response List Host Shares V1 Hosts  Host Id  Share Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Host Shares",
+        "tags": [
+          "hosts"
+        ]
+      },
+      "post": {
+        "description": "Grant a teammate access to a host you own.\n\nOnly the owner may share, and sharing does not transfer\nownership \u2014 the grantee cannot re-share or delete the host.\nIdempotent: re-sharing to the same user updates their level.\n\n**Parameters**\n\n- `body` \u2014 The grantee and access level.\n\n**Returns:** The resulting grant.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist; 403 if the caller does not own it; 400 if sharing with yourself.",
+        "operationId": "share_host_v1_hosts__host_id__share_post",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShareHostRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Share Host V1 Hosts  Host Id  Share Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Share Host",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/share/{shared_user_id}": {
+      "delete": {
+        "description": "Revoke a teammate's access to a host you own.\n\nSessions the grantee already started keep running \u2014 this stops\nnew launches. Stop them explicitly if that matters.\n\n**Returns:** `{\"revoked\": bool}` \u2014 `False` when no grant existed.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist; 403 if the caller does not own it.",
+        "operationId": "unshare_host_v1_hosts__host_id__share__shared_user_id__delete",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The grantee to revoke, e.g. `\"bob@example.com\"`.",
+            "in": "path",
+            "name": "shared_user_id",
+            "required": true,
+            "schema": {
+              "title": "Shared User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Unshare Host V1 Hosts  Host Id  Share  Shared User Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unshare Host",
         "tags": [
           "hosts"
         ]

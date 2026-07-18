@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -40,10 +40,19 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._host_launch import resolve_host_launch
+from omnigent.server.routes._host_launch import (
+    resolve_host_access,
+    resolve_host_launch,
+    resolve_host_owner,
+)
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.host_store import HostStore, host_is_live
+from omnigent.stores.host_store import (
+    HOST_LEVEL_READ,
+    HOST_LEVEL_USE,
+    HostStore,
+    host_is_live,
+)
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -205,6 +214,20 @@ class CreateDirectoryRequest(BaseModel):
     path: str
 
 
+class ShareHostRequest(BaseModel):
+    """Request body for ``POST /v1/hosts/{host_id}/share``.
+
+    :param user_id: The teammate to grant access to, e.g.
+        ``"bob@example.com"``.
+    :param level: ``"read"`` to let them see the host in their picker,
+        or ``"use"`` (default) to additionally let them run sessions on
+        it and browse its files.
+    """
+
+    user_id: str
+    level: Literal["read", "use"] = HOST_LEVEL_USE
+
+
 class LaunchRunnerRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{host_id}/runners``.
 
@@ -320,22 +343,24 @@ def create_hosts_router(
 
     @router.get("/hosts")
     async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:
-        """List all hosts owned by the authenticated user.
+        """List the hosts the authenticated user can reach.
 
-        Returns both online and offline hosts, with live runner
-        information for online hosts.
+        Hosts they own, plus hosts a teammate has shared with them
+        (see ``POST /hosts/{host_id}/share``). Returns both online and
+        offline hosts, with live runner information for online hosts.
 
         :param request: The incoming request (for auth).
         :returns: ``{"hosts": [...]}`` with host details.
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
-        # server's hosts are owned by the reserved "local" user.
+        # server's hosts are owned by the reserved "local" user, and
+        # sharing is meaningless, so the owned-only list is correct.
         user_id = require_user(request, auth_provider)
         if user_id is None:
             hosts = await asyncio.to_thread(host_store.list_hosts, "local")
         else:
-            hosts = await asyncio.to_thread(host_store.list_hosts, user_id)
+            hosts = await asyncio.to_thread(host_store.list_hosts_accessible_by, user_id)
 
         # One clock for the whole batch so every host is classified
         # against a consistent "now" (host_is_live's documented idiom).
@@ -364,6 +389,10 @@ def create_hosts_router(
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
                     "configured_harnesses": host.configured_harnesses,
+                    # Lets the picker mark a teammate's shared host
+                    # ("corey-laptop — alice@example.com") and hide
+                    # owner-only affordances like delete/share.
+                    "is_owned_by_me": user_id is None or host.owner == user_id,
                 }
             )
         return {"hosts": result}
@@ -376,19 +405,23 @@ def create_hosts_router(
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
         :returns: Host details dict.
-        :raises HTTPException: 404 if the host does not exist.
+        :raises HTTPException: 404 if the host does not exist; 403 if
+            the caller neither owns it nor has been granted access.
         """
         # require_user: with an auth provider configured, an
         # unauthenticated caller must get 401 here — get_user_id would
-        # return None and the ownership check below would be skipped,
+        # return None and the access check below would be skipped,
         # exposing another user's host. user_id is None only when auth
         # is disabled entirely (single-user server).
         user_id = require_user(request, auth_provider)
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        # Metadata only, so a "read" grant is enough.
+        host = await asyncio.to_thread(
+            resolve_host_access,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+            required_level=HOST_LEVEL_READ,
+        )
 
         # Status comes from the DB so the answer is consistent across
         # replicas, gated on the liveness freshness window — see
@@ -404,6 +437,105 @@ def create_hosts_router(
             "configured_harnesses": host.configured_harnesses,
             "runners": [],
         }
+
+    @router.post("/hosts/{host_id}/share")
+    async def share_host(
+        request: Request,
+        host_id: str,
+        body: ShareHostRequest,
+    ) -> dict[str, Any]:
+        """Grant a teammate access to a host you own.
+
+        Only the owner may share, and sharing does not transfer
+        ownership — the grantee cannot re-share or delete the host.
+        Idempotent: re-sharing to the same user updates their level.
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param body: The grantee and access level.
+        :returns: The resulting grant.
+        :raises HTTPException: 404 if the host does not exist; 403 if
+            the caller does not own it; 400 if sharing with yourself.
+        """
+        user_id = require_user(request, auth_provider)
+        # resolve_host_owner, NOT resolve_host_access: a grantee must
+        # not be able to widen access to someone else's machine.
+        await asyncio.to_thread(
+            resolve_host_owner,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+        )
+
+        if user_id is not None and body.user_id == user_id:
+            raise HTTPException(status_code=400, detail="cannot share a host with yourself")
+
+        await asyncio.to_thread(
+            host_store.grant_host_access,
+            host_id,
+            body.user_id,
+            body.level,
+        )
+        return {"host_id": host_id, "user_id": body.user_id, "level": body.level}
+
+    @router.get("/hosts/{host_id}/share")
+    async def list_host_shares(request: Request, host_id: str) -> dict[str, list[dict[str, Any]]]:
+        """List who a host you own is shared with.
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: ``{"shares": [...]}``, oldest grant first. The owner
+            is not listed — ownership is not a grant.
+        :raises HTTPException: 404 if the host does not exist; 403 if
+            the caller does not own it.
+        """
+        user_id = require_user(request, auth_provider)
+        await asyncio.to_thread(
+            resolve_host_owner,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+        )
+        grants = await asyncio.to_thread(host_store.list_host_grants, host_id)
+        return {
+            "shares": [
+                {"user_id": g.user_id, "level": g.level, "created_at": g.created_at}
+                for g in grants
+            ]
+        }
+
+    @router.delete("/hosts/{host_id}/share/{shared_user_id}")
+    async def unshare_host(
+        request: Request,
+        host_id: str,
+        shared_user_id: str,
+    ) -> dict[str, Any]:
+        """Revoke a teammate's access to a host you own.
+
+        Sessions the grantee already started keep running — this stops
+        new launches. Stop them explicitly if that matters.
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param shared_user_id: The grantee to revoke, e.g.
+            ``"bob@example.com"``.
+        :returns: ``{"revoked": bool}`` — ``False`` when no grant existed.
+        :raises HTTPException: 404 if the host does not exist; 403 if
+            the caller does not own it.
+        """
+        user_id = require_user(request, auth_provider)
+        await asyncio.to_thread(
+            resolve_host_owner,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+        )
+        revoked = await asyncio.to_thread(
+            host_store.revoke_host_access,
+            host_id,
+            shared_user_id,
+        )
+        return {"host_id": host_id, "user_id": shared_user_id, "revoked": revoked}
 
     @router.post("/hosts/{host_id}/runners")
     async def launch_runner(
@@ -795,17 +927,19 @@ def create_hosts_router(
         :raises HTTPException: See per-route docstrings for codes.
         """
         # require_user: unauthenticated callers 401 instead of slipping
-        # past the owner check below as None (see get_host above).
+        # past the access check below as None (see get_host above).
         user_id = require_user(request, auth_provider)
 
-        # Owner check: load the host record, fail with 404 if it
-        # doesn't exist (don't leak existence to non-owners), fail
-        # with 403 only when an authenticated caller doesn't own it.
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        # Access check: 404 if the host doesn't exist (don't leak
+        # existence), 403 if an authenticated caller neither owns it
+        # nor holds a "use" grant. Reading the owner's filesystem is
+        # "use", not "read" — "read" is host metadata only.
+        host = await asyncio.to_thread(
+            resolve_host_access,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+        )
 
         if "\x00" in path:
             raise HTTPException(
@@ -879,14 +1013,16 @@ def create_hosts_router(
             validation, 504 on host timeout, 502 on host I/O failure.
         """
         # require_user: unauthenticated callers 401 instead of slipping
-        # past the owner check below as None.
+        # past the access check below as None.
         user_id = require_user(request, auth_provider)
 
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        # Writing to the owner's filesystem requires "use".
+        host = await asyncio.to_thread(
+            resolve_host_access,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+        )
 
         path = body.path
         if not path.strip():
@@ -966,14 +1102,16 @@ def create_hosts_router(
         )
 
         # require_user: unauthenticated callers 401 instead of slipping
-        # past the owner check below as None.
+        # past the access check below as None.
         user_id = require_user(request, auth_provider)
 
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
+        # Enumerating the owner's worktrees requires "use".
+        host = await asyncio.to_thread(
+            resolve_host_access,
+            user_id=user_id,
+            host_id=host_id,
+            host_store=host_store,
+        )
 
         if not path.strip():
             raise HTTPException(status_code=400, detail="path must not be empty")

@@ -98,6 +98,13 @@ HOST_STATUS: dict[str, int] = {
     "offline": 2,
 }
 
+# Ordered by privilege: a check for "at least use" compares codes, so
+# any level added later must keep the codes monotonic in privilege.
+HOST_PERMISSION_LEVEL: dict[str, int] = {
+    "read": 1,
+    "use": 2,
+}
+
 AGENT_KIND: dict[str, int] = {
     "template": 1,
     "session": 2,
@@ -288,6 +295,16 @@ def encode_host_status(name: str) -> int:
 def decode_host_status(code: int) -> str:
     """Decode a ``hosts.status`` int code to its name."""
     return _decode(HOST_STATUS, code, field="hosts.status")
+
+
+def encode_host_permission_level(name: str) -> int:
+    """Encode a ``host_permissions.level`` name to its int code."""
+    return _encode(HOST_PERMISSION_LEVEL, name, field="host_permissions.level")
+
+
+def decode_host_permission_level(code: int) -> str:
+    """Decode a ``host_permissions.level`` int code to its name."""
+    return _decode(HOST_PERMISSION_LEVEL, code, field="host_permissions.level")
 
 
 def encode_agent_kind(name: str) -> int:

@@ -1259,6 +1259,64 @@ class SqlHost(OmnigentBase):
     )
 
 
+class SqlHostPermission(OmnigentBase):
+    """
+    SQLAlchemy model for the ``host_permissions`` table.
+
+    An access grant letting a user who is NOT a host's owner use that
+    host — the backing store for shared team hosts, where one person
+    registers a machine (``omnigent host``) and lets teammates run
+    sessions on it.
+
+    Ownership itself is NOT a row here: it stays ``hosts.owner``, and
+    the owner is always implicitly allowed. A row grants access to
+    someone else, so revoking is a delete and can never orphan a host.
+    One row per ``(host_id, user_id)`` — re-sharing upserts the level
+    rather than appending, so a grant cannot be duplicated and two
+    concurrent shares cannot lose one another's write.
+
+    :param host_id: The host being shared, relating to
+        ``hosts.host_id`` (no DB FK — schema Rule R032), e.g.
+        ``"host_a1b2c3d4..."``.
+    :param user_id: The grantee, e.g. ``"bob@example.com"``. Never the
+        owner — an owner grant would be redundant with ``hosts.owner``.
+    :param level: Access level as a stable int code (see
+        :data:`omnigent.db.enum_codecs.HOST_PERMISSION_LEVEL`):
+        ``read`` (1) sees the host in the picker and reads its
+        metadata; ``use`` (2) additionally launches sessions on it and
+        browses its filesystem. Owner-only operations (delete, launch
+        token revoke, tunnel claim) are never reachable by a grant at
+        any level.
+    :param created_at: Unix epoch seconds when the grant was made.
+    """
+
+    __tablename__ = "host_permissions"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    host_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    level: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer)
+
+    __table_args__ = (
+        CheckConstraint(
+            "level IN (1, 2)",
+            name="ck_host_permissions_level",
+        ),
+        # The host picker resolves a user's shared hosts on every load
+        # (WHERE workspace_id = ? AND user_id = ?), so keep it index-served
+        # instead of scanning every grant in the workspace.
+        Index("ix_host_permissions_user_id", "workspace_id", "user_id", "host_id"),
+    )
+
+
 class SqlUserDailyCost(OmnigentBase):
     """
     SQLAlchemy model for the ``user_daily_cost`` table.

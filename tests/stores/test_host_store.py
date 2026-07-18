@@ -895,3 +895,214 @@ def test_register_managed_host_refuses_cross_owner_recredential(db_uri: str) -> 
     assert resolved.owner == "alice@example.com"
     assert resolved.sandbox_id == "sb-m7"
     assert store.resolve_launch_token("bob-token-7") is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SHARED TEAM HOSTS — access grants
+# ─────────────────────────────────────────────────────────────────────
+
+ALICE = "alice@example.com"
+BOB = "bob@example.com"
+CAROL = "carol@example.com"
+HOST_A = "aaaa0000aaaa0000aaaa0000aaaa0000"
+HOST_B = "bbbb1111bbbb1111bbbb1111bbbb1111"
+
+
+def _register(store: HostStore, host_id: str, name: str, owner: str) -> Host:
+    """Register a host so grant tests have a real row to hang off.
+
+    :param store: The store under test.
+    :param host_id: Host id to register.
+    :param name: Host name.
+    :param owner: Owning user.
+    :returns: The registered :class:`Host`.
+    """
+    return store.upsert_on_connect(host_id=host_id, name=name, owner=owner)
+
+
+def test_grant_makes_host_visible_to_grantee(host_store: HostStore) -> None:
+    """
+    Verify a granted user sees the owner's host in their picker while
+    a third party does not.
+
+    This is the core of shared team hosts: if the grantee's list is
+    empty, sharing never reaches the UI; if Carol's list is non-empty,
+    the grant leaks to users it was never given to.
+    """
+    _register(host_store, HOST_A, "alice-laptop", ALICE)
+
+    # Before sharing, only Alice sees it.
+    assert [h.host_id for h in host_store.list_hosts_accessible_by(ALICE)] == [HOST_A]
+    assert host_store.list_hosts_accessible_by(BOB) == []
+
+    host_store.grant_host_access(HOST_A, BOB)
+
+    assert [h.host_id for h in host_store.list_hosts_accessible_by(BOB)] == [HOST_A]
+    # The owner still sees it, exactly once — the grant must not
+    # duplicate the row into the owner's own listing.
+    assert [h.host_id for h in host_store.list_hosts_accessible_by(ALICE)] == [HOST_A]
+    # An unrelated user is unaffected.
+    assert host_store.list_hosts_accessible_by(CAROL) == []
+
+
+def test_accessible_listing_merges_owned_and_shared(host_store: HostStore) -> None:
+    """
+    Verify the listing unions owned and shared hosts and stays ordered
+    by recency, so a shared host can't jump the picker's sort.
+    """
+    _register(host_store, HOST_A, "alice-laptop", ALICE)
+    _register(host_store, HOST_B, "bob-laptop", BOB)
+    host_store.grant_host_access(HOST_A, BOB)
+
+    # HOST_A is older than HOST_B, so Bob's own host sorts first.
+    _set_updated_at(host_store._engine.url.render_as_string(hide_password=False), HOST_A, 100)
+    _set_updated_at(host_store._engine.url.render_as_string(hide_password=False), HOST_B, 200)
+
+    assert [h.host_id for h in host_store.list_hosts_accessible_by(BOB)] == [HOST_B, HOST_A]
+
+
+def test_grant_is_idempotent_and_updates_level(host_store: HostStore) -> None:
+    """
+    Verify re-granting upserts rather than appending.
+
+    The JSON-array alternative appends, so a double-share duplicates
+    the user and a concurrent share silently loses a write.
+    """
+    _register(host_store, HOST_A, "alice-laptop", ALICE)
+
+    host_store.grant_host_access(HOST_A, BOB, "read")
+    host_store.grant_host_access(HOST_A, BOB, "use")
+    host_store.grant_host_access(HOST_A, BOB, "use")
+
+    grants = host_store.list_host_grants(HOST_A)
+    assert len(grants) == 1
+    assert grants[0].user_id == BOB
+    assert grants[0].level == "use"
+    assert host_store.get_host_access_level(HOST_A, BOB) == "use"
+
+
+def test_grant_to_owner_is_noop(host_store: HostStore) -> None:
+    """
+    Verify granting to the host's own owner writes nothing.
+
+    Ownership already implies access; a redundant grant row would
+    outlive an ownership change and silently re-authorize the old owner.
+    """
+    _register(host_store, HOST_A, "alice-laptop", ALICE)
+    host_store.grant_host_access(HOST_A, ALICE)
+
+    assert host_store.list_host_grants(HOST_A) == []
+    assert host_store.get_host_access_level(HOST_A, ALICE) is None
+
+
+def test_grant_on_unknown_host_is_noop(host_store: HostStore) -> None:
+    """
+    Verify granting on a host that doesn't exist writes nothing.
+
+    There is no FK (Rule R032), so a grant against a bogus host_id
+    would otherwise persist and pre-authorize that id if it were ever
+    registered later.
+    """
+    host_store.grant_host_access("deadbeefdeadbeefdeadbeefdeadbeef", BOB)
+    assert host_store.list_host_grants("deadbeefdeadbeefdeadbeefdeadbeef") == []
+
+
+def test_revoke_removes_access(host_store: HostStore) -> None:
+    """
+    Verify revoke drops the grant and reports whether one existed.
+    """
+    _register(host_store, HOST_A, "alice-laptop", ALICE)
+    host_store.grant_host_access(HOST_A, BOB)
+
+    assert host_store.revoke_host_access(HOST_A, BOB) is True
+    assert host_store.list_hosts_accessible_by(BOB) == []
+    assert host_store.get_host_access_level(HOST_A, BOB) is None
+    # Second revoke is a no-op, not an error.
+    assert host_store.revoke_host_access(HOST_A, BOB) is False
+
+
+def test_revoke_cannot_strip_owner(host_store: HostStore) -> None:
+    """
+    Verify revoking the owner leaves their access intact.
+
+    Ownership lives in hosts.owner, not in a grant row, so there is
+    nothing for a revoke to delete — the owner cannot lock themselves
+    out of their own machine.
+    """
+    _register(host_store, HOST_A, "alice-laptop", ALICE)
+
+    assert host_store.revoke_host_access(HOST_A, ALICE) is False
+    assert [h.host_id for h in host_store.list_hosts_accessible_by(ALICE)] == [HOST_A]
+
+
+def test_grants_are_dropped_when_host_deleted(host_store: HostStore) -> None:
+    """
+    Verify deleting a host removes its grants.
+
+    Grants are not FK-cascaded, so a leftover row would silently
+    re-authorize Bob if the host_id were ever reused.
+    """
+    _register(host_store, HOST_A, "alice-laptop", ALICE)
+    host_store.grant_host_access(HOST_A, BOB)
+
+    host_store.delete_host(HOST_A)
+    assert host_store.list_host_grants(HOST_A) == []
+
+    # Re-registering the same id must not resurrect Bob's access.
+    _register(host_store, HOST_A, "alice-laptop", ALICE)
+    assert host_store.list_hosts_accessible_by(BOB) == []
+
+
+def test_grants_follow_host_id_rotation(host_store: HostStore) -> None:
+    """
+    Verify a grant survives host_id rotation.
+
+    A user regenerating config.yaml reconnects the same physical
+    machine under a new host_id; the row is delete+reinserted. Bob's
+    access must follow it rather than vanishing.
+    """
+    _register(host_store, HOST_A, "alice-laptop", ALICE)
+    host_store.grant_host_access(HOST_A, BOB)
+
+    # Same (owner, name) reconnecting with a new id rotates the row.
+    rotated = host_store.upsert_on_connect(host_id=HOST_B, name="alice-laptop", owner=ALICE)
+    assert rotated.host_id == HOST_B
+
+    assert [h.host_id for h in host_store.list_hosts_accessible_by(BOB)] == [HOST_B]
+    assert host_store.get_host_access_level(HOST_B, BOB) == "use"
+    assert host_store.list_host_grants(HOST_A) == []
+
+
+def test_grants_dropped_when_host_reowned(host_store: HostStore) -> None:
+    """
+    Verify re-owning a host clears its grants.
+
+    The previous owner's sharing decisions must not bind the new owner
+    — otherwise Bob keeps code-execution access to a machine that now
+    belongs to Carol, who never granted him anything.
+    """
+    _register(host_store, HOST_A, "alice-laptop", ALICE)
+    host_store.grant_host_access(HOST_A, BOB)
+
+    host_store.upsert_on_connect(
+        host_id=HOST_A,
+        name="carol-laptop",
+        owner=CAROL,
+        allow_host_id_reown=True,
+    )
+
+    assert host_store.list_host_grants(HOST_A) == []
+    assert host_store.list_hosts_accessible_by(BOB) == []
+    assert [h.host_id for h in host_store.list_hosts_accessible_by(CAROL)] == [HOST_A]
+
+
+def test_unknown_level_rejected(host_store: HostStore) -> None:
+    """
+    Verify an unknown access level is refused rather than stored.
+
+    The level is a CHECK-constrained int code; a typo must fail loudly
+    at the boundary, not persist as an unenforceable value.
+    """
+    _register(host_store, HOST_A, "alice-laptop", ALICE)
+    with pytest.raises(ValueError):
+        host_store.grant_host_access(HOST_A, BOB, "admin")
