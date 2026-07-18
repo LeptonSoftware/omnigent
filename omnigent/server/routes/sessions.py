@@ -6599,18 +6599,19 @@ async def _validate_session_workspace(
             code=ErrorCode.INTERNAL_ERROR,
         )
 
-    # Authorize host ownership FIRST — before loading the agent spec or
-    # the host.stat round-trip below. A non-owner must be rejected
-    # (403/404 via the shared resolve_host_owner) before we touch the
-    # host or even read the agent bundle (cross-user host probe). The
-    # returned host also gives the display name for error messages.
-    from omnigent.server.routes._host_launch import resolve_host_owner
+    # Authorize host access FIRST — before loading the agent spec or
+    # the host.stat round-trip below. A caller who neither owns the
+    # host nor holds a grant on it must be rejected (403/404 via the
+    # shared resolve_host_access) before we touch the host or even read
+    # the agent bundle (cross-user host probe). The returned host also
+    # gives the display name for error messages.
+    from omnigent.server.routes._host_launch import resolve_host_access
 
     host_name: str | None = None
     host_store_inst = getattr(request.app.state, "host_store", None)
     if host_store_inst is not None:
         host = await asyncio.to_thread(
-            resolve_host_owner,
+            resolve_host_access,
             user_id=user_id,
             host_id=host_id,
             host_store=host_store_inst,
