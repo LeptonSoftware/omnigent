@@ -1,0 +1,240 @@
+# gitleaks configuration — geoTaggedVideoPOC
+# =============================================================================
+# Complete Lepton secret-scanning ruleset. `useDefault = true` keeps all ~150
+# upstream gitleaks rules (AWS, GitHub, GitLab, Slack, Stripe, Twilio, Azure,
+# Heroku, private-key, JWT, etc.), and the rules below add every credential class
+# our GitHub audit found that the defaults miss.
+# =============================================================================
+title = "Lepton secret-scanning rules"
+
+[extend]
+useDefault = true
+
+# ============================ Google / GCP ==================================
+[[rules]]
+id = "google-api-key"
+description = "Google API key (Maps/Places/Geocoding/Firebase, AIza...)"
+regex = '''AIza[0-9A-Za-z_\-]{35}'''
+keywords = ["aiza"]
+
+[[rules]]
+id = "google-oauth-client-secret"
+description = "Google OAuth client secret (GOCSPX)"
+regex = '''\bGOCSPX-[A-Za-z0-9_-]{28}\b'''
+keywords = ["gocspx-"]
+
+[[rules]]
+id = "gcp-service-account-private-key-id"
+description = "GCP service-account JSON private_key_id"
+regex = '''"private_key_id"\s*:\s*"[0-9a-f]{40}"'''
+keywords = ["private_key_id"]
+
+[[rules]]
+id = "gcp-service-account-json"
+description = "GCP service-account JSON (type: service_account)"
+regex = '''"type"\s*:\s*"service_account"'''
+keywords = ["service_account"]
+
+# ============================ Supabase ======================================
+[[rules]]
+id = "supabase-url"
+description = "Supabase project URL (locator — not secret, but flags hardcoding)"
+regex = '''https://[a-z]{20}\.supabase\.(co|in|net)'''
+keywords = ["supabase"]
+
+[[rules]]
+id = "supabase-jwt-key"
+description = "Supabase anon / service_role JWT"
+regex = '''eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{20,}'''
+keywords = ["eyj"]
+
+[[rules]]
+id = "supabase-service-role-secret"
+description = "Supabase sb_secret_ service key"
+regex = '''sb_secret_[A-Za-z0-9_\-]{20,}'''
+keywords = ["sb_secret_"]
+
+# ============================ Maps / geo ====================================
+[[rules]]
+id = "mapbox-token"
+description = "Mapbox access token (public pk. / secret sk. / temp tk.)"
+regex = '''\b(pk|sk|tk)\.eyJ[\w-]{20,}\.[\w-]{20,}'''
+keywords = ["pk.eyj", "sk.eyj", "tk.eyj"]
+
+# ============================ AI / analytics ================================
+[[rules]]
+id = "openai-key"
+description = "OpenAI API key"
+regex = '''\bsk-(proj-)?[A-Za-z0-9_-]{20,}T3BlbkFJ[A-Za-z0-9_-]{20,}'''
+keywords = ["t3blbkfj"]
+
+[[rules]]
+id = "openai-key-legacy"
+description = "OpenAI legacy API key"
+regex = '''\bsk-[A-Za-z0-9]{48}\b'''
+keywords = ["sk-"]
+
+[[rules]]
+id = "anthropic-key"
+description = "Anthropic API key"
+regex = '''\bsk-ant-[A-Za-z0-9_-]{20,}'''
+keywords = ["sk-ant-"]
+
+[[rules]]
+id = "posthog-key"
+description = "PostHog project API key"
+regex = '''\bphc_[A-Za-z0-9]{40,}'''
+keywords = ["phc_"]
+
+# ============================ Email / comms =================================
+[[rules]]
+id = "sendgrid-key"
+description = "SendGrid API key"
+regex = '''\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}'''
+keywords = ["sg."]
+
+[[rules]]
+id = "twilio-key"
+description = "Twilio API key SID"
+regex = '''\bSK[0-9a-fA-F]{32}\b'''
+keywords = ["sk"]
+
+# ============================ Registries / CI ===============================
+[[rules]]
+id = "docker-hub-pat"
+description = "Docker Hub personal access token"
+regex = '''\bdckr_pat_[A-Za-z0-9_\-]{20,}'''
+keywords = ["dckr_pat_"]
+
+[[rules]]
+id = "npm-token"
+description = "npm access token"
+regex = '''\bnpm_[A-Za-z0-9]{36}\b'''
+keywords = ["npm_"]
+
+[[rules]]
+id = "vercel-token"
+description = "Vercel API / AI Gateway token"
+regex = '''\b(vercel_[A-Za-z0-9_\-]{20,}|vck_[A-Za-z0-9_\-]{20,})'''
+keywords = ["vercel_", "vck_"]
+
+# ============================ Payments / cloud ==============================
+[[rules]]
+id = "razorpay-key"
+description = "Razorpay live key id"
+regex = '''\brzp_live_[A-Za-z0-9]{14,}'''
+keywords = ["rzp_live_"]
+
+[[rules]]
+id = "digitalocean-token"
+description = "DigitalOcean personal access token"
+regex = '''\bdop_v1_[a-f0-9]{64}\b'''
+keywords = ["dop_v1_"]
+
+[[rules]]
+id = "aws-secret-access-key-assign"
+description = "AWS secret access key (explicit assignment)"
+regex = '''(?i)aws_secret_access_key\s*[:=]\s*["']?[A-Za-z0-9/+=]{40}'''
+keywords = ["aws_secret_access_key"]
+
+# ============================ Databases =====================================
+[[rules]]
+id = "postgres-uri"
+description = "PostgreSQL connection URI with embedded password"
+regex = '''postgres(ql)?://[a-zA-Z0-9._%+-]+:[^@\s/'"]{3,}@[a-zA-Z0-9.-]+'''
+keywords = ["postgres://", "postgresql://"]
+
+[[rules]]
+id = "mysql-uri"
+description = "MySQL connection URI with embedded password"
+regex = '''mysql://[a-zA-Z0-9._%+-]+:[^@\s/'"]{3,}@[a-zA-Z0-9.-]+'''
+keywords = ["mysql://"]
+
+[[rules]]
+id = "mongodb-uri"
+description = "MongoDB connection URI with embedded password"
+regex = '''mongodb(\+srv)?://[a-zA-Z0-9._%+-]+:[^@\s/'"]{3,}@[a-zA-Z0-9.-]+'''
+keywords = ["mongodb://", "mongodb+srv://"]
+
+[[rules]]
+id = "redis-uri"
+description = "Redis connection URI with embedded password"
+regex = '''redis://[a-zA-Z0-9._%+-]*:[^@\s/'"]{3,}@[a-zA-Z0-9.-]+'''
+keywords = ["redis://"]
+
+[[rules]]
+id = "amqp-uri"
+description = "AMQP / RabbitMQ connection URI with embedded password"
+regex = '''amqp(s)?://[a-zA-Z0-9._%+-]+:[^@\s/'"]{3,}@[a-zA-Z0-9.-]+'''
+keywords = ["amqp://", "amqps://"]
+
+[[rules]]
+id = "mssql-conn"
+description = "MSSQL / ADO connection string with password"
+regex = '''(?i)(Server|Data Source)=[^;]+;(.*;)?\s*(Password|Pwd)=[^;\s"']{3,}'''
+keywords = ["data source=", "server="]
+
+[[rules]]
+id = "jdbc-uri"
+description = "JDBC connection URL with password param"
+regex = '''(?i)jdbc:[a-z0-9]+://[^\s"']*(password|pwd)=[^;&\s"']{3,}'''
+keywords = ["jdbc:"]
+
+[[rules]]
+id = "db-password-assign"
+description = "Explicit DB password assignment (env/config)"
+regex = '''(?i)(db[_-]?pass(word)?|database[_-]?password|mysql[_-]?password|postgres[_-]?password|pg[_-]?password|mongo[_-]?password)\s*[:=]\s*["']?[^\s"'{}$<][^\s"']{3,}'''
+keywords = ["db_pass", "dbpassword", "database_password", "mysql_password", "postgres_password", "mongo_password", "pg_password"]
+
+[[rules]]
+id = "smtp-password-assign"
+description = "SMTP / mail password assignment"
+regex = '''(?i)(smtp[_-]?pass(word)?|mail[_-]?password|email[_-]?password)\s*[:=]\s*["']?[^\s"'{}$<][^\s"']{3,}'''
+keywords = ["smtp_pass", "mail_password", "email_password"]
+
+# ============================ Generic assignments ===========================
+[[rules]]
+id = "jwt-secret-assign"
+description = "JWT / session signing secret (explicit assignment)"
+regex = '''(?i)(jwt[_-]?secret|token[_-]?secret|session[_-]?secret|cookie[_-]?secret)\s*[:=]\s*["']?[^\s"'{}$<][^\s"']{8,}'''
+keywords = ["jwt_secret", "jwtsecret", "token_secret", "session_secret", "cookie_secret"]
+
+# High-entropy hardcoded secret/token = "..." — VALUE must be >=16 chars and high
+# entropy, so dictionary words and short UI strings don't match.
+[[rules]]
+id = "generic-secret-assignment"
+description = "Hardcoded high-entropy secret/token assignment"
+regex = '''(?i)(?:secret|passwd|password|pwd|token|api[_-]?key|access[_-]?key|private[_-]?key|service[_-]?key)['"]?\s*[:=]\s*['"]([^'"\s${}<>]{16,})['"]'''
+secretGroup = 1
+entropy = 3.5
+keywords = ["secret", "password", "passwd", "token", "apikey", "api_key", "api-key", "access_key", "service_key"]
+
+# =============================================================================
+# Allowlist — cut false positives from lock files, examples, minified/vendored
+# code, and obvious placeholders. Never hides a real key.
+# =============================================================================
+[allowlist]
+description = "Global allowlist"
+paths = [
+  '''package-lock\.json''',
+  '''yarn\.lock''',
+  '''pnpm-lock\.yaml''',
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+  '''(^|/)build/''',
+  '''\.min\.(js|css)(\.map)?$''',
+  '''(^|/)\.env\.example$''',
+  '''(^|/)\.env\.sample$''',
+  '''(^|/)docs/SECRET-SCANNING\.md$''',
+  '''(^|/)docs/EXPOSED-CREDENTIALS-TO-ROTATE\.md$''',
+  '''(^|/)\.gitleaks\.toml$''',
+  '''(^|/)git-hooks/''',
+]
+# Only STRUCTURAL placeholders — a real secret never contains these. Word-based
+# allowlists like "example" are deliberately NOT used: they silently skip real secrets
+# that happen to contain example.com, so false-negatives outweigh the convenience.
+regexTarget = "match"
+regexes = [
+  '''\$\{[^}]+\}''',            # ${ENV_VAR} interpolation
+  '''<[A-Za-z0-9_\- ]{2,}>''',  # <YOUR_KEY> angle-bracket placeholder
+]

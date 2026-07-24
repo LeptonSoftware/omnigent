@@ -1,0 +1,88 @@
+# Self-contained gitleaks CI check. Vendor this into each repo as
+# `.github/workflows/gitleaks.yml` (alongside a copy of `.gitleaks.toml`).
+# Scans ONLY the PR's new commits, so pre-existing history doesn't fail every PR.
+# Make it a REQUIRED status check (org ruleset / branch protection) — see docs/ROLLOUT.md.
+name: gitleaks
+
+on:
+  pull_request:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitleaks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    name: Scan for secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: "8.21.2"
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Scan the new commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEFAULT="${{ github.event.repository.default_branch }}"
+          git fetch --no-tags origin "$DEFAULT" 2>/dev/null || true
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            RANGE="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          else
+            BEFORE="${{ github.event.before }}"
+            if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+              RANGE="${BEFORE}..${{ github.sha }}"
+            else
+              RANGE="origin/${DEFAULT}..${{ github.sha }}"
+            fi
+          fi
+          echo "Scanning new commits: $RANGE"
+          # --verbose prints each finding (File/Line/RuleID); --redact hides the secret value.
+          gitleaks git --log-opts="$RANGE" --config .gitleaks.toml --redact --verbose --no-banner \
+            --report-format json --report-path gitleaks.json
+
+      - name: What to fix
+        if: failure()
+        run: |
+          # Inline annotations: show the error right on the offending file:line in "Files changed".
+          if [ -f gitleaks.json ]; then
+            jq -r 'unique_by([.File,.StartLine,.RuleID])[] | "::error file=\(.File),line=\(.StartLine)::gitleaks: \(.RuleID) secret detected — remove it, load it from an env var, and rotate it if it was pushed"' gitleaks.json
+          fi
+          {
+            echo "## 🔒 Secret scan failed — remove these before merging"
+            echo ""
+            echo "A credential was found in the commits added by this PR. **Remove each one,** load"
+            echo "it from an environment variable instead, and **rotate it** if it was ever pushed."
+            echo ""
+            echo "| File | Line | Type (rule) |"
+            echo "|------|------|-------------|"
+            if [ -f gitleaks.json ]; then
+              jq -r 'unique_by([.File,.StartLine,.RuleID])[] | "| `\(.File)` | \(.StartLine) | `\(.RuleID)` |"' gitleaks.json
+            fi
+            echo ""
+            echo "_Secrets are redacted here. Full findings: the **gitleaks-report** artifact on this run,"
+            echo "or reproduce locally: \`gitleaks git --pre-commit --staged --verbose\`._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-report
+          path: gitleaks.json
+          if-no-files-found: ignore
