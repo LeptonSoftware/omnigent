@@ -567,16 +567,29 @@ async def _generator_const(_request: BackgroundTitleRequest) -> str:
 
 
 def test_is_fork_placeholder() -> None:
-    assert _is_fork_placeholder("Fork of Something")
-    assert _is_fork_placeholder("Fork of Fork of Something")
-    assert not _is_fork_placeholder("A real handwritten title")
-    assert not _is_fork_placeholder(None)
+    from omnigent.stores.conversation_store import FORK_SOURCE_LABEL_KEY
+
+    fork_labels = {FORK_SOURCE_LABEL_KEY: "src"}
+    assert _is_fork_placeholder("Fork of Something", fork_labels)
+    assert _is_fork_placeholder("Fork of Fork of Something", fork_labels)
+    assert not _is_fork_placeholder("A real handwritten title", fork_labels)
+    assert not _is_fork_placeholder(None, fork_labels)
+    # Without fork lineage the prefix is the user's own words — never a placeholder.
+    assert not _is_fork_placeholder("Fork of my auth experiment", {})
+    # A human rename opts the fork out permanently.
+    assert not _is_fork_placeholder("Fork of Something", {**fork_labels, TITLE_AUTO_LABEL: "0"})
 
 
 async def test_fork_placeholder_is_eligible_for_renaming(db_uri: str) -> None:
     """A fork born with a 'Fork of ...' title gets titled from its first NEW turn."""
+    from omnigent.stores.conversation_store import FORK_SOURCE_LABEL_KEY
+
     store = SqlAlchemyConversationStore(db_uri)
-    conv = store.create_conversation(kind="default", title="Fork of Clone the repo")
+    source = store.create_conversation(kind="default", title="Clone the repo")
+    created = store.create_conversation(kind="default", title="Fork of Clone the repo")
+    store.set_labels(created.id, {FORK_SOURCE_LABEL_KEY: source.id})
+    conv = store.get_conversation(created.id)
+    assert conv is not None
 
     pending = prepare_background_session_title(
         coordinator=BackgroundSessionTitleCoordinator(store, _generator_const),
@@ -622,14 +635,14 @@ async def test_note_completed_turn_thresholds_and_provenance() -> None:
     assert fired == [False, False, False, False, False, True]
 
     # Simulate the re-title landing (resets clock, bumps count).
-    coord._turns_since_title["auto"] = 0
-    coord._retitle_count["auto"] = 1
+    coord._state_for("auto").turns_since_title = 0
+    coord._state_for("auto").retitles = 1
     fired2 = [coord.note_completed_turn("auto", title_is_auto=True) for _ in range(6)]
     assert fired2[-1] is True  # second re-title still allowed (cap is 2)
 
     # At the cap, no further re-titles even after many turns.
-    coord._turns_since_title["auto"] = 0
-    coord._retitle_count["auto"] = 2
+    coord._state_for("auto").turns_since_title = 0
+    coord._state_for("auto").retitles = 2
     assert all(coord.note_completed_turn("auto", title_is_auto=True) is False for _ in range(20))
 
 
@@ -707,3 +720,59 @@ async def test_noise_turns_are_excluded_from_retitle_prompt(db_uri: str) -> None
     prompt = _build_retitle_prompt(store, conv.id)
     assert "reverse proxy exposure" in prompt
     assert "[System:" not in prompt
+
+
+# ── Regressions found by adversarial QA (each of these was a real bug) ──
+
+
+def test_human_title_starting_with_fork_of_is_never_clobbered(db_uri: str) -> None:
+    """A user may legitimately NAME a session 'Fork of ...' — that is not a placeholder.
+
+    Regression: matching on the title string alone renamed user-named sessions.
+    Real fork lineage (the fork-source label) is now required.
+    """
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(kind="default", title="Fork of my auth experiment")
+
+    pending = prepare_background_session_title(
+        coordinator=BackgroundSessionTitleCoordinator(store, _generator_const),
+        conversation=conv,
+        event=SessionEventInput(
+            type="message",
+            data={"role": "user", "content": [{"type": "input_text", "text": "keep going"}]},
+        ),
+    )
+    assert pending is None
+
+
+def test_turn_bookkeeping_is_memory_bounded(db_uri: str) -> None:
+    """Regression: per-session turn state grew without bound on a long-lived server."""
+    store = SqlAlchemyConversationStore(db_uri)
+    coord = BackgroundSessionTitleCoordinator(store, _generator_const)
+
+    for i in range(5000):
+        coord.note_completed_turn(f"session-{i}", title_is_auto=True)
+
+    assert len(coord._title_state) <= 4096
+
+
+def test_duplicate_idle_for_one_turn_counts_once(db_uri: str) -> None:
+    """Regression: every idle publish counted as a turn, so re-titles fired far too soon.
+
+    Sub-agent echoes and retries republish idle for the SAME turn; the turn key
+    (response id) collapses them.
+    """
+    store = SqlAlchemyConversationStore(db_uri)
+    coord = BackgroundSessionTitleCoordinator(store, _generator_const)
+
+    fired = [
+        coord.note_completed_turn("s1", title_is_auto=True, turn_key="resp-1") for _ in range(10)
+    ]
+    assert not any(fired)
+
+    # Distinct turns still advance the counter to the threshold (default 6).
+    fired2 = [
+        coord.note_completed_turn("s1", title_is_auto=True, turn_key=f"resp-{i}")
+        for i in range(2, 8)
+    ]
+    assert fired2[-1] is True

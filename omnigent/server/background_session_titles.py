@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -14,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 from omnigent.entities.conversation import synthesize_conversation_title
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import background_title_generators
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import FORK_SOURCE_LABEL_KEY, ConversationStore
 
 if TYPE_CHECKING:
     from omnigent.entities.conversation import Conversation
@@ -57,9 +58,20 @@ _TRAILING_PUNCTUATION = re.compile(r"[.!?;:,]+$")
 _FORK_PLACEHOLDER_RE = re.compile(r"^(?:Fork of )+")
 
 
-def _is_fork_placeholder(title: str | None) -> bool:
-    """True when *title* is the auto-generated 'Fork of ...' placeholder."""
-    return title is not None and _FORK_PLACEHOLDER_RE.match(title) is not None
+def _is_fork_placeholder(title: str | None, labels: dict[str, str] | None = None) -> bool:
+    """True when *title* is still the auto-generated 'Fork of ...' placeholder.
+
+    The title string alone is not proof: a user may legitimately NAME a session
+    "Fork of my auth experiment", and replacing that would destroy their title.
+    So require actual fork lineage (the fork-source label the store writes at
+    creation) and that the title was not explicitly set by a human.
+    """
+    if title is None or _FORK_PLACEHOLDER_RE.match(title) is None:
+        return False
+    labels = labels or {}
+    if FORK_SOURCE_LABEL_KEY not in labels:
+        return False  # not actually a fork — the prefix is the user's own words
+    return labels.get(TITLE_AUTO_LABEL) != "0"  # a human rename opts out
 
 
 # Provenance label: "1" marks a title this system generated, so it may be
@@ -90,6 +102,22 @@ def _retitle_after_turns() -> int:
 
 def _max_retitles() -> int:
     return _positive_int_env("OMNIGENT_SESSION_MAX_RETITLES", 2)
+
+
+# Upper bound on sessions tracked for re-titling at once. Bounds memory on a
+# long-lived server; the coldest entry is evicted first.
+_MAX_TRACKED_SESSIONS = 4096
+
+
+@dataclass
+class _SessionTitleState:
+    """Per-session re-title bookkeeping (in-memory, LRU-evicted)."""
+
+    turns_since_title: int = 0
+    retitles: int = 0
+    # Identifies the turn last counted, so repeated ``idle`` publishes for the
+    # SAME turn (sub-agent echoes, retries) don't inflate the count.
+    last_turn_key: str | None = None
 
 
 def normalize_background_title(value: str | None) -> str | None:
@@ -155,10 +183,23 @@ class BackgroundSessionTitleCoordinator:
         self._generation_slots = asyncio.Semaphore(max_concurrency)
         self._pending: set[asyncio.Task[None]] = set()
         self._scheduled_session_ids: set[str] = set()
-        # Re-title tracking (in-memory; provenance itself is persisted as a
+        # Re-title bookkeeping (in-memory; provenance itself is persisted as a
         # label so a human title is never re-titled even across restarts).
-        self._turns_since_title: dict[str, int] = {}
-        self._retitle_count: dict[str, int] = {}
+        # LRU-bounded: a long-lived server sees unboundedly many sessions, and
+        # losing state for a cold session only costs it a re-title cycle.
+        self._title_state: OrderedDict[str, _SessionTitleState] = OrderedDict()
+
+    def _state_for(self, session_id: str) -> _SessionTitleState:
+        """Fetch (or create) per-session re-title state, evicting the coldest."""
+        state = self._title_state.get(session_id)
+        if state is None:
+            state = _SessionTitleState()
+            self._title_state[session_id] = state
+            while len(self._title_state) > _MAX_TRACKED_SESSIONS:
+                self._title_state.popitem(last=False)
+        else:
+            self._title_state.move_to_end(session_id)
+        return state
 
     def schedule(
         self,
@@ -296,7 +337,7 @@ class BackgroundSessionTitleCoordinator:
                 return False
             await asyncio.sleep(0.05)
 
-    def maybe_retitle(self, conversation: Conversation) -> None:
+    def maybe_retitle(self, conversation: Conversation, *, turn_key: str | None = None) -> None:
         """Re-title a session from its trajectory when it is due (off the send path).
 
         Called on the turn-complete (idle) edge. Cheap for the common case:
@@ -313,7 +354,9 @@ class BackgroundSessionTitleCoordinator:
         title_is_auto = conversation.labels.get(TITLE_AUTO_LABEL) == "1"
         # note_completed_turn is in-memory only — the hot idle path does no I/O.
         # Item fetch + prompt build happen inside the scheduled task below.
-        if not self.note_completed_turn(conversation.id, title_is_auto=title_is_auto):
+        if not self.note_completed_turn(
+            conversation.id, title_is_auto=title_is_auto, turn_key=turn_key
+        ):
             return
         self.schedule_retitle(
             session_id=conversation.id,
@@ -326,7 +369,7 @@ class BackgroundSessionTitleCoordinator:
 
     async def _mark_auto_titled(self, session_id: str) -> None:
         """Record that this system set the title, and (re)start its turn clock."""
-        self._turns_since_title[session_id] = 0
+        self._state_for(session_id).turns_since_title = 0
         try:
             await asyncio.to_thread(
                 self._conversation_store.set_labels,
@@ -336,22 +379,36 @@ class BackgroundSessionTitleCoordinator:
         except Exception:  # noqa: BLE001 - provenance is best-effort metadata
             _logger.warning("failed to mark auto title session=%s", session_id, exc_info=True)
 
-    def note_completed_turn(self, session_id: str, *, title_is_auto: bool) -> bool:
+    def note_completed_turn(
+        self,
+        session_id: str,
+        *,
+        title_is_auto: bool,
+        turn_key: str | None = None,
+    ) -> bool:
         """Record a finished turn; return whether the session is due a re-title.
 
         Cheap and side-effect-free on the caller's path (in-memory only). Only
         auto-generated titles are tracked, so a hand-typed title is never
         re-titled. Caller passes ``title_is_auto`` from the already-loaded
         conversation labels, so no extra read happens on the turn path.
+
+        ``turn_key`` (the turn's response id) de-duplicates repeated ``idle``
+        publishes for a single turn; without it every echo would count as a
+        turn and trigger re-titles far too eagerly.
         """
         if not title_is_auto:
-            self._turns_since_title.pop(session_id, None)
+            # Drop any state so a renamed session stops consuming memory.
+            self._title_state.pop(session_id, None)
             return False
-        if self._retitle_count.get(session_id, 0) >= _max_retitles():
+        state = self._state_for(session_id)
+        if turn_key is not None and turn_key == state.last_turn_key:
+            return False  # same turn, already counted
+        state.last_turn_key = turn_key
+        if state.retitles >= _max_retitles():
             return False
-        turns = self._turns_since_title.get(session_id, 0) + 1
-        self._turns_since_title[session_id] = turns
-        return turns >= _retitle_after_turns()
+        state.turns_since_title += 1
+        return state.turns_since_title >= _retitle_after_turns()
 
     def schedule_retitle(
         self,
@@ -369,7 +426,7 @@ class BackgroundSessionTitleCoordinator:
         self._scheduled_session_ids.add(session_id)
         # Reset the clock now so turns during generation count toward the NEXT
         # cycle rather than immediately re-triggering.
-        self._turns_since_title[session_id] = 0
+        self._state_for(session_id).turns_since_title = 0
         task = asyncio.create_task(
             self._run_retitle(
                 session_id=session_id,
@@ -432,7 +489,7 @@ class BackgroundSessionTitleCoordinator:
                 title,
             )
             if updated is not None:
-                self._retitle_count[session_id] = self._retitle_count.get(session_id, 0) + 1
+                self._state_for(session_id).retitles += 1
                 await self._mark_auto_titled(session_id)
             _logger.info(
                 "background session re-title session=%s renamed=%s elapsed_ms=%.1f",
@@ -503,7 +560,7 @@ def prepare_background_session_title(
         )
         if expected_seed_title is None:
             return None
-    elif _is_fork_placeholder(conversation.title):
+    elif _is_fork_placeholder(conversation.title, conversation.labels):
         # Fork: replace the "Fork of ..." placeholder itself, titling from the
         # divergence turn (this event) rather than the shared parent opening.
         expected_seed_title = conversation.title
