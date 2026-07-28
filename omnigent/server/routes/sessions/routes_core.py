@@ -69,6 +69,7 @@ from omnigent.server.auth import (
     AuthProvider,
 )
 from omnigent.server.background_session_titles import (
+    TITLE_AUTO_LABEL,
     BackgroundSessionTitleCoordinator,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
@@ -1397,6 +1398,9 @@ def register_core_routes(
         )
         if updated is None:
             return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        # Client-applied auto title: mark it so the background re-titler may
+        # later refresh it as the session's trajectory grows.
+        await asyncio.to_thread(conversation_store.set_labels, session_id, {TITLE_AUTO_LABEL: "1"})
         return AutomaticSessionRenameResponse(renamed=True, title=updated.title)
 
     @router.patch(
@@ -1695,6 +1699,12 @@ def register_core_routes(
         )
         if updated is None:
             raise _session_not_found()
+        # A human-set title is authoritative: clear the auto-title provenance so
+        # the background re-titler never overwrites a name the user typed.
+        if body.title is not None:
+            await asyncio.to_thread(
+                conversation_store.set_labels, session_id, {TITLE_AUTO_LABEL: "0"}
+            )
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).

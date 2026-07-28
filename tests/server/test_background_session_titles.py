@@ -547,3 +547,163 @@ async def test_seed_polling_is_bounded_by_generation_slots(db_uri: str) -> None:
 
     release.set()
     await coordinator.wait_for_idle()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# FORK NAMING + RE-TITLE ON TRAJECTORY DRIFT
+# ─────────────────────────────────────────────────────────────────────
+
+from omnigent.entities import NewConversationItem  # noqa: E402
+from omnigent.entities.conversation import MessageData  # noqa: E402
+from omnigent.server.background_session_titles import (  # noqa: E402
+    TITLE_AUTO_LABEL,
+    _build_retitle_prompt,
+    _is_fork_placeholder,
+)
+
+
+async def _generator_const(_request: BackgroundTitleRequest) -> str:
+    return "Generated title"
+
+
+def test_is_fork_placeholder() -> None:
+    assert _is_fork_placeholder("Fork of Something")
+    assert _is_fork_placeholder("Fork of Fork of Something")
+    assert not _is_fork_placeholder("A real handwritten title")
+    assert not _is_fork_placeholder(None)
+
+
+async def test_fork_placeholder_is_eligible_for_renaming(db_uri: str) -> None:
+    """A fork born with a 'Fork of ...' title gets titled from its first NEW turn."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(kind="default", title="Fork of Clone the repo")
+
+    pending = prepare_background_session_title(
+        coordinator=BackgroundSessionTitleCoordinator(store, _generator_const),
+        conversation=conv,
+        event=SessionEventInput(
+            type="message",
+            data={"role": "user", "content": [{"type": "input_text", "text": "now add auth"}]},
+        ),
+    )
+
+    assert pending is not None
+    # The divergence turn is the prompt, and the CAS targets the fork placeholder.
+    assert pending.request.prompt == "now add auth"
+    assert pending.expected_seed_title == "Fork of Clone the repo"
+
+
+async def test_real_title_is_never_touched(db_uri: str) -> None:
+    """A session with a hand-written title is left alone by the titler."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(kind="default", title="My careful title")
+
+    pending = prepare_background_session_title(
+        coordinator=BackgroundSessionTitleCoordinator(store, _generator_const),
+        conversation=conv,
+        event=SessionEventInput(
+            type="message",
+            data={"role": "user", "content": [{"type": "input_text", "text": "keep going"}]},
+        ),
+    )
+    assert pending is None
+
+
+async def test_note_completed_turn_thresholds_and_provenance() -> None:
+    """Only auto titles are counted; re-title triggers at N turns, capped."""
+    store = object()  # not used by note_completed_turn
+    coord = BackgroundSessionTitleCoordinator(store, _generator_const)  # type: ignore[arg-type]
+
+    # Human-titled session: never counted, never re-titled.
+    assert coord.note_completed_turn("human", title_is_auto=False) is False
+
+    # Auto-titled: counts up, fires exactly at the threshold (default 6).
+    fired = [coord.note_completed_turn("auto", title_is_auto=True) for _ in range(6)]
+    assert fired == [False, False, False, False, False, True]
+
+    # Simulate the re-title landing (resets clock, bumps count).
+    coord._turns_since_title["auto"] = 0
+    coord._retitle_count["auto"] = 1
+    fired2 = [coord.note_completed_turn("auto", title_is_auto=True) for _ in range(6)]
+    assert fired2[-1] is True  # second re-title still allowed (cap is 2)
+
+    # At the cap, no further re-titles even after many turns.
+    coord._turns_since_title["auto"] = 0
+    coord._retitle_count["auto"] = 2
+    assert all(coord.note_completed_turn("auto", title_is_auto=True) is False for _ in range(20))
+
+
+async def test_mark_auto_titled_sets_label(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(kind="default", title="seed")
+    coord = BackgroundSessionTitleCoordinator(store, _generator_const)
+
+    await coord._mark_auto_titled(conv.id)
+
+    refreshed = store.get_conversation(conv.id)
+    assert refreshed is not None
+    assert refreshed.labels.get(TITLE_AUTO_LABEL) == "1"
+
+
+async def test_build_retitle_prompt_spans_the_arc(db_uri: str) -> None:
+    """The re-title prompt samples user turns across the session plus the ending."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(kind="default", title="Fork of X")
+    turns = [
+        ("user", "clone the repo"),
+        ("assistant", "cloned"),
+        ("user", "now wire up the OpenBao secret injector"),  # the divergence
+        ("assistant", "injector wired, 16 exports"),
+        ("user", "make the container entrypoint part of this PR"),
+        ("assistant", "PR opened, fail-closed injector verified end to end"),
+    ]
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"r{i}",
+                data=MessageData(
+                    role=role,
+                    agent="a" if role == "assistant" else None,
+                    content=[{"type": "input_text", "text": text}],
+                ),
+            )
+            for i, (role, text) in enumerate(turns)
+        ],
+    )
+
+    prompt = _build_retitle_prompt(store, conv.id)
+    # Captures the divergence and the outcome, not just the shared opening.
+    assert "OpenBao secret injector" in prompt
+    assert "container entrypoint" in prompt
+    assert "injector verified" in prompt.lower() or "PR opened" in prompt
+
+
+async def test_noise_turns_are_excluded_from_retitle_prompt(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(kind="default", title="Fork of X")
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="r0",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "[System: sub-agent finished]"}],
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="r1",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "audit the reverse proxy exposure"}],
+                ),
+            ),
+        ],
+    )
+    prompt = _build_retitle_prompt(store, conv.id)
+    assert "reverse proxy exposure" in prompt
+    assert "[System:" not in prompt

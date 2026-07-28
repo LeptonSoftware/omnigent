@@ -781,6 +781,11 @@ def register_events_routes(
                 response_id=response_id,
                 background_task_count=bg_count,
             )
+            # Turn-complete edge: refresh an auto-generated title from the
+            # session's trajectory once it has drifted enough turns (in-memory
+            # check; only re-titles system-set titles, never a hand-typed one).
+            if status == "idle" and background_title_coordinator is not None:
+                background_title_coordinator.maybe_retitle(conv)
             forward_body = body.model_dump()
             forward_body["data"] = await _enrich_idle_status_with_subagent_output(
                 forward_body["data"], status, session_id, conversation_store
