@@ -153,6 +153,7 @@ try:
         SqlAlchemyPermissionStore,
     )
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
@@ -216,6 +217,8 @@ try:
         permission_store=permission_store,
         policy_store=policy_store,
         host_store=host_store,
+        # Same wiring the projects CRUD router is gated on; see entrypoint.py.
+        project_store=SqlAlchemyProjectStore(DB_URI),
         scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,
     )

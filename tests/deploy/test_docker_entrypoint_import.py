@@ -153,3 +153,65 @@ def test_select_artifact_store(
         port=8000,
     )
     assert isinstance(_select_artifact_store(resolved), expected_type)
+
+
+# ── store wiring ─────────────────────────────────────────────────────────
+# create_app mounts several routers only when their store is passed, so a
+# store this entrypoint forgets is a feature that 404s in the image while
+# the generated openapi.json (built with every store wired) still advertises
+# it. Assert the wiring here — the drift is invisible to the spec check.
+
+
+def test_build_app_wires_every_router_gating_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Verify the entrypoint passes each store ``create_app`` gates a router on.
+
+    ``project_store`` is the regression that motivated this: it was absent,
+    so ``/v1/projects`` 404'd in every Docker deployment even though the
+    checked-in spec listed the routes.
+    """
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("{}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config_file))
+    # SQLite, not a fake Postgres URL: some stores open a connection when
+    # constructed, so the URL has to point somewhere real.
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'entrypoint.db'}")
+    monkeypatch.setenv("ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.delenv("OMNIGENT_ARTIFACT_URI", raising=False)
+
+    import omnigent.server.app as app_module
+
+    captured: dict[str, object] = {}
+
+    def _capture(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(app_module, "create_app", _capture)
+
+    from deploy.docker.entrypoint import build_app
+
+    build_app()
+
+    # Every store create_app gates a router or a capability on. Constructing
+    # them never connects (the engine is lazy), so the bogus URL above is fine.
+    for store in (
+        "agent_store",
+        "conversation_store",
+        "file_store",
+        "artifact_store",
+        "comment_store",
+        "permission_store",
+        "policy_store",
+        "host_store",
+        "project_store",
+        "scheduled_task_store",
+    ):
+        assert captured.get(store) is not None, (
+            f"deploy/docker/entrypoint.py must pass {store} to create_app — "
+            "create_app gates its router on the store being wired, so omitting "
+            "it silently 404s those routes in the image."
+        )
