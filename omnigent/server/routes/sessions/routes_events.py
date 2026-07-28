@@ -83,6 +83,7 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SessionEventInput,
 )
+from omnigent.server.session_title_extensions import prepare_session_title  # fork
 from omnigent.session_lifecycle import (
     is_session_closed,
 )
@@ -1294,7 +1295,8 @@ def register_events_routes(
                     session_id,
                     exc_info=True,
                 )
-        pending_background_title = prepare_background_session_title(
+        # Fork: extends upstream to cover forks (omnigent.server.session_title_extensions).
+        pending_background_title = prepare_session_title(
             coordinator=background_title_coordinator,
             conversation=conv,
             event=body,

@@ -555,10 +555,14 @@ async def test_seed_polling_is_bounded_by_generation_slots(db_uri: str) -> None:
 
 from omnigent.entities import NewConversationItem  # noqa: E402
 from omnigent.entities.conversation import MessageData  # noqa: E402
-from omnigent.server.background_session_titles import (  # noqa: E402
+from omnigent.server.session_title_extensions import (  # noqa: E402
     TITLE_AUTO_LABEL,
-    _build_retitle_prompt,
+    ForkAwareTitleCoordinator,
     _is_fork_placeholder,
+    prepare_session_title,
+)
+from omnigent.server.session_title_extensions import (  # noqa: E402
+    build_retitle_prompt as _build_retitle_prompt,
 )
 
 
@@ -591,8 +595,8 @@ async def test_fork_placeholder_is_eligible_for_renaming(db_uri: str) -> None:
     conv = store.get_conversation(created.id)
     assert conv is not None
 
-    pending = prepare_background_session_title(
-        coordinator=BackgroundSessionTitleCoordinator(store, _generator_const),
+    pending = prepare_session_title(
+        coordinator=ForkAwareTitleCoordinator(store, _generator_const),
         conversation=conv,
         event=SessionEventInput(
             type="message",
@@ -611,8 +615,8 @@ async def test_real_title_is_never_touched(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(kind="default", title="My careful title")
 
-    pending = prepare_background_session_title(
-        coordinator=BackgroundSessionTitleCoordinator(store, _generator_const),
+    pending = prepare_session_title(
+        coordinator=ForkAwareTitleCoordinator(store, _generator_const),
         conversation=conv,
         event=SessionEventInput(
             type="message",
@@ -625,7 +629,7 @@ async def test_real_title_is_never_touched(db_uri: str) -> None:
 async def test_note_completed_turn_thresholds_and_provenance() -> None:
     """Only auto titles are counted; re-title triggers at N turns, capped."""
     store = object()  # not used by note_completed_turn
-    coord = BackgroundSessionTitleCoordinator(store, _generator_const)  # type: ignore[arg-type]
+    coord = ForkAwareTitleCoordinator(store, _generator_const)  # type: ignore[arg-type]
 
     # Human-titled session: never counted, never re-titled.
     assert coord.note_completed_turn("human", title_is_auto=False) is False
@@ -649,7 +653,7 @@ async def test_note_completed_turn_thresholds_and_provenance() -> None:
 async def test_mark_auto_titled_sets_label(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(kind="default", title="seed")
-    coord = BackgroundSessionTitleCoordinator(store, _generator_const)
+    coord = ForkAwareTitleCoordinator(store, _generator_const)
 
     await coord._mark_auto_titled(conv.id)
 
@@ -734,8 +738,8 @@ def test_human_title_starting_with_fork_of_is_never_clobbered(db_uri: str) -> No
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(kind="default", title="Fork of my auth experiment")
 
-    pending = prepare_background_session_title(
-        coordinator=BackgroundSessionTitleCoordinator(store, _generator_const),
+    pending = prepare_session_title(
+        coordinator=ForkAwareTitleCoordinator(store, _generator_const),
         conversation=conv,
         event=SessionEventInput(
             type="message",
@@ -748,7 +752,7 @@ def test_human_title_starting_with_fork_of_is_never_clobbered(db_uri: str) -> No
 def test_turn_bookkeeping_is_memory_bounded(db_uri: str) -> None:
     """Regression: per-session turn state grew without bound on a long-lived server."""
     store = SqlAlchemyConversationStore(db_uri)
-    coord = BackgroundSessionTitleCoordinator(store, _generator_const)
+    coord = ForkAwareTitleCoordinator(store, _generator_const)
 
     for i in range(5000):
         coord.note_completed_turn(f"session-{i}", title_is_auto=True)
@@ -763,7 +767,7 @@ def test_duplicate_idle_for_one_turn_counts_once(db_uri: str) -> None:
     (response id) collapses them.
     """
     store = SqlAlchemyConversationStore(db_uri)
-    coord = BackgroundSessionTitleCoordinator(store, _generator_const)
+    coord = ForkAwareTitleCoordinator(store, _generator_const)
 
     fired = [
         coord.note_completed_turn("s1", title_is_auto=True, turn_key="resp-1") for _ in range(10)

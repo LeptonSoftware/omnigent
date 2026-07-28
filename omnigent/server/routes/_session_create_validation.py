@@ -133,12 +133,11 @@ async def validate_existing_host_workspace(
             code=ErrorCode.INTERNAL_ERROR,
         )
 
-    from omnigent.server.routes._host_launch import resolve_host_access
+    from omnigent.server.host_access import resolve_host_access  # fork: shared team hosts
 
-    # Authorize host access FIRST — before loading the agent spec or the
-    # host.stat round-trip below. A caller who neither owns the host nor holds
-    # a grant on it must be rejected (403/404 via the shared
-    # resolve_host_access) before we touch the host or even read the agent
+    # Authorize host ownership FIRST — before loading the agent spec or the
+    # host.stat round-trip below. A non-owner must be rejected (403/404 via the
+    # shared resolve_host_owner) before we touch the host or even read the agent
     # bundle (cross-user host probe). The returned host also gives the display
     # name for error messages.
     host_name: str | None = None

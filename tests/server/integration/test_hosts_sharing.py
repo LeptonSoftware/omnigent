@@ -17,6 +17,7 @@ from omnigent.errors import OmnigentError
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._host_launch import resolve_host_access, resolve_host_owner
+from omnigent.server.routes.host_sharing import create_host_sharing_router
 from omnigent.server.routes.hosts import create_hosts_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -56,6 +57,10 @@ def share_app(db_uri: str) -> tuple[FastAPI, HostStore]:
             SqlAlchemyConversationStore(db_uri),
             auth_provider=UnifiedAuthProvider(source="header"),
         ),
+        prefix="/v1",
+    )
+    app.include_router(
+        create_host_sharing_router(host_store, auth_provider=UnifiedAuthProvider(source="header")),
         prefix="/v1",
     )
     return app, host_store
@@ -294,6 +299,10 @@ async def test_unauthenticated_caller_cannot_share(
             SqlAlchemyConversationStore(db_uri),
             auth_provider=UnifiedAuthProvider(source="header"),
         ),
+        prefix="/v1",
+    )
+    app.include_router(
+        create_host_sharing_router(host_store, auth_provider=UnifiedAuthProvider(source="header")),
         prefix="/v1",
     )
 

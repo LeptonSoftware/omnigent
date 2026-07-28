@@ -69,7 +69,6 @@ from omnigent.server.auth import (
     AuthProvider,
 )
 from omnigent.server.background_session_titles import (
-    TITLE_AUTO_LABEL,
     BackgroundSessionTitleCoordinator,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
@@ -118,6 +117,7 @@ from omnigent.server.schemas import (
     SessionSwitchAgentRequest,
     UpdateSessionRequest,
 )
+from omnigent.server.session_title_extensions import TITLE_AUTO_LABEL  # fork
 from omnigent.session_lifecycle import (
     labels_with_closed_status,
 )
