@@ -309,6 +309,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         SqlAlchemyPermissionStore,
     )
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
@@ -322,6 +323,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     permission_store = SqlAlchemyPermissionStore(database_url)
     host_store = HostStore(database_url)
     policy_store = SqlAlchemyPolicyStore(database_url)
+    project_store = SqlAlchemyProjectStore(database_url)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(database_url)
     # Fail startup loud on a malformed `sandbox:` section (an operator
     # typo should not surface as a runtime 502 on the first managed
@@ -418,6 +420,10 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         permission_store=permission_store,
         policy_store=policy_store,
         host_store=host_store,
+        # create_app mounts the projects CRUD router only when this is wired,
+        # so omitting it makes /v1/projects 404 even though the generated
+        # openapi.json (built with a project store) advertises it.
+        project_store=project_store,
         scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,
         account_store=account_store,
