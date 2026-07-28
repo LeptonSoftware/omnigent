@@ -81,7 +81,7 @@ def alices_host(share_app: tuple[FastAPI, HostStore]) -> HostStore:
     :returns: The host store, with Alice's host registered.
     """
     _, host_store = share_app
-    host_store.upsert_on_connect(host_id=_HOST_ID, name="alice-laptop", owner=ALICE)
+    host_store.upsert_on_connect(host_id=_HOST_ID, name="alice-laptop", user_id=ALICE)
     return host_store
 
 
@@ -285,7 +285,7 @@ async def test_unauthenticated_caller_cannot_share(
     monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
 
     host_store = HostStore(db_uri)
-    host_store.upsert_on_connect(host_id=_HOST_ID, name="alice-laptop", owner=ALICE)
+    host_store.upsert_on_connect(host_id=_HOST_ID, name="alice-laptop", user_id=ALICE)
     app = FastAPI()
     app.include_router(
         create_hosts_router(
