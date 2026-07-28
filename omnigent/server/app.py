@@ -53,7 +53,6 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import session_live_state
 from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
-    BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
 from omnigent.server.managed_hosts import ManagedSandboxConfig
@@ -90,6 +89,7 @@ from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
+from omnigent.server.session_title_extensions import ForkAwareTitleCoordinator  # fork
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -1295,7 +1295,8 @@ def create_app(
         tunnel_registry,
         server_version=_server_version(),
     )
-    background_title_coordinator = BackgroundSessionTitleCoordinator(
+    # Fork: adds fork naming + trajectory re-titling on top of upstream's coordinator.
+    background_title_coordinator = ForkAwareTitleCoordinator(
         conversation_store,
         RunnerBackgroundTitleGenerator(runner_router),
     )
@@ -2705,6 +2706,15 @@ def create_app(
                 agent_store=agent_store,
                 agent_cache=agent_cache,
             ),
+            prefix="/v1",
+            tags=["hosts"],
+        )
+        # Fork: shared team hosts — share/unshare lives in its own router so an
+        # upstream refactor of hosts.py cannot orphan it.
+        from omnigent.server.routes.host_sharing import create_host_sharing_router
+
+        app.include_router(
+            create_host_sharing_router(host_store, auth_provider=auth_provider),
             prefix="/v1",
             tags=["hosts"],
         )

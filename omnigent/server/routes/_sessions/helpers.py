@@ -3958,10 +3958,9 @@ async def _validate_session_workspace(
     See ``designs/SESSION_WORKSPACE_SELECTION.md`` for the full
     semantic spec.
 
-    The caller's host access is checked BEFORE the ``host.stat``
-    round-trip the validation performs, so a caller who neither owns the
-    host nor holds a grant on it never reaches another user's host
-    (raises 403/404 via ``resolve_host_access``).
+    The caller's host ownership is checked BEFORE the ``host.stat``
+    round-trip the validation performs, so a non-owner never reaches
+    another user's host (raises 403/404 via ``resolve_host_owner``).
 
     :param user_id: Authenticated caller, e.g.
         ``"alice@example.com"``, or ``None`` when auth is disabled.

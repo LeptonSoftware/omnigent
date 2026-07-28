@@ -7062,7 +7062,7 @@
     },
     "/v1/hosts": {
       "get": {
-        "description": "List the hosts the authenticated user can reach.\n\nHosts they own, plus hosts a teammate has shared with them\n(see `POST /hosts/{host_id}/share`). Returns both online and\noffline hosts, with live runner information for online hosts.\n\n**Returns:** `{\"hosts\": [...]}` with host details.",
+        "description": "List all hosts owned by the authenticated user.\n\nReturns both online and offline hosts, with live runner\ninformation for online hosts.\n\n**Returns:** `{\"hosts\": [...]}` with host details.",
         "operationId": "list_hosts_v1_hosts_get",
         "responses": {
           "200": {
@@ -7092,7 +7092,7 @@
     },
     "/v1/hosts/{host_id}": {
       "get": {
-        "description": "Get details for a single host.\n\n**Returns:** Host details dict.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist; 403 if the caller neither owns it nor has been granted access.",
+        "description": "Get details for a single host.\n\n**Returns:** Host details dict.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist.",
         "operationId": "get_host_v1_hosts__host_id__get",
         "parameters": [
           {
@@ -7724,7 +7724,7 @@
         ]
       },
       "post": {
-        "description": "Grant a teammate access to a host you own.\n\nOnly the owner may share, and sharing does not transfer\nownership \u2014 the grantee cannot re-share or delete the host.\nIdempotent: re-sharing to the same user updates their level.\n\n**Parameters**\n\n- `body` \u2014 The grantee and access level.\n\n**Returns:** The resulting grant.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist; 403 if the caller does not own it; 400 if sharing with yourself.",
+        "description": "Grant a teammate access to a host you own.\n\nOnly the owner may share, and sharing does not transfer ownership \u2014 the\ngrantee cannot re-share or delete the host. Idempotent: re-sharing to\nthe same user updates their level.\n\n**Parameters**\n\n- `body` \u2014 The grantee and access level.\n\n**Returns:** The resulting grant.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist; 403 if the caller does not own it; 400 if sharing with yourself.",
         "operationId": "share_host_v1_hosts__host_id__share_post",
         "parameters": [
           {
@@ -7780,7 +7780,7 @@
     },
     "/v1/hosts/{host_id}/share/{shared_user_id}": {
       "delete": {
-        "description": "Revoke a teammate's access to a host you own.\n\nSessions the grantee already started keep running \u2014 this stops\nnew launches. Stop them explicitly if that matters.\n\n**Returns:** `{\"revoked\": bool}` \u2014 `False` when no grant existed.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist; 403 if the caller does not own it.",
+        "description": "Revoke a teammate's access to a host you own.\n\nSessions the grantee already started keep running \u2014 this stops new\nlaunches. Stop them explicitly if that matters.\n\n**Returns:** `{\"revoked\": bool}` \u2014 `False` when no grant existed.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist; 403 if the caller does not own it.",
         "operationId": "unshare_host_v1_hosts__host_id__share__shared_user_id__delete",
         "parameters": [
           {
