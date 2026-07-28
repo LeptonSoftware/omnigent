@@ -1259,6 +1259,34 @@ def _build_claude_sdk_spawn_env(
     return env
 
 
+def _apply_harness_path_override(
+    env: dict[str, str],
+    harness: str,
+) -> None:
+    """Thread a config ``harness.<canonical>.command`` into ``OMNIGENT_<NAME>_PATH``.
+
+    The harness wraps read ``OMNIGENT_<NAME>_PATH`` to locate their vendor
+    CLI (the headless CLI-subprocess family historically read ``HARNESS_*_PATH``;
+    both are honored, ``OMNIGENT_*`` canonical). A user can set that path via
+    config (``harness.codex.command: /usr/local/bin/codex``); this threads it
+    into the spawn env when the ambient env var isn't already set (ambient
+    wins, per the shared ``env > config > default`` precedence). A no-op when
+    config has no ``command`` for *harness* or the ambient env var is set.
+
+    :param env: The spawn-env dict being built (mutated in place).
+    :param harness: A harness id (canonical or alias), e.g. ``"codex"``.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harness_startup_config import (
+        _harness_path_env_var,
+        config_harness_path_override,
+    )
+
+    path = config_harness_path_override(harness, load_config())
+    if path is not None:
+        env[_harness_path_env_var(canonicalize_harness(harness) or harness)] = path
+
+
 def _build_codex_spawn_env(
     spec: AgentSpec,
     *,
@@ -1335,6 +1363,7 @@ def _build_codex_spawn_env(
     retry_payload = _serialize_retry_policy(_resolve_retry_policy(spec))
     if retry_payload is not None:
         env["HARNESS_CODEX_RETRY_POLICY"] = retry_payload
+    _apply_harness_path_override(env, "codex")
     return env
 
 
@@ -1389,6 +1418,7 @@ def _build_pi_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_PI_OS_ENV"] = os_env_payload
+    _apply_harness_path_override(env, "pi")
     return env
 
 
@@ -1439,6 +1469,7 @@ def _build_qwen_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_QWEN_OS_ENV"] = os_env_payload
+    _apply_harness_path_override(env, "qwen")
     return env
 
 
@@ -1476,6 +1507,7 @@ def _build_goose_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_GOOSE_OS_ENV"] = os_env_payload
+    _apply_harness_path_override(env, "goose")
     return env
 
 
@@ -1487,9 +1519,9 @@ def _build_acp_spawn_env(
 ) -> dict[str, str]:
     """Build the env-var dict the generic ACP harness wrap reads.
 
-    Resolves the picked ``acp:<slug>`` (carried in ``spec.executor.config`` — the
-    slug is the addressable half of the harness id) to a user-configured agent in
-    the ``acp:`` config block, and forwards its command + protocol knobs as the
+    Prefers a one-shot agent embedded in ``spec.executor.config``; otherwise
+    resolves the picked ``acp:<slug>`` to a user-configured agent in the global
+    ``acp:`` block. The selected command + protocol knobs become the
     ``HARNESS_ACP_*`` env vars defined in ``omnigent/inner/acp_harness.py``.
 
     Like Goose, a generic ACP agent owns its own auth, so this wires **no**
@@ -1512,12 +1544,34 @@ def _build_acp_spawn_env(
 
     # Lazily import the config reader — the hot spawn-env path shouldn't pull in
     # the onboarding/config stack eagerly (mirrors the cursor builder).
-    from omnigent.onboarding.acp_auth import acp_agents, resolve_acp_agent
+    from omnigent.onboarding.acp_auth import (
+        AcpAgentEntry,
+        acp_agents,
+        resolve_acp_agent,
+    )
 
-    agent = resolve_acp_agent(slug) if slug else None
-    if agent is None:
-        agents = acp_agents()
-        agent = agents[0] if agents else None
+    has_embedded = isinstance(cfg, dict) and "acp_agent" in cfg
+    embedded = cfg.get("acp_agent") if has_embedded else None
+    agent: AcpAgentEntry | None = None
+    if has_embedded:
+        if not isinstance(embedded, dict):
+            raise ValueError("executor acp_agent must be a mapping with name and command")
+        name = embedded.get("name")
+        command = embedded.get("command")
+        if not (
+            isinstance(name, str) and name.strip() and isinstance(command, str) and command.strip()
+        ):
+            raise ValueError("executor acp_agent requires non-empty string name and command")
+        agent = AcpAgentEntry(
+            slug=slug or "agent",
+            name=name.strip(),
+            command=command.strip(),
+        )
+    else:
+        agent = resolve_acp_agent(slug) if slug else None
+        if agent is None:
+            agents = acp_agents()
+            agent = agents[0] if agents else None
 
     if agent is not None:
         env["HARNESS_ACP_COMMAND"] = agent.command
@@ -1866,6 +1920,7 @@ def _build_kimi_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_KIMI_OS_ENV"] = os_env_payload
+    _apply_harness_path_override(env, "kimi")
     return env
 
 
