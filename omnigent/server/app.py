@@ -90,6 +90,7 @@ from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.session_title_extensions import ForkAwareTitleCoordinator  # fork
+from omnigent.server.title_gateway import gateway_title_generator_from_env  # fork
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -1295,10 +1296,17 @@ def create_app(
         tunnel_registry,
         server_version=_server_version(),
     )
-    # Fork: adds fork naming + trajectory re-titling on top of upstream's coordinator.
+    # Fork: adds fork naming + trajectory re-titling on top of upstream's
+    # coordinator, and prefers a server-side gateway generator when one is
+    # configured — that path needs no live runner, no runner-side route, and
+    # no per-harness title generator. Falls back to upstream's runner
+    # generator when unset, so an unconfigured deploy behaves as upstream.
+    _title_generator = gateway_title_generator_from_env()
+    if _title_generator is not None:
+        _logger.info("session titles: server-side gateway (model=%s)", _title_generator.model)
     background_title_coordinator = ForkAwareTitleCoordinator(
         conversation_store,
-        RunnerBackgroundTitleGenerator(runner_router),
+        _title_generator or RunnerBackgroundTitleGenerator(runner_router),
     )
     host_registry = HostRegistry()
     # Shared between the host tunnel (which records ``host.runner_exited``

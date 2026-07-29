@@ -217,7 +217,7 @@ def prepare_session_title(
         coordinator is None
         or conversation.parent_conversation_id is not None
         or not _is_fork_placeholder(conversation.title, conversation.labels)
-        or not _background_session_title_harness_supported(conversation.harness_override)
+        or not coordinator._harness_allows_titling(conversation.harness_override)
     ):
         return None
 
@@ -266,6 +266,28 @@ class ForkAwareTitleCoordinator(BackgroundSessionTitleCoordinator):
         # LRU-bounded: a long-lived server sees unboundedly many sessions, and
         # losing state for a cold session only costs it a re-title cycle.
         self._title_state: OrderedDict[str, _SessionTitleState] = OrderedDict()
+
+    @property
+    def harness_independent(self) -> bool:
+        """Whether titling works regardless of the session's harness.
+
+        The runner generator delegates to the session's own harness, so it can
+        only title harnesses that register a title generator. A server-side
+        gateway holds its own model and has no such limit.
+        """
+        from omnigent.server.title_gateway import GatewayBackgroundTitleGenerator
+
+        return isinstance(self._generator, GatewayBackgroundTitleGenerator)
+
+    def _harness_allows_titling(self, harness_override: str | None) -> bool:
+        """Apply the per-harness gate only when the generator needs it.
+
+        :param harness_override: The session's harness, or ``None``.
+        :returns: ``True`` when this session may be titled.
+        """
+        if self.harness_independent:
+            return True
+        return _background_session_title_harness_supported(harness_override)
 
     def _state_for(self, session_id: str) -> _SessionTitleState:
         """Fetch (or create) per-session state, evicting the coldest entry."""
@@ -338,7 +360,7 @@ class ForkAwareTitleCoordinator(BackgroundSessionTitleCoordinator):
         if (
             title is None
             or conversation.parent_conversation_id is not None
-            or not _background_session_title_harness_supported(conversation.harness_override)
+            or not self._harness_allows_titling(conversation.harness_override)
         ):
             return
         title_is_auto = conversation.labels.get(TITLE_AUTO_LABEL) == "1"
