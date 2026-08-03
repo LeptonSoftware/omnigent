@@ -263,7 +263,7 @@ def test_make_auth_token_factory_prefers_host_delegation_over_user_credentials(
 def test_initial_host_token_defers_local_auth_until_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A host bearer covers startup and resolves runner auth only on rejection."""
+    """A host bearer covers startup when the server won't mint an owner JWT."""
     resolve_calls: list[int] = []
     mint_calls: list[int] = []
 
@@ -278,10 +278,12 @@ def test_initial_host_token_defers_local_auth_until_rejected(
         resolve_calls.append(1)
         return _SdkAuth(), "https://workspace.cloud.databricks.com"
 
-    def _unexpected_mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
+    def _declining_mint(mint_url: str, *args: Any, **kwargs: Any) -> tuple[str, float]:
         del args, kwargs
         mint_calls.append(1)
-        raise AssertionError("bootstrap fallback must use runner-local refresh auth")
+        request = httpx.Request("POST", mint_url)
+        response = httpx.Response(400, request=request)
+        raise httpx.HTTPStatusError("no auth provider", request=request, response=response)
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
     monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
@@ -289,7 +291,7 @@ def test_initial_host_token_defers_local_auth_until_rejected(
     monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
     monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
-    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _unexpected_mint)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _declining_mint)
 
     factory = _make_auth_token_factory()
 
@@ -298,7 +300,7 @@ def test_initial_host_token_defers_local_auth_until_rejected(
     assert factory() == "host-bootstrap-token"
     assert factory() == "host-bootstrap-token"
     assert resolve_calls == []
-    assert mint_calls == []
+    assert mint_calls == [1]
 
     request = httpx.Request("GET", "https://app.databricksapps.com/api/version")
     redirect = httpx.Response(302, headers={"Location": "/oidc/oauth2/v2.0/authorize"})
@@ -309,7 +311,58 @@ def test_initial_host_token_defers_local_auth_until_rejected(
         "Bearer runner-refreshed-token",
     ]
     assert resolve_calls == [1]
-    assert mint_calls == []
+    assert mint_calls == [1]
+
+
+def test_owner_mint_preferred_over_host_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host-launched runner adopts the session owner's minted JWT.
+
+    On a shared host the session owner may not be the host owner, and the
+    host bearer cannot read guest-owned sessions (the server masks
+    no-access as 404) — so a successful owner mint must win over the
+    injected host bearer.
+    """
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr(
+        "omnigent.runner._entry._mint_managed_owner_token",
+        lambda mint_url, server_url, binding_token: ("owner-jwt", time.time() + 1800),
+    )
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    assert not isinstance(factory, _InitialAuthTokenFactory)
+    assert RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR not in os.environ
+    assert factory() == "owner-jwt"
+
+
+def test_host_bearer_kept_when_owner_mint_fails_transiently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient mint failure at boot keeps the host bearer, not bare auth."""
+    mint_calls: list[int] = []
+
+    def _flaky_mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        del args, kwargs
+        mint_calls.append(1)
+        raise httpx.ConnectError("mint endpoint unreachable")
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _flaky_mint)
+
+    factory = _make_auth_token_factory()
+
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    assert factory() == "host-bootstrap-token"
+    assert len(mint_calls) >= 1
 
 
 def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(

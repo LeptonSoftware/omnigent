@@ -84,3 +84,4 @@ omnigent/server/smart_routing.py databricks-gpt-5-6-sol 1
 omnigent/server/smart_routing.py databricks-gpt-5-6-terra 1
 omnigent/tools/builtins/spawn.py databricks-claude-opus-4-8 1
 omnigent/tools/builtins/spawn.py system.ai.glm-5-2 1
+omnigent/server/title_gateway.py claude-haiku-4.5 1
