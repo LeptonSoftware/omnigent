@@ -1223,7 +1223,7 @@ async def _run_tunnel_from_env() -> None:
         from omnigent.runtime import telemetry
 
         telemetry.init("omni-runner")
-    except Exception:
+    except Exception:  # noqa: BLE001 — tracing is best-effort; never block runner boot
         _logger.debug("telemetry init failed in runner", exc_info=True)
 
     # Reuse the tunnel's token factory for the app's httpx client so the
