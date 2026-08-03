@@ -361,10 +361,15 @@ def _make_auth_token_factory(
     """Build a callable that mints fresh auth tokens.
 
     Resolution order:
-      1. Host's current bearer, when injected for runner bootstrap. This is
-         used until rejection; local refreshable auth resolves lazily.
-      2. Host-delegated runner token, when the host launch marker and
-         binding token are present.
+      1. Host-delegated runner token, when the host launch marker and
+         binding token are present and the server mints one. The mint
+         resolves the bound session's owner, so a runner on a shared host
+         acts as the session owner — the host owner's bearer cannot read
+         guest-owned sessions.
+      2. Host's current bearer, when injected for runner bootstrap and the
+         owner mint is unavailable (no-auth/header mode, older server, or
+         a failed mint). Used until rejection; local refreshable auth
+         resolves lazily.
       3. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
          (populated by ``omnigent login``), keyed by ``server_url``.
       4. Databricks OAuth token (refreshed via the SDK) — host-keyed
@@ -408,6 +413,24 @@ def _make_auth_token_factory(
         if _allow_initial_token
         else ""
     )
+
+    # Prefer the owner-bound mint over the host bearer: on a shared host the
+    # session owner may not be the host owner, and the host bearer cannot
+    # read guest-owned sessions (the server masks no-access as 404).
+    delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
+    binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
+    if _allow_delegated_mint and delegated_auth and resolved_server_url and binding_token:
+        delegated_factory = _make_managed_mint_factory(resolved_server_url, binding_token)
+        if delegated_factory is not None:
+            # With a host bearer in hand, only adopt the mint once it has
+            # actually produced a token; otherwise keep the bearer so a
+            # transient mint failure doesn't degrade auth at boot.
+            if not initial_token:
+                return delegated_factory
+            if delegated_factory() is not None:
+                _logger.info("using delegated owner mint for runner auth")
+                return delegated_factory
+
     if initial_token and resolved_server_url:
         _logger.info("using host-provided bearer for runner bootstrap")
         return _InitialAuthTokenFactory(initial_token, resolved_server_url)
@@ -417,15 +440,6 @@ def _make_auth_token_factory(
         _DatabricksBearerAuth,
         _resolve_databricks_auth,
     )
-
-    # Prefer the host-launched runner's owner-bound capability so user
-    # credentials stay out of the runner and credential discovery is skipped.
-    delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
-    binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
-    if _allow_delegated_mint and delegated_auth and resolved_server_url and binding_token:
-        delegated_factory = _make_managed_mint_factory(resolved_server_url, binding_token)
-        if delegated_factory is not None:
-            return delegated_factory
 
     # Reused Databricks SDK auth, resolved once on first use and cached
     # here for the life of the factory. Reusing one Config is the whole
@@ -1209,7 +1223,7 @@ async def _run_tunnel_from_env() -> None:
         from omnigent.runtime import telemetry
 
         telemetry.init("omni-runner")
-    except Exception:  # noqa: BLE001 — best-effort; tracing failure must not crash the runner
+    except Exception:
         _logger.debug("telemetry init failed in runner", exc_info=True)
 
     # Reuse the tunnel's token factory for the app's httpx client so the
