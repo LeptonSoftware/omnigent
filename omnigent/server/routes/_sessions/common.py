@@ -22,6 +22,7 @@ from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
 )
+from omnigent.harness_capabilities import ForkHistory
 from omnigent.harness_plugins import (
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
@@ -29,8 +30,10 @@ from omnigent.harness_plugins import (
     KIRO_NATIVE_CODING_AGENT,
     OPENCODE_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
+    harness_capabilities,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
     McpServerStartup,
     SandboxStatus,
@@ -453,6 +456,12 @@ _model_options_cache: dict[str, list[dict[str, Any]]] = {}
 _model_options_inflight: dict[str, asyncio.Task[None]] = {}
 
 
+# Sessions whose cached catalog should be re-fetched at the next snapshot
+# that has a live runner. A stale entry still SERVES in the meantime (and
+# whenever no runner is bound) so the model picker survives runner death.
+_model_options_stale: set[str] = set()
+
+
 _MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
 
 
@@ -579,27 +588,34 @@ _STOP_RUNNER_RESULT_TIMEOUT_S = 10.0
 _COMPACT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
-_FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = frozenset(
-    {
-        "claude-native",
-        "native-claude",
-        "codex-native",
-        "native-codex",
-        "hermes-native",
-        "native-hermes",
-        "pi-native",
-        # qwen-native rebuilds qwen's on-disk chat recording (+ runtime/meta
-        # sidecars) from the copied items, so a fork carries history into the
-        # qwen TUI (see _build_qwen_fork_recording / write_qwen_session_recording).
-        # Only the canonical id is needed — "native-qwen" is aliased to it.
-        "qwen-native",
-    }
-)
+# Derived from the fork_history capability axis (see harness_capabilities). A
+# harness declaring fork_history=REBUILD rebuilds its resumable session file
+# from the copied items (e.g. qwen rebuilds its on-disk chat recording via
+# _build_qwen_fork_recording); PREAMBLE replays prior turns as text
+# (cursor/opencode, whose conversations are server-backed).
+#
+# The read sites match on canonicalize_harness(harness_kind), but several
+# reversed "native-<x>" spellings (native-claude / native-codex / native-cursor)
+# are valid harness ids that canonicalize_harness passes through UNCHANGED — so
+# each canonical id must be listed alongside its reversed spelling, exactly as
+# the pre-derivation literals did (see test_fork_reversed_native_spelling_carry_gating).
+def _fork_history_harness_ids(behavior: ForkHistory) -> frozenset[str]:
+    ids: set[str] = set()
+    for harness, caps in harness_capabilities().items():
+        if caps.fork_history is not behavior:
+            continue
+        ids.add(harness)
+        # Add the reversed "native-<key>" spelling for a canonical "<key>-native"
+        # id; it canonicalizes to itself for some harnesses, so membership needs it.
+        if harness.endswith("-native"):
+            ids.add(f"native-{harness[: -len('-native')]}")
+    return frozenset(ids)
 
 
-_CURSOR_FORK_HISTORY_HARNESSES: frozenset[str] = frozenset(
-    {"cursor-native", "native-cursor", "opencode-native", "native-opencode"}
-)
+_FORK_HISTORY_NATIVE_HARNESSES: frozenset[str] = _fork_history_harness_ids(ForkHistory.REBUILD)
+
+
+_CURSOR_FORK_HISTORY_HARNESSES: frozenset[str] = _fork_history_harness_ids(ForkHistory.PREAMBLE)
 
 
 _DENY_SENTINEL_PREFIX = "[Denied by policy: "
@@ -614,6 +630,12 @@ _MAX_TERMINAL_LAUNCH_ARG_LEN = 4096
 COST_CONTROL_OVERRIDE_VALUES = frozenset({"on", "off"})
 
 
+# Per-session subagent-routing switch. Two-state: only ``"on"`` routes
+# spawns, and ``"off"`` / absent both read as Default. Creates that start
+# on Smart Routing are stamped ``"on"``, so absent is never an inherit.
+SUBAGENT_ROUTING_OVERRIDE_VALUES = frozenset({"on", "off"})
+
+
 _CHILD_PREVIEW_LIMIT = 150
 
 
@@ -624,10 +646,11 @@ _UPLOAD_READ_CHUNK_BYTES: int = 1024 * 1024
 
 
 # Live runner-owned model catalogs, keyed by wrapper label to route segment.
-# Static catalogs bypass this cache so ``refresh_state`` cannot blank them.
 _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
     _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE: "claude-model-options",
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
+    _CURSOR_NATIVE_WRAPPER_LABEL_VALUE: "cursor-model-options",
+    _KIRO_NATIVE_WRAPPER_LABEL_VALUE: "kiro-model-options",
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
     # extension (``external_model_options`` → ``_pushed_model_options_cache``),
@@ -664,8 +687,37 @@ def get_server_runner_router() -> RunnerRouter | None:
     return _server_runner_router
 
 
+# Live host-tunnel registry, set once at app startup (see
+# :func:`set_server_host_registry`). Asleep claude-native sessions refill
+# their model catalog from the session's host (the new-session picker's
+# pre-launch source) via a background task that carries no FastAPI request,
+# so it reads the registry from this module-level global.
+_server_host_registry: HostRegistry | None = None
+
+
+def set_server_host_registry(host_registry: HostRegistry | None) -> None:
+    """Stash the live host registry for asleep-session catalog refills.
+
+    Called once from ``create_app`` so ``_load_model_options_from_host``
+    can reach a session's host connection from background contexts that do
+    not carry the request / route closure.
+
+    :param host_registry: The live host-tunnel registry, or ``None`` in
+        setups without host tunnels.
+    :returns: None.
+    """
+    global _server_host_registry
+    _server_host_registry = host_registry
+
+
+def get_server_host_registry() -> HostRegistry | None:
+    """Return the registry stashed by :func:`set_server_host_registry`."""
+    return _server_host_registry
+
+
 __all__ = [
     "COST_CONTROL_OVERRIDE_VALUES",
+    "SUBAGENT_ROUTING_OVERRIDE_VALUES",
     "_ALLOWED_EVENT_TYPES",
     "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
     "_APPROVAL_TYPE",
@@ -796,6 +848,7 @@ __all__ = [
     "_managed_launch_tasks",
     "_model_options_cache",
     "_model_options_inflight",
+    "_model_options_stale",
     "_native_ask_gate_locks",
     "_native_popup_forward_tasks",
     "_pending_policy_ask_writes",
@@ -806,6 +859,7 @@ __all__ = [
     "_runner_relay_tasks",
     "_runner_skills_cache",
     "_runner_skills_inflight",
+    "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",
     "_session_background_task_count_cache",
@@ -814,7 +868,9 @@ __all__ = [
     "_session_status_cache",
     "_session_terminal_pending_cache",
     "_session_todos_cache",
+    "get_server_host_registry",
     "get_server_runner_router",
+    "set_server_host_registry",
     "set_server_runner_router",
 ]
 
@@ -826,8 +882,8 @@ __all__ = [
 # sibling ``_sessions`` modules resolve the names in their OWN namespace, so a
 # facade-level patch would miss them. These proxies resolve the facade attribute
 # lazily on every access, so a patch on the facade is honoured everywhere the
-# siblings import the name from here. Deliberately NOT in ``__all__`` so the
-# facade's ``import *`` never overwrites its real runtime bindings.
+# siblings import the name from here. Deliberately NOT in ``__all__`` or the
+# facade's explicit imports, preserving its real runtime bindings.
 
 
 def _sessions_facade() -> Any:

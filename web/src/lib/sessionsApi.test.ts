@@ -94,6 +94,7 @@ describe("createSession", () => {
       pendingElicitations: [],
       pendingInputs: [],
       permissionLevel: null,
+      canApprove: null,
       parentSessionId: null,
       subAgentName: null,
       kind: "default",
@@ -525,6 +526,45 @@ describe("runner binding", () => {
     expect(JSON.parse(init.body as string)).toEqual({ cost_control_mode_override: null });
   });
 
+  it("PATCHes subagent_routing_override as snake_case and reads it back", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+        subagent_routing_override: "on",
+      }),
+    );
+
+    const session = await updateSession("conv_abc", { subagentRoutingOverride: "on" });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ subagent_routing_override: "on" });
+    expect(session.subagentRoutingOverride).toBe("on");
+  });
+
+  it("PATCHes an explicit null to clear subagentRoutingOverride", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+        subagent_routing_override: null,
+      }),
+    );
+
+    await updateSession("conv_abc", { subagentRoutingOverride: null });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    // "off" is a real value here too, so the clear signal is a JSON null. The
+    // cleared session reads as Default, the same place "off" lands.
+    expect(JSON.parse(init.body as string)).toEqual({ subagent_routing_override: null });
+  });
+
   it("forwards silent:true so bind-time auto-apply skips runner forward", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
@@ -639,6 +679,20 @@ describe("getSession", () => {
     );
     const session = await getSession("conv_abc");
     expect(session.permissionLevel).toBe(4);
+  });
+
+  it("maps can_approve from the wire to canApprove", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "ag",
+        status: "idle",
+        created_at: 0,
+        can_approve: false,
+      }),
+    );
+    const session = await getSession("conv_abc");
+    expect(session.canApprove).toBe(false);
   });
 
   it("treats a missing permission_level as null", async () => {
@@ -803,7 +857,7 @@ describe("fetchInitialHistoryWindow", () => {
       content: [{ type: "output_text", text: id }],
     };
   }
-  function pageBody(dataNewestFirst: Array<{ id: string }>, hasMore: boolean): Response {
+  function pageBody(dataNewestFirst: { id: string }[], hasMore: boolean): Response {
     return mockJsonResponse({
       object: "list",
       data: dataNewestFirst,

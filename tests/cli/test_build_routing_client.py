@@ -11,6 +11,9 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import click
+import pytest
+
 from omnigent.cli import _build_external_routing_client, _build_local_llm_routing_client
 from omnigent.server.smart_routing import ExternalRoutingClient, LLMRoutingClient
 
@@ -26,7 +29,11 @@ def test_external_builds_client() -> None:
     assert client._url == "https://host/ai-gateway/routing/v1/routes:select"
     assert client._router_name == "task_v0"
     assert client._auth is None  # no profile -> unauthenticated
-    assert client._model_prefixes == []  # no prefix -> catalog ids sent verbatim
+    # No prefix configured -> the module's shared catalog-prefix list, so the
+    # client and the server-side seam can't disagree about a catalog id.
+    from omnigent.server.smart_routing import MODEL_ID_PREFIXES
+
+    assert client._model_prefixes == list(MODEL_ID_PREFIXES)
 
 
 def test_external_threads_model_prefix_scalar() -> None:
@@ -124,6 +131,17 @@ def test_external_missing_required_fields_disables() -> None:
         _build_external_routing_client({"provider": "external", "base_url": "https://h/v1"})
         is None
     )
+
+
+def test_external_rejects_non_string_config_value() -> None:
+    with pytest.raises(click.ClickException, match=r"routing\.base_url must be a string"):
+        _build_external_routing_client(
+            {
+                "provider": "external",
+                "base_url": 123,
+                "router_name": "task_v0",
+            }
+        )
 
 
 def test_llm_without_server_llm_disables() -> None:
