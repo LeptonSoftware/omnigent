@@ -35,6 +35,7 @@ from typing import Any
 
 import httpx
 
+from omnigent.model_fallbacks import title_gateway_model
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INSTRUCTIONS,
     BACKGROUND_TITLE_MAX_OUTPUT_TOKENS,
@@ -52,8 +53,8 @@ DEFAULT_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/v1"
 # gateway, ``openai/gpt-5-mini`` returned 0 completion tokens at 32 and needed
 # ~73 to answer at all, while this model answered in 7. Override with
 # OMNIGENT_TITLE_GATEWAY_MODEL only after checking the model returns content
-# within the cap.
-DEFAULT_TITLE_MODEL = "anthropic/claude-haiku-4.5"
+# within the cap. The id itself lives in the central owned-fallback registry.
+DEFAULT_TITLE_MODEL = title_gateway_model()
 
 # Titles are a few hundred input tokens and ~10 output; a slow gateway must not
 # hold a generation slot for the full runner-path timeout.
