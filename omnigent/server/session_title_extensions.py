@@ -187,6 +187,25 @@ def build_retitle_prompt(conversation_store: ConversationStore, session_id: str)
     return "\n".join(lines)[:_RETITLE_MAX_CHARS]
 
 
+def _coordinator_allows_titling(
+    coordinator: BackgroundSessionTitleCoordinator,
+    harness_override: str | None,
+) -> bool:
+    """Apply the per-harness gate, tolerating a plain upstream coordinator.
+
+    ``_harness_allows_titling`` is a fork addition on
+    :class:`ForkAwareTitleCoordinator`. A base coordinator — upstream's own, or
+    a test double — falls back to upstream's harness gate rather than raising.
+
+    :param coordinator: The active title coordinator.
+    :param harness_override: The session's harness, or ``None``.
+    :returns: ``True`` when this session may be titled.
+    """
+    if isinstance(coordinator, ForkAwareTitleCoordinator):
+        return coordinator._harness_allows_titling(harness_override)
+    return _background_session_title_harness_supported(harness_override)
+
+
 def prepare_session_title(
     *,
     coordinator: BackgroundSessionTitleCoordinator | None,
@@ -217,7 +236,7 @@ def prepare_session_title(
         coordinator is None
         or conversation.parent_conversation_id is not None
         or not _is_fork_placeholder(conversation.title, conversation.labels)
-        or not coordinator._harness_allows_titling(conversation.harness_override)
+        or not _coordinator_allows_titling(coordinator, conversation.harness_override)
     ):
         return None
 

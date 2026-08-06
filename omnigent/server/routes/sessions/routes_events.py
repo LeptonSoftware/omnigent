@@ -192,7 +192,10 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SessionEventInput,
 )
-from omnigent.server.session_title_extensions import prepare_session_title  # fork
+from omnigent.server.session_title_extensions import (  # fork
+    ForkAwareTitleCoordinator,
+    prepare_session_title,
+)
 from omnigent.session_lifecycle import (
     is_session_closed,
 )
@@ -916,7 +919,11 @@ def register_events_routes(
             # Turn-complete edge: refresh an auto-generated title from the
             # session's trajectory once it has drifted enough turns (in-memory
             # check; only re-titles system-set titles, never a hand-typed one).
-            if status == "idle" and background_title_coordinator is not None:
+            # Re-titling is a fork addition; a plain upstream coordinator has no
+            # maybe_retitle, so feature-detect rather than assume the subclass.
+            if status == "idle" and isinstance(
+                background_title_coordinator, ForkAwareTitleCoordinator
+            ):
                 # response_id keys the turn, so repeated idle publishes for one
                 # turn (sub-agent echoes, retries) are counted only once.
                 background_title_coordinator.maybe_retitle(conv, turn_key=response_id)

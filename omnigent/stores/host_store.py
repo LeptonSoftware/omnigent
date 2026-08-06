@@ -16,8 +16,9 @@ import hmac
 import json
 import logging
 from dataclasses import dataclass
+from typing import cast
 
-from sqlalchemy import Engine, or_, select, update
+from sqlalchemy import CursorResult, Engine, or_, select, update
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -826,12 +827,15 @@ class HostStore:
         :returns: ``True`` if a grant was deleted, ``False`` if none existed.
         """
         with self._session("revoke_host_access") as session:
-            result = session.execute(
-                sql_delete(SqlHostPermission).where(
-                    SqlHostPermission.workspace_id == current_workspace_id(),
-                    SqlHostPermission.host_id == host_id,
-                    SqlHostPermission.user_id == user_id,
-                )
+            result = cast(
+                "CursorResult[tuple[object]]",
+                session.execute(
+                    sql_delete(SqlHostPermission).where(
+                        SqlHostPermission.workspace_id == current_workspace_id(),
+                        SqlHostPermission.host_id == host_id,
+                        SqlHostPermission.user_id == user_id,
+                    )
+                ),
             )
             return result.rowcount > 0
 
