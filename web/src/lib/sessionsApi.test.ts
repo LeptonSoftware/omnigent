@@ -833,14 +833,15 @@ describe("fetchInitialHistoryWindow", () => {
     );
   });
 
-  it("pages backward until the previous user message is included (long single turn)", async () => {
+  it("fetches the remainder of the window in one bulk request (long single turn)", async () => {
     // A long turn: one user prompt followed by 19 tool/assistant items, so
     // the first 20-item page contains only ONE user prompt. The previous
-    // prompt lives in the next page; the helper must fetch it.
+    // prompt lives further back; the helper must fetch it — in a single
+    // bulk request, not a cursor-by-cursor page walk.
     const turnFillers = Array.from({ length: 19 }, (_, i) => asstWire(`t${i}`));
     // Page 1 newest-first: fillers then the turn's prompt as the oldest item.
     fetchMock.mockResolvedValueOnce(pageBody([...turnFillers, userWire("u_last")], true));
-    // Page 2 (older): the previous exchange.
+    // Bulk page (older): the previous exchange.
     fetchMock.mockResolvedValueOnce(pageBody([asstWire("a_prev"), userWire("u_prev")], true));
 
     const page = await fetchInitialHistoryWindow("conv_abc");
@@ -850,35 +851,62 @@ describe("fetchInitialHistoryWindow", () => {
     expect(page.items[0]!.id).toBe("u_prev");
     expect(page.items).toHaveLength(22);
     expect(page.hasMore).toBe(true);
-    // Second fetch pages older via the oldest loaded id (u_last) as `after`.
+    // Second fetch pages older via the oldest loaded id (u_last) as `after`,
+    // asking for the entire remaining window at once.
     expect(String(fetchMock.mock.calls[1]![0])).toBe(
-      `/v1/sessions/conv_abc/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc&after=u_last`,
+      `/v1/sessions/conv_abc/items?limit=${7 * SESSION_HISTORY_PAGE_SIZE}&order=desc&after=u_last`,
     );
   });
 
-  it("keeps fetching into a last turn longer than one page until its prompt is reached", async () => {
+  it("reaches a prompt beyond a turn longer than one page in the same two requests", async () => {
     // The newest turn itself spans more than SESSION_HISTORY_PAGE_SIZE
     // items, so the first page is ALL assistant/tool items — zero user
-    // prompts. The helper must page past the full turn to surface the
-    // last user message (the prompt that started it), then one more to
-    // the previous prompt, rather than opening to a response with no
-    // visible prompt above it.
+    // prompts. The bulk request must surface both the last user message
+    // (the prompt that started the turn) and the previous prompt, rather
+    // than opening to a response with no visible prompt above it.
     const tail = Array.from({ length: 20 }, (_, i) => asstWire(`tail${i}`));
     fetchMock.mockResolvedValueOnce(pageBody(tail, true)); // page 1: no user prompt
-    // Page 2: the rest of the long turn, then the prompt that started it.
+    // Bulk page: the rest of the long turn, its prompt, then the previous exchange.
     const head = Array.from({ length: 5 }, (_, i) => asstWire(`head${i}`));
-    fetchMock.mockResolvedValueOnce(pageBody([...head, userWire("u_last")], true));
-    // Page 3: the previous exchange.
-    fetchMock.mockResolvedValueOnce(pageBody([asstWire("a_prev"), userWire("u_prev")], true));
+    fetchMock.mockResolvedValueOnce(
+      pageBody([...head, userWire("u_last"), asstWire("a_prev"), userWire("u_prev")], true),
+    );
 
     const page = await fetchInitialHistoryWindow("conv_abc");
 
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     // The long turn's own prompt is included even though it sat beyond the
     // first page...
     expect(page.items.some((i) => i.id === "u_last")).toBe(true);
     // ...and the window still extends back to the previous prompt.
     expect(page.items[0]!.id).toBe("u_prev");
+  });
+
+  it("trims a bulk overshoot back to the previous-prompt boundary", async () => {
+    // The bulk request can return far more than the boundary needs. The
+    // window is trimmed to the smallest suffix holding one page of items
+    // and the previous prompt; trimmed items stay reachable via scroll-up,
+    // so hasMore flips to true even when the server said the fetch reached
+    // the start of the conversation.
+    const tail = Array.from({ length: 20 }, (_, i) => asstWire(`tail${i}`));
+    fetchMock.mockResolvedValueOnce(pageBody(tail, true)); // page 1: no user prompt
+    const turnRest = Array.from({ length: 10 }, (_, i) => asstWire(`turn${i}`));
+    const older = Array.from({ length: 30 }, (_, i) => asstWire(`old${i}`));
+    fetchMock.mockResolvedValueOnce(
+      pageBody(
+        [...turnRest, userWire("u_last"), asstWire("a_prev"), userWire("u_prev"), ...older],
+        false,
+      ),
+    );
+
+    const page = await fetchInitialHistoryWindow("conv_abc");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // Window opens at the previous prompt, not at the oldest fetched item.
+    expect(page.items[0]!.id).toBe("u_prev");
+    expect(page.items).toHaveLength(33); // u_prev, a_prev, u_last, 10 turn items, 20 tail items
+    // The 30 older items were cut, so more history exists for scroll-up.
+    expect(page.hasMore).toBe(true);
   });
 
   it("stops at the start of a short conversation without spinning", async () => {
@@ -910,18 +938,17 @@ describe("fetchInitialHistoryWindow", () => {
     expect(page.items.filter((i) => i.id === "u_prev" || i.id === "u_last")).toHaveLength(2);
   });
 
-  it("stops at MAX_INITIAL_PAGES, leaving hasMore=true so scroll-up still reaches older items", async () => {
-    // Pathological: a turn so long that 8 pages never reach a second user
-    // prompt. The helper must bound its requests and hand the rest back to
-    // loadMoreHistory (hasMore stays true) rather than fetch unbounded.
-    for (let i = 0; i < 20; i++) {
-      fetchMock.mockResolvedValueOnce(pageBody([asstWire(`p${i}`)], true));
-    }
+  it("never issues a third request, leaving hasMore=true so scroll-up reaches older items", async () => {
+    // Pathological: a turn so long that even the bulk request never reaches
+    // a second user prompt. The helper must bound itself to two requests and
+    // hand the rest back to loadMoreHistory (hasMore stays true) rather than
+    // keep fetching.
+    fetchMock.mockResolvedValueOnce(pageBody([asstWire("p0")], true));
+    fetchMock.mockResolvedValueOnce(pageBody([asstWire("p1")], true));
 
     const page = await fetchInitialHistoryWindow("conv_abc");
 
-    // MAX_INITIAL_PAGES is 8; never more, even with pages still available.
-    expect(fetchMock).toHaveBeenCalledTimes(8);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(page.hasMore).toBe(true);
   });
 });
