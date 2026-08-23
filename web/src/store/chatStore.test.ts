@@ -28,6 +28,7 @@ import type {
   UserMessageBlock,
 } from "@/lib/blocks";
 import type { ConversationItem } from "@/lib/conversationItems";
+import { clearHistoryWindowCache } from "@/lib/historyWindowCache";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { buildBubbles } from "@/lib/renderItems";
 import { SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
@@ -390,6 +391,9 @@ beforeEach(() => {
   fetchMock.mockReset();
   fetchMock.mockImplementation(defaultFetchHandler);
   vi.stubGlobal("fetch", fetchMock);
+  // The history-window cache is module-level state: a window cached by one
+  // test would short-circuit the next test's cold-load path.
+  clearHistoryWindowCache();
 });
 
 afterEach(() => {
@@ -428,6 +432,64 @@ function seedPendingInputs(
 ): void {
   sessionPendingInputs.set(id, inputs);
 }
+
+describe("chatStore — history window cache", () => {
+  it("re-renders a previously viewed session instantly from cache, then reconciles the delta", async () => {
+    const itemsA: ConversationItem[] = [
+      userMessage("resp_1", "hello"),
+      assistantMessage("resp_1", "hi there"),
+    ];
+    seedSession("conv_a", itemsA);
+    seedSession("conv_b", [userMessage("resp_9", "other")]);
+
+    await useChatStore.getState().switchTo("conv_a"); // cold load fills the cache
+    await useChatStore.getState().switchTo("conv_b");
+
+    // New items commit server-side while the user is away on conv_b.
+    seedSession("conv_a", [
+      ...itemsA,
+      userMessage("resp_2", "while away"),
+      assistantMessage("resp_2", "reply"),
+    ]);
+
+    fetchMock.mockClear();
+    const settled = useChatStore.getState().switchTo("conv_a");
+    // Synchronously after the call: the cached window is already on
+    // screen with no loading gate — this is the sub-100ms switch.
+    let state = useChatStore.getState();
+    expect(state.loadingConversation).toBe(false);
+    expect(state.blocks).toHaveLength(2);
+    expect(state.oldestItemId).toBe(itemsA[0]!.id);
+
+    await settled;
+    // The background catch-up appended the two items that landed while
+    // away, in order, without refetching the cached prefix.
+    state = useChatStore.getState();
+    expect(state.blocks).toHaveLength(4);
+    expect((state.blocks[2] as UserMessageBlock).content).toEqual([
+      { type: "input_text", text: "while away" },
+    ]);
+    const itemUrls = fetchMock.mock.calls
+      .map((c) => String(c[0]))
+      .filter((u) => u.includes("/items"));
+    expect(itemUrls).toHaveLength(1);
+    expect(itemUrls[0]).toBe(
+      `/v1/sessions/conv_a/items?limit=1000&order=asc&after=${itemsA[1]!.id}`,
+    );
+  });
+
+  it("keeps the cold-load gate for a session never opened before", async () => {
+    seedSession("conv_cold", [userMessage("resp_1", "hi")]);
+
+    const settled = useChatStore.getState().switchTo("conv_cold");
+    expect(useChatStore.getState().loadingConversation).toBe(true);
+    expect(useChatStore.getState().blocks).toHaveLength(0);
+
+    await settled;
+    expect(useChatStore.getState().loadingConversation).toBe(false);
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+  });
+});
 
 describe("chatStore — switchTo", () => {
   it("hydrates blocks from the session snapshot when switching to a real conv id", async () => {
