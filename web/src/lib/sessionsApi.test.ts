@@ -10,9 +10,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   approve,
   bindOnlyOnlineRunner,
+  catchUpHistoryWindow,
   createSession,
   fetchInitialHistoryWindow,
   fetchSessionItemsPage,
+  fetchSessionItemsSince,
   forkSession,
   getSession,
   getSessionSlim,
@@ -950,6 +952,98 @@ describe("fetchInitialHistoryWindow", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(page.hasMore).toBe(true);
+  });
+});
+
+describe("catchUpHistoryWindow", () => {
+  // Minimal wire items; only ids matter to the stitch logic.
+  function wireItem(id: string, role: "user" | "assistant" = "assistant") {
+    return {
+      id,
+      response_id: `resp_${id}`,
+      type: "message",
+      role,
+      status: "completed",
+      content: [{ type: role === "user" ? "input_text" : "output_text", text: id }],
+    };
+  }
+  function listBody(data: Array<{ id: string }>, hasMore: boolean): Response {
+    return mockJsonResponse({
+      object: "list",
+      data,
+      first_id: data[0]?.id ?? null,
+      last_id: data.at(-1)?.id ?? null,
+      has_more: hasMore,
+    });
+  }
+  const cachedItems = [wireItem("i1", "user"), wireItem("i2")] as never[];
+
+  it("fetchSessionItemsSince asks ascending past the cursor with the max page size", async () => {
+    fetchMock.mockResolvedValueOnce(listBody([wireItem("i3"), wireItem("i4")], false));
+
+    const delta = await fetchSessionItemsSince("conv_abc", "i2");
+
+    expect(String(fetchMock.mock.calls[0]![0])).toBe(
+      "/v1/sessions/conv_abc/items?limit=1000&order=asc&after=i2",
+    );
+    expect(delta.items.map((i) => i.id)).toEqual(["i3", "i4"]);
+    expect(delta.overflowed).toBe(false);
+  });
+
+  it("appends the delta to the cached window and keeps the cached hasMore", async () => {
+    fetchMock.mockResolvedValueOnce(listBody([wireItem("i3")], false));
+
+    const page = await catchUpHistoryWindow("conv_abc", { items: cachedItems, hasMore: true });
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(page.items.map((i) => i.id)).toEqual(["i1", "i2", "i3"]);
+    expect(page.hasMore).toBe(true);
+  });
+
+  it("falls back to a fresh initial window when the delta overflows one page", async () => {
+    // First request: the delta, too big for one page. The stitch would
+    // leave a gap, so the helper refetches the window from scratch.
+    fetchMock.mockResolvedValueOnce(listBody([wireItem("i3")], true));
+    // Second request: fetchInitialHistoryWindow's first (desc) page.
+    fetchMock.mockResolvedValueOnce(
+      listBody([wireItem("f2", "user"), wireItem("f1", "user")], false),
+    );
+
+    const page = await catchUpHistoryWindow("conv_abc", { items: cachedItems, hasMore: true });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[1]![0])).toBe(
+      `/v1/sessions/conv_abc/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc`,
+    );
+    expect(page.items.map((i) => i.id)).toEqual(["f1", "f2"]);
+    expect(page.hasMore).toBe(false);
+  });
+
+  it("falls back to a fresh initial window when the delta read fails", async () => {
+    // E.g. the cached tail item no longer exists server-side.
+    fetchMock.mockRejectedValueOnce(new Error("410 Gone"));
+    fetchMock.mockResolvedValueOnce(
+      listBody([wireItem("f2", "user"), wireItem("f1", "user")], false),
+    );
+
+    const page = await catchUpHistoryWindow("conv_abc", { items: cachedItems, hasMore: true });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(page.items.map((i) => i.id)).toEqual(["f1", "f2"]);
+  });
+
+  it("treats an empty cached window as a cold load", async () => {
+    fetchMock.mockResolvedValueOnce(
+      listBody([wireItem("f2", "user"), wireItem("f1", "user")], false),
+    );
+
+    const page = await catchUpHistoryWindow("conv_abc", { items: [], hasMore: false });
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(String(fetchMock.mock.calls[0]![0])).toBe(
+      `/v1/sessions/conv_abc/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc`,
+    );
+    expect(page.items.map((i) => i.id)).toEqual(["f1", "f2"]);
   });
 });
 

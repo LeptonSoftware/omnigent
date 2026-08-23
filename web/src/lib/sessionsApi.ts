@@ -818,6 +818,33 @@ export async function fetchSessionItemsPage(
 }
 
 /**
+ * Fetch every item strictly newer than `afterId`, oldest-to-newest —
+ * the catch-up read for a cached history window. One request; the
+ * server caps a page at 1000 items, so `overflowed` reports whether
+ * even more items exist beyond what one page could carry (the caller
+ * should then discard the cache and re-hydrate a fresh window instead
+ * of stitching).
+ */
+export interface SessionItemsDelta {
+  /** Items newer than the cursor, oldest-to-newest. */
+  items: ConversationItem[];
+  /** True when the delta did not fit in one page. */
+  overflowed: boolean;
+}
+
+export async function fetchSessionItemsSince(
+  sessionId: string,
+  afterId: string,
+): Promise<SessionItemsDelta> {
+  const params = new URLSearchParams({ limit: "1000", order: "asc", after: afterId });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+  );
+  const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
+  return { items: page.data, overflowed: page.has_more };
+}
+
+/**
  * Upper bound, in pages, on how far back `fetchInitialHistoryWindow`
  * reaches for the previous-user-message boundary. Caps a pathological
  * single turn (thousands of tool calls between two user prompts) from
@@ -888,6 +915,34 @@ export async function fetchInitialHistoryWindow(sessionId: string): Promise<Sess
   // turn spanning the whole bulk fetch), `hasMore` stays true so the rest
   // remains reachable via scroll-up — same fallback as the default.
   return { items, hasMore };
+}
+
+/**
+ * Bring a cached history window up to date with ONE catch-up request:
+ * fetch only the items newer than the cached tail and append them. This
+ * is the fetch path for a session whose window `switchTo` already
+ * rendered from cache — usually a tiny (often empty) delta instead of
+ * re-downloading the whole window.
+ *
+ * Falls back to a full `fetchInitialHistoryWindow` when the cache can't
+ * be trusted to stitch: an empty cache entry, a delta too large for one
+ * page, or a failed delta read (e.g. the cached tail item no longer
+ * exists server-side).
+ */
+export async function catchUpHistoryWindow(
+  sessionId: string,
+  cached: { items: ConversationItem[]; hasMore: boolean },
+): Promise<SessionItemsPage> {
+  const tailId = cached.items.at(-1)?.id;
+  if (tailId === undefined) return fetchInitialHistoryWindow(sessionId);
+  let delta: SessionItemsDelta;
+  try {
+    delta = await fetchSessionItemsSince(sessionId, tailId);
+  } catch {
+    return fetchInitialHistoryWindow(sessionId);
+  }
+  if (delta.overflowed) return fetchInitialHistoryWindow(sessionId);
+  return { items: [...cached.items, ...delta.items], hasMore: cached.hasMore };
 }
 
 /**

@@ -56,11 +56,13 @@ import type {
 import { BlockStream } from "@/lib/blockStream";
 import { isSystemUserContent } from "@/lib/systemMessage";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { getCachedHistoryWindow, setCachedHistoryWindow } from "@/lib/historyWindowCache";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   ApiError,
   approve as approveElicitation,
   bindOnlyOnlineRunner,
+  catchUpHistoryWindow,
   createSession,
   getSessionSlim,
   fetchInitialHistoryWindow,
@@ -1545,6 +1547,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // events to state.blocks.
     get().abortController?.abort();
 
+    // Seed from the history-window cache: a recently viewed session
+    // renders its last known window immediately (no loading gate), and
+    // bindStream reconciles with a delta fetch in the background.
+    const cachedWindow = conversationId !== null ? getCachedHistoryWindow(conversationId) : null;
+
     set((s) => {
       // Stash the OUTGOING conversation's still-in-flight optimistic
       // bubbles and restore the INCOMING one's. Until a send's POST
@@ -1591,9 +1598,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // sessions, so a leftover target (e.g. already consumed by the
         // navigate that brought us here) must not fire again.
         redirectToConversationId: null,
-        // Cleared here, so a different session's in-flight preview blocks
-        // (``live:*``) never bleed across.
-        blocks: [],
+        // Cleared here (or seeded from the cached window), so a different
+        // session's in-flight preview blocks (``live:*``) never bleed across.
+        blocks: cachedWindow !== null ? itemsToBlocks(cachedWindow.items) : [],
         pendingUserMessages:
           conversationId !== null ? (pendingByConversation[conversationId]?.messages ?? []) : [],
         activeResponse: null,
@@ -1605,11 +1612,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
         nativeVendorOwnsModel: false,
         boundAgentId: null,
         boundAgentName: null,
-        loadingConversation: conversationId !== null,
+        // A cache hit skips the loading gate entirely — the seeded window
+        // is on screen while bindStream's delta fetch reconciles.
+        loadingConversation: conversationId !== null && cachedWindow === null,
         conversationLoadError: null,
-        hasMoreHistory: false,
+        hasMoreHistory: cachedWindow?.hasMore ?? false,
         loadingMoreHistory: false,
-        oldestItemId: null,
+        oldestItemId: cachedWindow?.items[0]?.id ?? null,
         llmModel: null,
         sessionHarness: null,
         // ``selectedEffort`` / ``selectedModel`` are sticky user picks —
@@ -1647,7 +1656,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // native messages; when one was, bindStream dedupes it against the
     // committed snapshot. Reconnect/rebind paths pass false so they never
     // overwrite the live optimistic bubbles (which would flink).
-    await bindStream(conversationId, set, get, true);
+    await bindStream(conversationId, set, get, true, cachedWindow !== null);
   },
 
   submitApproval: async (elicitationId, action, content) => {
@@ -2302,6 +2311,11 @@ async function bindStream(
   set: Setter,
   get: Getter,
   hydratePending = false,
+  // True when switchTo already rendered this session's cached history
+  // window: fetch only the delta past the cached tail, and let the
+  // reconcile below REPLACE the seeded blocks (they're re-derived from
+  // the merged window) instead of deduping around them.
+  seededFromCache = false,
 ): Promise<void> {
   racedNativeModelOptions.delete(id);
   const controller = new AbortController();
@@ -2341,6 +2355,7 @@ async function bindStream(
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
   try {
+    const cachedWindow = seededFromCache ? getCachedHistoryWindow(id) : null;
     const [session, page] = await Promise.all([
       queryClient.fetchQuery({
         queryKey: ["session", id],
@@ -2348,10 +2363,13 @@ async function bindStream(
         staleTime: 0,
         retry: false,
       }),
-      fetchInitialHistoryWindow(id),
+      cachedWindow !== null
+        ? catchUpHistoryWindow(id, cachedWindow)
+        : fetchInitialHistoryWindow(id),
     ]);
     if (get().conversationId !== id) return;
     const items = page.items;
+    setCachedHistoryWindow(id, { items, hasMore: page.hasMore });
 
     // Sticky-pref handoff for CLI-created sessions with no override.
     const nativeModelFamily = nativeModelFamilyForSession(session);
@@ -2445,15 +2463,28 @@ async function bindStream(
           ...session,
           codexModelOptions: racedOptions!,
         });
+      // On a cache-seeded bind, state.blocks starts with the seeded window's
+      // blocks. The merged window (`items`) is a superset of the seed, so
+      // drop every block whose item the merged window covers and let
+      // `snapshotBlocks` re-provide them in order — deduping around the
+      // seed instead would prepend the delta's NEWER items before it.
+      // Blocks without an itemId (live previews) always survive.
+      const mergedItemIds = seededFromCache
+        ? new Set(items.map((item) => item.id).filter(Boolean))
+        : null;
+      const retainedBlocks =
+        mergedItemIds !== null
+          ? state.blocks.filter((b) => !b.ctx.itemId || !mergedItemIds.has(b.ctx.itemId))
+          : state.blocks;
       const seenItemIds = new Set(
-        state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+        retainedBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
       );
       const unique = snapshotBlocks.filter((b) => !b.ctx.itemId || !seenItemIds.has(b.ctx.itemId));
       // Dedupe against any elicitation blocks already produced by
       // the live pump (the snapshot may race ahead of or behind
       // the SSE event — match by elicitationId).
       const seenElicitationIds = new Set(
-        state.blocks
+        retainedBlocks
           .filter((b): b is typeof b & { type: "elicitation" } => b.type === "elicitation")
           .map((b) => b.elicitationId),
       );
@@ -2471,7 +2502,7 @@ async function bindStream(
       // live blocks the pump already inserted) so the ApprovalCard
       // appears at the bottom of the chat — same position the live
       // stream would have given it.
-      const allBlocks = [...unique, ...state.blocks, ...uniquePendingElicitations];
+      const allBlocks = [...unique, ...retainedBlocks, ...uniquePendingElicitations];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
       // Decide the optimistic user bubbles to render after this bind, and
       // (on cold load) keep the per-conversation stash consistent.
