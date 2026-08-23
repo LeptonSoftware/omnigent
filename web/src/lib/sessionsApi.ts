@@ -818,12 +818,12 @@ export async function fetchSessionItemsPage(
 }
 
 /**
- * Upper bound on pages `fetchInitialHistoryWindow` will fetch before
- * giving up on reaching the previous-user-message boundary. Caps a
- * pathological single turn (thousands of tool calls between two user
- * prompts) from fanning out into unbounded requests on open. When the
- * cap is hit we stop with `hasMore: true`, so the rest stays reachable
- * via scroll-up `loadMoreHistory` — not a silent truncation.
+ * Upper bound, in pages, on how far back `fetchInitialHistoryWindow`
+ * reaches for the previous-user-message boundary. Caps a pathological
+ * single turn (thousands of tool calls between two user prompts) from
+ * pulling unbounded history on open. When the cap is hit we stop with
+ * `hasMore: true`, so the rest stays reachable via scroll-up
+ * `loadMoreHistory` — not a silent truncation.
  */
 const MAX_INITIAL_PAGES = 8;
 
@@ -846,29 +846,47 @@ function isUserPrompt(item: ConversationItem): boolean {
  * its preceding prompt are always on screen.
  *
  * Cost: the common case (a page that already holds ≥2 user prompts) is a
- * single request, identical to `fetchSessionItemsPage`. Extra requests
- * fire only for long single turns — exactly the case this targets.
- * Bounded by `MAX_INITIAL_PAGES`.
+ * single request, identical to `fetchSessionItemsPage`. When the boundary
+ * is further back — an agentic session whose last turn is a long run of
+ * tool calls — the remainder of the window is fetched in ONE bulk request
+ * rather than paged cursor-by-cursor: serial round-trips are what made
+ * opening such sessions slow. Never more than two requests total.
  *
  * Returns the same `{ items, hasMore }` shape as `fetchSessionItemsPage`
  * so callers feed `oldestItemId` / `hasMoreHistory` from it unchanged.
  */
 export async function fetchInitialHistoryWindow(sessionId: string): Promise<SessionItemsPage> {
-  let items: ConversationItem[] = [];
-  let hasMore = true;
-  for (let pages = 0; pages < MAX_INITIAL_PAGES; pages++) {
-    const cursor = items[0]?.id;
-    const page = await fetchSessionItemsPage(sessionId, cursor ? { olderThan: cursor } : {});
-    items = [...page.items, ...items]; // prepend the older page
-    hasMore = page.hasMore;
-    if (!hasMore) break; // reached the start of the conversation
-    const userCount = items.filter(isUserPrompt).length;
-    if (items.length >= SESSION_HISTORY_PAGE_SIZE && userCount >= 2) break;
-    if (!items[0]?.id) break; // no cursor to page further; avoid a spin
+  const windowMet = (items: ConversationItem[]): boolean =>
+    items.length >= SESSION_HISTORY_PAGE_SIZE && items.filter(isUserPrompt).length >= 2;
+
+  const first = await fetchSessionItemsPage(sessionId);
+  let items = first.items;
+  let hasMore = first.hasMore;
+  if (hasMore && !windowMet(items) && items[0]?.id) {
+    const rest = await fetchSessionItemsPage(sessionId, {
+      olderThan: items[0].id,
+      limit: (MAX_INITIAL_PAGES - 1) * SESSION_HISTORY_PAGE_SIZE,
+    });
+    items = [...rest.items, ...items]; // prepend the older bulk page
+    hasMore = rest.hasMore;
   }
-  // If the cap stopped us before the previous user prompt (a pathological
-  // single turn spanning >MAX_INITIAL_PAGES pages), `hasMore` stays true so
-  // the rest remains reachable via scroll-up — same fallback as the default.
+  // Trim the bulk fetch back to the boundary: the smallest suffix holding
+  // one page of items and the previous user prompt. Trimmed items stay
+  // reachable via scroll-up, so this is a render bound, not truncation.
+  if (windowMet(items)) {
+    let prompts = 0;
+    for (let i = items.length - 1; i > 0; i--) {
+      if (isUserPrompt(items[i])) prompts++;
+      if (prompts >= 2 && items.length - i >= SESSION_HISTORY_PAGE_SIZE) {
+        items = items.slice(i);
+        hasMore = true;
+        break;
+      }
+    }
+  }
+  // If the window cap stopped us before the previous user prompt (a single
+  // turn spanning the whole bulk fetch), `hasMore` stays true so the rest
+  // remains reachable via scroll-up — same fallback as the default.
   return { items, hasMore };
 }
 
