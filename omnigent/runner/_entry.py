@@ -448,6 +448,23 @@ class _InitialAuthTokenFactory:
             f = self._fallback_factory
             return getattr(f, "declined", False) and not getattr(f, "proxy_auth_failed", False)
 
+    def adopt_fallback(self, factory: Callable[[], str | None]) -> None:
+        """Install ``factory`` up front and stop serving the host bearer.
+
+        Fork mint-first path: on a shared host the bearer cannot read
+        guest-owned sessions (the server masks no-access as 404, which never
+        trips the rejection fallback), so a mint that already produced a
+        token is adopted at construction. Adopting it INSIDE this wrapper —
+        rather than returning the bare mint factory — keeps upstream's
+        recovery chain: a mid-session re-mint 403 (``proxy_auth_failed``)
+        still re-resolves SDK/OIDC in the same call instead of bricking
+        every subsequent callback.
+        """
+        with self._lock:
+            self._initial_token = None
+            self._fallback_factory = factory
+            self._fallback_resolved = True
+
     def invalidate(self) -> bool:
         """Discard the host bearer so the next call resolves local auth."""
         with self._lock:
@@ -558,7 +575,9 @@ def _make_auth_token_factory(
                 return delegated_factory
             if delegated_factory() is not None:
                 _logger.info("using delegated owner mint for runner auth")
-                return delegated_factory
+                wrapper = _InitialAuthTokenFactory(initial_token, resolved_server_url)
+                wrapper.adopt_fallback(delegated_factory)
+                return wrapper
 
     if initial_token and resolved_server_url:
         _logger.info(

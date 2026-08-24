@@ -340,7 +340,10 @@ def test_owner_mint_preferred_over_host_bearer(
     factory = _make_auth_token_factory()
 
     assert factory is not None
-    assert not isinstance(factory, _InitialAuthTokenFactory)
+    # The mint is adopted up front, but INSIDE the recovery wrapper so a
+    # mid-session re-mint 403 can still re-resolve SDK/OIDC (OMNI-2529).
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    assert isinstance(factory._fallback_factory, _ManagedMintTokenFactory)
     assert RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR not in os.environ
     assert factory() == "owner-jwt"
 
@@ -406,7 +409,8 @@ def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
     factory = _make_auth_token_factory()
 
     # The working mint wins immediately; the bearer never serves a request.
-    assert isinstance(factory, _ManagedMintTokenFactory)
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    assert isinstance(factory._fallback_factory, _ManagedMintTokenFactory)
     assert factory() == "managed-minted-token"
     assert len(mint_calls) >= 1
     # The bearer is still consumed out of the environment either way.
