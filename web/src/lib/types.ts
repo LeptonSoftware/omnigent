@@ -69,6 +69,12 @@ export interface Usage {
 export interface ErrorInfo {
   code: string;
   message: string;
+  /** Friendly headline for a classified failure, e.g. "Claude Code can't run as root". */
+  title?: string;
+  /** One/two-sentence explanation of why it failed. Paired with `title`. */
+  cause?: string;
+  /** Concrete next step to fix it, e.g. a command to run. */
+  remediation?: string;
 }
 
 /** Details about why a response stopped early. */
@@ -96,7 +102,7 @@ export interface Response {
   /** "queued" | "in_progress" | "completed" | "failed" | "incomplete" | "cancelled". */
   status: string;
   model: string;
-  output?: Array<Record<string, unknown>>;
+  output?: Record<string, unknown>[];
   createdAt?: number;
   completedAt?: number | null;
   previousResponseId?: string | null;
@@ -151,6 +157,8 @@ export type SessionStatus = "idle" | "launching" | "running" | "waiting" | "fail
  * - `"interrupt"`: `{}` (empty data)
  * - `"stop_session"`: `{}` (empty data) — terminate the live session
  *   without deleting its conversation (owner-only)
+ * - `"retry_session"`: `{}` (empty data) — reconnect the existing runner
+ *   without persisting or replaying user input
  * - `"slash_command"`: `{ kind: "skill", name, arguments }` — invoke a
  *   skill the same way the REPL does. The server resolves the skill,
  *   persists a visible receipt plus a hidden `<skill>` meta message,
@@ -165,6 +173,7 @@ export type SessionEventInput =
   | { type: "approval"; data: Record<string, unknown> }
   | { type: "interrupt"; data?: Record<string, unknown> }
   | { type: "stop_session"; data?: Record<string, unknown> }
+  | { type: "retry_session"; data?: Record<string, unknown> }
   | { type: "slash_command"; data: { kind: "skill"; name: string; arguments: string } }
   | { type: string; data: Record<string, unknown> };
 
@@ -283,6 +292,13 @@ export interface Session {
    */
   workspace?: string | null;
   /**
+   * Native-terminal CLI args the session was launched with, e.g.
+   * ``["--permission-mode", "plan"]``. Reflects the LAUNCH command only:
+   * a later permission-mode switch lands in `labels`, so read the mode
+   * via `claudePermissionModeFromSession` rather than from these args.
+   */
+  terminalLaunchArgs?: string[] | null;
+  /**
    * Git branch checked out in a server-created worktree, e.g.
    * ``"feature/login"``. ``null`` when the session uses no worktree.
    * When set on the source, the picker offers a worktree/branch
@@ -315,6 +331,13 @@ export interface Session {
    * "Cost Optimized" toggle.
    */
   costControlModeOverride?: "on" | "off" | null;
+  /**
+   * Per-session routing switch for the sub-agents this session spawns:
+   * `"on"` routes them intelligently, and `"off"` or `null` both run them
+   * on the default model. Sessions that start on Smart Routing are stamped
+   * `"on"` at create, so `null` means Default rather than "inherit".
+   */
+  subagentRoutingOverride?: "on" | "off" | null;
   /** Model context window size in tokens as looked up server-side. */
   contextWindow?: number | null;
   /**
@@ -344,7 +367,13 @@ export interface Session {
    * relying on the transient ``response.error`` SSE event, which may
    * have been emitted before the web client subscribed.
    */
-  lastTaskError?: { code: string; message: string } | null;
+  lastTaskError?: {
+    code: string;
+    message: string;
+    title?: string;
+    cause?: string;
+    remediation?: string;
+  } | null;
   /**
    * Outstanding `response.elicitation_request` event payloads on
    * the snapshot. Replayed into the chat as ApprovalCard blocks on
@@ -353,7 +382,7 @@ export interface Session {
    * raw SSE shape so the existing `sse.ts` parser can fold them
    * back into the block stream.
    */
-  pendingElicitations?: Array<Record<string, unknown>>;
+  pendingElicitations?: Record<string, unknown>[];
   /**
    * Un-consumed web-composer user messages on native-terminal
    * sessions at snapshot time. Replayed so a client that posted then
@@ -402,11 +431,11 @@ export interface Session {
    * build time so the panel survives page refresh. Empty array for
    * non-claude-native sessions or before the first turn creates todos.
    */
-  todos?: Array<{
+  todos?: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
-  }>;
+  }[];
   /**
    * Skills the bound agent has access to (bundled + host-discovered,
    * subject to the spec's ``skills_filter``). Populated by the

@@ -12,6 +12,10 @@ function loadMainHarness({
   forceDevUpdateConfig = false,
   dialogResponses = [{ response: 1, checkboxChecked: false }],
   serverShutdown = () => Promise.resolve(),
+  isPackaged = false,
+  platform = process.platform,
+  developerMode = false,
+  desktopVersionOverride,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-update-test-"));
   fs.writeFileSync(path.join(userData, "settings.json"), JSON.stringify(settings), "utf8");
@@ -43,7 +47,21 @@ function loadMainHarness({
     focus: () => {},
   };
 
+  class FakeSemVer {
+    constructor(version) {
+      if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+        throw new Error(`Invalid version: ${version}`);
+      }
+      this.version = version;
+    }
+
+    format() {
+      return this.version;
+    }
+  }
+
   const autoUpdater = new EventEmitter();
+  autoUpdater.currentVersion = new FakeSemVer("0.3.0");
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
   autoUpdater.forceDevUpdateConfig = forceDevUpdateConfig;
@@ -61,8 +79,9 @@ function loadMainHarness({
 
   const electron = {
     app: {
-      isPackaged: false,
+      isPackaged,
       getPath: (name) => (name === "userData" ? userData : userData),
+      getVersion: () => "0.3.0",
       setName: () => {},
       requestSingleInstanceLock: () => true,
       on: (name, listener) => appEvents.set(name, listener),
@@ -103,7 +122,10 @@ function loadMainHarness({
     screen: {},
     session: { defaultSession: {} },
     shell: {},
-    systemPreferences: {},
+    systemPreferences: {
+      getUserDefault: (key, type) =>
+        key === "DeveloperMode" && type === "boolean" ? developerMode : false,
+    },
   };
 
   const localRequires = {
@@ -113,6 +135,7 @@ function loadMainHarness({
       expandDatabricksWorkspaceUrl: async (url) => url,
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
+    "./workspace-root-bounce": { registerWorkspaceRootBounce: () => {} },
     "./omnigent_cli": {
       isExecutableFile: () => false,
       resolveCliPath: () => null,
@@ -138,7 +161,7 @@ function loadMainHarness({
   // into the menu, the IPC surface, and the before-quit install handoff.
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    '\nmodule.exports.__test = { buildMenu, registerIpc, windows, updater, setQuitTimeouts: (o) => { if (typeof (o && o.cleanup) === "number") quitCleanupTimeoutMs = o.cleanup; if (typeof (o && o.installFallback) === "number") quitInstallFallbackMs = o.installFallback; } }';
+    '\nmodule.exports.testApi = { buildMenu, registerIpc, windows, updater, setQuitTimeouts: (o) => { if (typeof (o && o.cleanup) === "number") quitCleanupTimeoutMs = o.cleanup; if (typeof (o && o.installFallback) === "number") quitInstallFallbackMs = o.installFallback; } }';
 
   const module = { exports: {} };
   const sandbox = {
@@ -154,8 +177,10 @@ function loadMainHarness({
     module,
     process: {
       ...process,
+      platform,
       env: {
         ...process.env,
+        OMNIGENT_DESKTOP_VERSION_OVERRIDE: desktopVersionOverride,
         // No OMNIGENT_FORCE_DEV_UPDATE_CONFIG injection: main.js now derives
         // forceDevUpdateConfig from !app.isPackaged (always true in this
         // harness), not an env var. The harness still controls the
@@ -174,14 +199,14 @@ function loadMainHarness({
   };
 
   vm.runInNewContext(source, sandbox, { filename: mainPath });
-  module.exports.__test.windows.set(win, {
+  module.exports.testApi.windows.set(win, {
     origin: "https://server.example",
     serverUrl: "https://server.example/app",
     badgeCount: 0,
   });
 
   return {
-    api: module.exports.__test,
+    api: module.exports.testApi,
     appEvents,
     autoUpdater,
     calls,
@@ -196,7 +221,9 @@ function loadMainHarness({
 }
 
 async function flushPromises() {
-  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => {
+    setImmediate(resolve);
+  });
 }
 
 function plain(value) {
@@ -211,6 +238,67 @@ function findMenuItem(menu, id) {
   }
   return null;
 }
+
+function hasDebugMenu(menu) {
+  return menu.template.some((item) => item.label === "Debug");
+}
+
+describe("new session menu action", () => {
+  it("routes Cmd/Ctrl+N to the current window without replacing the New Window action", (t) => {
+    const harness = loadMainHarness();
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    const newSessionItem = findMenuItem(menu, "new_session");
+    const newWindowItem = findMenuItem(menu, "new_window");
+
+    assert.equal(newSessionItem.label, "New Session");
+    assert.equal(newSessionItem.accelerator, "CmdOrCtrl+N");
+    assert.equal(newWindowItem.accelerator, undefined);
+
+    newSessionItem.click();
+
+    assert.deepEqual(harness.calls.sent, [{ channel: "omnigent:open-path", payload: "/" }]);
+  });
+});
+
+describe("developer-mode menu wiring", () => {
+  it("keeps the Debug menu in development builds", (t) => {
+    const harness = loadMainHarness({ isPackaged: false, platform: "linux" });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+
+    assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), true);
+  });
+
+  it("hides the Debug menu in packaged builds by default", (t) => {
+    const harness = loadMainHarness({
+      isPackaged: true,
+      platform: "darwin",
+      developerMode: false,
+    });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+
+    assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), false);
+  });
+
+  it("shows the Debug menu when a packaged macOS build opts in", (t) => {
+    const harness = loadMainHarness({
+      isPackaged: true,
+      platform: "darwin",
+      developerMode: true,
+    });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+
+    assert.equal(hasDebugMenu(harness.calls.setApplicationMenu.at(-1)), true);
+  });
+});
 
 describe("auto-update main-process wiring", () => {
   it("preserves unrelated settings keys when writing update config", (t) => {
@@ -262,13 +350,15 @@ describe("auto-update main-process wiring", () => {
       ["omnigent:update-install", []],
       ["omnigent:set-update-config", [{ mode: "manual" }]],
     ];
-    for (const [channel, args] of cases) {
-      const handler = harness.ipcHandlers.get(channel);
-      await assert.rejects(
-        Promise.resolve().then(() => handler(harness.events.unpinned, ...args)),
-        /connected server page/,
-      );
-    }
+    await Promise.all(
+      cases.map(([channel, args]) => {
+        const handler = harness.ipcHandlers.get(channel);
+        return assert.rejects(
+          Promise.resolve().then(() => handler(harness.events.unpinned, ...args)),
+          /connected server page/,
+        );
+      }),
+    );
   });
 
   it("prompts for every privileged update channel before running it", async (t) => {
@@ -305,6 +395,8 @@ describe("auto-update main-process wiring", () => {
       },
     ];
 
+    // Harnesses install process-level module mocks and must run one at a time.
+    /* oxlint-disable no-await-in-loop */
     for (const item of cases) {
       const harness = loadMainHarness({
         forceDevUpdateConfig: true,
@@ -327,6 +419,7 @@ describe("auto-update main-process wiring", () => {
       ]);
       item.assertRan(harness);
     }
+    /* oxlint-enable no-await-in-loop */
   });
 
   it("does not let a cached hosting grant bypass update-control consent", async (t) => {
@@ -360,6 +453,8 @@ describe("auto-update main-process wiring", () => {
       },
     ];
 
+    // Harnesses install process-level module mocks and must run one at a time.
+    /* oxlint-disable no-await-in-loop */
     for (const item of cases) {
       const harness = loadMainHarness({
         forceDevUpdateConfig: true,
@@ -382,6 +477,7 @@ describe("auto-update main-process wiring", () => {
       assert.equal(harness.calls.showMessageBox.length, 1, item.channel);
       item.assertBlocked(harness);
     }
+    /* oxlint-enable no-await-in-loop */
   });
 
   it("routes approved update-install through before-quit cleanup to quitAndInstall", async (t) => {
@@ -436,7 +532,9 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.calls.appQuit, 1); // still no re-issued quit
     assert.equal(harness.calls.appExit, 0); // fallback not fired yet
 
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
     assert.equal(harness.calls.appExit, 1); // fallback forced the exit
     assert.equal(harness.calls.appQuit, 1); // never re-issued
   });
@@ -462,7 +560,9 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.calls.appQuit, 0); // shutdown hung, no re-issued quit
     assert.equal(harness.calls.appExit, 0); // cap not fired yet
 
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
     assert.equal(harness.calls.appExit, 1); // cap forced the exit
     assert.equal(harness.calls.appQuit, 0); // never re-issued
   });
@@ -549,6 +649,41 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.api.updater.installPending, false);
   });
 
+  it("allows only development builds to override the effective desktop version", async (t) => {
+    const development = loadMainHarness({
+      settings: { update_mode: "manual" },
+      desktopVersionOverride: " 0.2.0 ",
+    });
+    t.after(development.cleanup);
+    assert.equal(development.autoUpdater.currentVersion.version, "0.2.0");
+    assert.equal(development.autoUpdater.currentVersion.format(), "0.2.0");
+
+    development.api.updater.init();
+    development.autoUpdater.emit("update-available", { version: "0.4.0" });
+    assert.equal(development.api.updater.getStatus().currentVersion, "0.2.0");
+
+    development.autoUpdater.emit("update-not-available");
+    development.api.buildMenu();
+    await findMenuItem(development.calls.setApplicationMenu.at(-1), "check_for_updates").click();
+    assert.equal(development.calls.showMessageBox.at(-1).options.title, "Omnigent Desktop");
+    assert.equal(
+      development.calls.showMessageBox.at(-1).options.detail,
+      "Omnigent Desktop 0.2.0 is the latest version.",
+    );
+
+    const packaged = loadMainHarness({
+      isPackaged: true,
+      settings: { update_mode: "manual" },
+      desktopVersionOverride: "0.2.0",
+    });
+    t.after(packaged.cleanup);
+    assert.equal(packaged.autoUpdater.currentVersion.version, "0.3.0");
+
+    packaged.api.updater.init();
+    packaged.autoUpdater.emit("update-available", { version: "0.4.0" });
+    assert.equal(packaged.api.updater.getStatus().currentVersion, "0.3.0");
+  });
+
   it("supports forceDevUpdateConfig and broadcasts updater events", (t) => {
     const harness = loadMainHarness({
       forceDevUpdateConfig: true,
@@ -562,12 +697,17 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.autoUpdater.forceDevUpdateConfig, true);
     assert.deepEqual(plain(harness.api.updater.getStatus()), {
       state: "available",
+      currentVersion: "0.3.0",
       info: { version: "0.4.0" },
     });
     assert.deepEqual(plain(harness.calls.sent), [
       {
         channel: "omnigent:update-status",
-        payload: { state: "available", info: { version: "0.4.0" } },
+        payload: {
+          state: "available",
+          currentVersion: "0.3.0",
+          info: { version: "0.4.0" },
+        },
       },
     ]);
   });

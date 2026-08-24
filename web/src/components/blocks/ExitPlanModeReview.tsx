@@ -16,12 +16,13 @@
 //      revises toward it.
 //
 // The plan markdown renders through the same secure Streamdown stack
-// as assistant chat bubbles (`MessageResponse`).
+// as assistant chat bubbles, so file paths and file links a plan names
+// open in the FileViewer just as they do in a message.
 
 import { CheckIcon, XIcon, ZapIcon } from "lucide-react";
 import { useState } from "react";
-import { MessageResponse } from "@/components/ai-elements/message";
 import { Button } from "@/components/ui/button";
+import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 import { Textarea } from "@/components/ui/textarea";
 
 interface ExitPlanModeReviewProps {
@@ -51,8 +52,8 @@ export function ExitPlanModeReview({
           escaping AlertDescription's muted default (which otherwise washes
           the whole plan out). The short lead-in caption above stays muted
           for hierarchy, matching the Codex command card. */}
-      <div className="text-sm text-foreground">
-        <MessageResponse>{plan}</MessageResponse>
+      <div className="text-ui text-foreground">
+        <FilePathAwareMessageResponse>{plan}</FilePathAwareMessageResponse>
       </div>
       {rejecting ? (
         <div className="flex flex-col gap-2 pt-1" data-testid="exit-plan-mode-feedback">
@@ -61,7 +62,7 @@ export function ExitPlanModeReview({
             placeholder="What should change about the plan? (optional)"
             value={feedback}
             onChange={(e) => setFeedback(e.target.value)}
-            className="min-h-20 text-sm"
+            className="min-h-20 text-ui"
           />
           <div className="flex flex-wrap gap-2">
             <Button size="sm" onClick={() => onReject(feedback)}>

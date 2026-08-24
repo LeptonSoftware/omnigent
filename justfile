@@ -10,10 +10,11 @@ DEVICE := env("OMNIGENT_IOS_SIMULATOR", "iPhone 17 Pro")
 
 _check-uv:
     uv run --no-sync ruff --version
+    uv run --no-sync pyrefly --version
     uv run --no-sync pre-commit --version
 
 _ensure-uv:
-    uv sync --extra all --extra dev
+    uv sync --extra all --group dev
 
 # --- iOS Ruby dependencies ---
 
@@ -86,15 +87,25 @@ electron-build: _ensure-web _ensure-electron
 
 [group('lint')]
 lint: _ensure-uv
-    uv run pre-commit run
+    uv run --no-sync pre-commit run
 
 [group('lint')]
 lint-all: _ensure-uv
-    uv run pre-commit run --all-files
+    uv run --no-sync pre-commit run --all-files
+
+[group('lint')]
+typecheck-python: _ensure-uv
+    uv run --no-sync pyrefly check
+
+[group('lint')]
+lint-ts:
+    pnpm install --frozen-lockfile --filter web --filter omnigent-vscode
+    pnpm --filter web run lint
+    pnpm --filter web run type-check
+    pnpm --filter omnigent-vscode run type-check
 
 # --- Lockfile maintenance ---
 
 [group('lint')]
 normalize-locks: _ensure-uv
-    uv run scripts/normalize_package_lock_registry.py editors/vscode/package-lock.json || true
-    uv run scripts/normalize_uv_lock_registry.py uv.lock || true
+    uv run --no-sync scripts/normalize_uv_lock_registry.py uv.lock || true

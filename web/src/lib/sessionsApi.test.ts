@@ -10,11 +10,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   approve,
   bindOnlyOnlineRunner,
-  catchUpHistoryWindow,
   createSession,
-  fetchInitialHistoryWindow,
   fetchSessionItemsPage,
-  fetchSessionItemsSince,
   forkSession,
   getSession,
   getSessionSlim,
@@ -98,6 +95,7 @@ describe("createSession", () => {
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
+      terminalLaunchArgs: null,
       kind: "default",
       backgroundTaskCount: undefined,
       todos: [],
@@ -527,6 +525,45 @@ describe("runner binding", () => {
     expect(JSON.parse(init.body as string)).toEqual({ cost_control_mode_override: null });
   });
 
+  it("PATCHes subagent_routing_override as snake_case and reads it back", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+        subagent_routing_override: "on",
+      }),
+    );
+
+    const session = await updateSession("conv_abc", { subagentRoutingOverride: "on" });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ subagent_routing_override: "on" });
+    expect(session.subagentRoutingOverride).toBe("on");
+  });
+
+  it("PATCHes an explicit null to clear subagentRoutingOverride", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+        subagent_routing_override: null,
+      }),
+    );
+
+    await updateSession("conv_abc", { subagentRoutingOverride: null });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    // "off" is a real value here too, so the clear signal is a JSON null. The
+    // cleared session reads as Default, the same place "off" lands.
+    expect(JSON.parse(init.body as string)).toEqual({ subagent_routing_override: null });
+  });
+
   it("forwards silent:true so bind-time auto-apply skips runner forward", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
@@ -774,276 +811,6 @@ describe("fetchSessionItemsPage", () => {
     expect(String(fetchMock.mock.calls[0]![0])).toBe(
       "/v1/sessions/conv_abc/items?limit=25&order=desc&after=msg_50",
     );
-  });
-});
-
-describe("fetchInitialHistoryWindow", () => {
-  // Wire builders. The server returns one page newest-first (order=desc);
-  // the helper reverses each page to chronological and prepends older
-  // pages, so the assertions below track item ids, not raw wire order.
-  function userWire(id: string, opts: { meta?: boolean } = {}) {
-    return {
-      id,
-      response_id: `resp_${id}`,
-      type: "message",
-      role: "user",
-      status: "completed",
-      content: [{ type: "input_text", text: id }],
-      ...(opts.meta ? { is_meta: true } : {}),
-    };
-  }
-  function asstWire(id: string) {
-    // Stands in for any non-user turn item (assistant text, tool call,
-    // tool output) — only real user prompts count toward the boundary.
-    return {
-      id,
-      response_id: `resp_${id}`,
-      type: "message",
-      role: "assistant",
-      status: "completed",
-      model: "agent_xyz",
-      content: [{ type: "output_text", text: id }],
-    };
-  }
-  function pageBody(dataNewestFirst: Array<{ id: string }>, hasMore: boolean): Response {
-    return mockJsonResponse({
-      object: "list",
-      data: dataNewestFirst,
-      first_id: dataNewestFirst[0]?.id ?? null,
-      last_id: dataNewestFirst[dataNewestFirst.length - 1]?.id ?? null,
-      has_more: hasMore,
-    });
-  }
-
-  it("stops after one fetch when the first page already holds 2+ user prompts", async () => {
-    // 20 items (the floor) with two user prompts → the previous user
-    // message is already on screen, so no extra request is needed. This
-    // is the common case and must stay as cheap as fetchSessionItemsPage.
-    const fillers = Array.from({ length: 18 }, (_, i) => asstWire(`a${i}`));
-    fetchMock.mockResolvedValueOnce(
-      pageBody([...fillers, userWire("u_last"), userWire("u_prev")], true),
-    );
-
-    const page = await fetchInitialHistoryWindow("conv_abc");
-
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(page.items).toHaveLength(SESSION_HISTORY_PAGE_SIZE);
-    expect(page.hasMore).toBe(true);
-    // Single descending request, no cursor — same shape as the plain page.
-    expect(String(fetchMock.mock.calls[0]![0])).toBe(
-      `/v1/sessions/conv_abc/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc`,
-    );
-  });
-
-  it("fetches the remainder of the window in one bulk request (long single turn)", async () => {
-    // A long turn: one user prompt followed by 19 tool/assistant items, so
-    // the first 20-item page contains only ONE user prompt. The previous
-    // prompt lives further back; the helper must fetch it — in a single
-    // bulk request, not a cursor-by-cursor page walk.
-    const turnFillers = Array.from({ length: 19 }, (_, i) => asstWire(`t${i}`));
-    // Page 1 newest-first: fillers then the turn's prompt as the oldest item.
-    fetchMock.mockResolvedValueOnce(pageBody([...turnFillers, userWire("u_last")], true));
-    // Bulk page (older): the previous exchange.
-    fetchMock.mockResolvedValueOnce(pageBody([asstWire("a_prev"), userWire("u_prev")], true));
-
-    const page = await fetchInitialHistoryWindow("conv_abc");
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    // Window now starts at the previous user prompt and runs to the newest item.
-    expect(page.items[0]!.id).toBe("u_prev");
-    expect(page.items).toHaveLength(22);
-    expect(page.hasMore).toBe(true);
-    // Second fetch pages older via the oldest loaded id (u_last) as `after`,
-    // asking for the entire remaining window at once.
-    expect(String(fetchMock.mock.calls[1]![0])).toBe(
-      `/v1/sessions/conv_abc/items?limit=${7 * SESSION_HISTORY_PAGE_SIZE}&order=desc&after=u_last`,
-    );
-  });
-
-  it("reaches a prompt beyond a turn longer than one page in the same two requests", async () => {
-    // The newest turn itself spans more than SESSION_HISTORY_PAGE_SIZE
-    // items, so the first page is ALL assistant/tool items — zero user
-    // prompts. The bulk request must surface both the last user message
-    // (the prompt that started the turn) and the previous prompt, rather
-    // than opening to a response with no visible prompt above it.
-    const tail = Array.from({ length: 20 }, (_, i) => asstWire(`tail${i}`));
-    fetchMock.mockResolvedValueOnce(pageBody(tail, true)); // page 1: no user prompt
-    // Bulk page: the rest of the long turn, its prompt, then the previous exchange.
-    const head = Array.from({ length: 5 }, (_, i) => asstWire(`head${i}`));
-    fetchMock.mockResolvedValueOnce(
-      pageBody([...head, userWire("u_last"), asstWire("a_prev"), userWire("u_prev")], true),
-    );
-
-    const page = await fetchInitialHistoryWindow("conv_abc");
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    // The long turn's own prompt is included even though it sat beyond the
-    // first page...
-    expect(page.items.some((i) => i.id === "u_last")).toBe(true);
-    // ...and the window still extends back to the previous prompt.
-    expect(page.items[0]!.id).toBe("u_prev");
-  });
-
-  it("trims a bulk overshoot back to the previous-prompt boundary", async () => {
-    // The bulk request can return far more than the boundary needs. The
-    // window is trimmed to the smallest suffix holding one page of items
-    // and the previous prompt; trimmed items stay reachable via scroll-up,
-    // so hasMore flips to true even when the server said the fetch reached
-    // the start of the conversation.
-    const tail = Array.from({ length: 20 }, (_, i) => asstWire(`tail${i}`));
-    fetchMock.mockResolvedValueOnce(pageBody(tail, true)); // page 1: no user prompt
-    const turnRest = Array.from({ length: 10 }, (_, i) => asstWire(`turn${i}`));
-    const older = Array.from({ length: 30 }, (_, i) => asstWire(`old${i}`));
-    fetchMock.mockResolvedValueOnce(
-      pageBody(
-        [...turnRest, userWire("u_last"), asstWire("a_prev"), userWire("u_prev"), ...older],
-        false,
-      ),
-    );
-
-    const page = await fetchInitialHistoryWindow("conv_abc");
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    // Window opens at the previous prompt, not at the oldest fetched item.
-    expect(page.items[0]!.id).toBe("u_prev");
-    expect(page.items).toHaveLength(33); // u_prev, a_prev, u_last, 10 turn items, 20 tail items
-    // The 30 older items were cut, so more history exists for scroll-up.
-    expect(page.hasMore).toBe(true);
-  });
-
-  it("stops at the start of a short conversation without spinning", async () => {
-    // Only one user prompt exists; has_more=false means there is nothing
-    // older to fetch. Must return what it has rather than loop forever
-    // chasing a second prompt that doesn't exist.
-    fetchMock.mockResolvedValueOnce(pageBody([asstWire("a_1"), userWire("u_1")], false));
-
-    const page = await fetchInitialHistoryWindow("conv_abc");
-
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(page.items.map((i) => i.id)).toEqual(["u_1", "a_1"]);
-    expect(page.hasMore).toBe(false);
-  });
-
-  it("does not count meta user items toward the boundary", async () => {
-    // Injected context (is_meta) carries role:"user" but is not a real
-    // prompt. A full page of meta-user items must NOT satisfy the
-    // boundary — the helper keeps paging to find genuine prompts.
-    const metaUsers = Array.from({ length: 20 }, (_, i) => userWire(`m${i}`, { meta: true }));
-    fetchMock.mockResolvedValueOnce(pageBody(metaUsers, true));
-    fetchMock.mockResolvedValueOnce(pageBody([userWire("u_last"), userWire("u_prev")], true));
-
-    const page = await fetchInitialHistoryWindow("conv_abc");
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    // Both real prompts present; the meta page alone would have stopped a
-    // count-only window short of any real prompt.
-    expect(page.items.filter((i) => i.id === "u_prev" || i.id === "u_last")).toHaveLength(2);
-  });
-
-  it("never issues a third request, leaving hasMore=true so scroll-up reaches older items", async () => {
-    // Pathological: a turn so long that even the bulk request never reaches
-    // a second user prompt. The helper must bound itself to two requests and
-    // hand the rest back to loadMoreHistory (hasMore stays true) rather than
-    // keep fetching.
-    fetchMock.mockResolvedValueOnce(pageBody([asstWire("p0")], true));
-    fetchMock.mockResolvedValueOnce(pageBody([asstWire("p1")], true));
-
-    const page = await fetchInitialHistoryWindow("conv_abc");
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(page.hasMore).toBe(true);
-  });
-});
-
-describe("catchUpHistoryWindow", () => {
-  // Minimal wire items; only ids matter to the stitch logic.
-  function wireItem(id: string, role: "user" | "assistant" = "assistant") {
-    return {
-      id,
-      response_id: `resp_${id}`,
-      type: "message",
-      role,
-      status: "completed",
-      content: [{ type: role === "user" ? "input_text" : "output_text", text: id }],
-    };
-  }
-  function listBody(data: Array<{ id: string }>, hasMore: boolean): Response {
-    return mockJsonResponse({
-      object: "list",
-      data,
-      first_id: data[0]?.id ?? null,
-      last_id: data.at(-1)?.id ?? null,
-      has_more: hasMore,
-    });
-  }
-  const cachedItems = [wireItem("i1", "user"), wireItem("i2")] as never[];
-
-  it("fetchSessionItemsSince asks ascending past the cursor with the max page size", async () => {
-    fetchMock.mockResolvedValueOnce(listBody([wireItem("i3"), wireItem("i4")], false));
-
-    const delta = await fetchSessionItemsSince("conv_abc", "i2");
-
-    expect(String(fetchMock.mock.calls[0]![0])).toBe(
-      "/v1/sessions/conv_abc/items?limit=1000&order=asc&after=i2",
-    );
-    expect(delta.items.map((i) => i.id)).toEqual(["i3", "i4"]);
-    expect(delta.overflowed).toBe(false);
-  });
-
-  it("appends the delta to the cached window and keeps the cached hasMore", async () => {
-    fetchMock.mockResolvedValueOnce(listBody([wireItem("i3")], false));
-
-    const page = await catchUpHistoryWindow("conv_abc", { items: cachedItems, hasMore: true });
-
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(page.items.map((i) => i.id)).toEqual(["i1", "i2", "i3"]);
-    expect(page.hasMore).toBe(true);
-  });
-
-  it("falls back to a fresh initial window when the delta overflows one page", async () => {
-    // First request: the delta, too big for one page. The stitch would
-    // leave a gap, so the helper refetches the window from scratch.
-    fetchMock.mockResolvedValueOnce(listBody([wireItem("i3")], true));
-    // Second request: fetchInitialHistoryWindow's first (desc) page.
-    fetchMock.mockResolvedValueOnce(
-      listBody([wireItem("f2", "user"), wireItem("f1", "user")], false),
-    );
-
-    const page = await catchUpHistoryWindow("conv_abc", { items: cachedItems, hasMore: true });
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(String(fetchMock.mock.calls[1]![0])).toBe(
-      `/v1/sessions/conv_abc/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc`,
-    );
-    expect(page.items.map((i) => i.id)).toEqual(["f1", "f2"]);
-    expect(page.hasMore).toBe(false);
-  });
-
-  it("falls back to a fresh initial window when the delta read fails", async () => {
-    // E.g. the cached tail item no longer exists server-side.
-    fetchMock.mockRejectedValueOnce(new Error("410 Gone"));
-    fetchMock.mockResolvedValueOnce(
-      listBody([wireItem("f2", "user"), wireItem("f1", "user")], false),
-    );
-
-    const page = await catchUpHistoryWindow("conv_abc", { items: cachedItems, hasMore: true });
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(page.items.map((i) => i.id)).toEqual(["f1", "f2"]);
-  });
-
-  it("treats an empty cached window as a cold load", async () => {
-    fetchMock.mockResolvedValueOnce(
-      listBody([wireItem("f2", "user"), wireItem("f1", "user")], false),
-    );
-
-    const page = await catchUpHistoryWindow("conv_abc", { items: [], hasMore: false });
-
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(String(fetchMock.mock.calls[0]![0])).toBe(
-      `/v1/sessions/conv_abc/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc`,
-    );
-    expect(page.items.map((i) => i.id)).toEqual(["f1", "f2"]);
   });
 });
 
