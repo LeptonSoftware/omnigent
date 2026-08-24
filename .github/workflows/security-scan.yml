@@ -91,8 +91,23 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
         run: |
-          gh pr diff "$PR" --repo "$REPO" > "$GITHUB_WORKSPACE/pr.diff"
-          gh pr diff "$PR" --repo "$REPO" --name-only > "$GITHUB_WORKSPACE/changed.txt"
+          # The diff API refuses PRs touching >300 files (HTTP 406) — an
+          # upstream-sync PR always does. Fall back to a local three-dot
+          # diff against the base branch, which has no size limit.
+          if ! gh pr diff "$PR" --repo "$REPO" > "$GITHUB_WORKSPACE/pr.diff" 2>/dev/null; then
+            echo "::notice::diff API refused (large PR); using local git diff"
+            # This job checks out `main`, so diff the PR's own SHAs, fetched
+            # shallow: a two-dot tree diff needs no merge-base. base.sha is
+            # the base tip at event time, so this equals the PR diff (and on
+            # base drift it only over-scans, never under-scans).
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            git fetch --no-tags --depth=1 origin "$BASE_SHA" "$HEAD_SHA"
+            git diff "$BASE_SHA" "$HEAD_SHA" > "$GITHUB_WORKSPACE/pr.diff"
+            git diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$GITHUB_WORKSPACE/changed.txt"
+          else
+            gh pr diff "$PR" --repo "$REPO" --name-only > "$GITHUB_WORKSPACE/changed.txt"
+          fi
           echo "Changed files:"; cat "$GITHUB_WORKSPACE/changed.txt"
 
       - name: Secret scan (added lines)
