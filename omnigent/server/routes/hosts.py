@@ -47,8 +47,8 @@ from omnigent.onboarding.harness_install import (
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
-from omnigent.server.host_access import host_access_allowed  # fork: shared team hosts
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
+from omnigent.server.host_access import host_access_allowed  # fork: shared team hosts
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_launch

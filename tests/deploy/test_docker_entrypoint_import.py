@@ -215,6 +215,8 @@ def test_build_app_wires_every_router_gating_store(
             "create_app gates its router on the store being wired, so omitting "
             "it silently 404s those routes in the image."
         )
+
+
 # ── routing wiring ────────────────────────────────────────────────────────
 # A Docker deploy must honour its own `routing:` block rather than running on
 # all-default knobs, so the settings that reach RuntimeCaps are the parsed ones.

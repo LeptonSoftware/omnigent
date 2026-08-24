@@ -267,7 +267,7 @@ def test_make_auth_token_factory_prefers_host_delegation_over_user_credentials(
 def test_initial_host_token_defers_local_auth_until_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A host bearer covers startup when the server won't mint an owner JWT."""
+    """A host bearer covers startup and resolves runner auth only on rejection."""
     resolve_calls: list[int] = []
     mint_calls: list[int] = []
 
@@ -282,12 +282,10 @@ def test_initial_host_token_defers_local_auth_until_rejected(
         resolve_calls.append(1)
         return _SdkAuth(), "https://workspace.cloud.databricks.com"
 
-    def _declining_mint(mint_url: str, *args: Any, **kwargs: Any) -> tuple[str, float]:
+    def _unexpected_mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
         del args, kwargs
         mint_calls.append(1)
-        request = httpx.Request("POST", mint_url)
-        response = httpx.Response(400, request=request)
-        raise httpx.HTTPStatusError("no auth provider", request=request, response=response)
+        raise AssertionError("SDK auth available — fallback must prefer it over managed mint")
 
     # A host-launched runner: has an initial bearer and SDK auth, but no
     # managed-sandbox delegation — OMNIGENT_RUNNER_DELEGATED_AUTH is absent.
@@ -297,7 +295,7 @@ def test_initial_host_token_defers_local_auth_until_rejected(
     monkeypatch.delenv("OMNIGENT_RUNNER_DELEGATED_AUTH", raising=False)
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
     monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
-    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _declining_mint)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _unexpected_mint)
 
     factory = _make_auth_token_factory()
 
@@ -306,7 +304,7 @@ def test_initial_host_token_defers_local_auth_until_rejected(
     assert factory() == "host-bootstrap-token"
     assert factory() == "host-bootstrap-token"
     assert resolve_calls == []
-    assert mint_calls == [1]
+    assert mint_calls == []
 
     request = httpx.Request("GET", "https://app.databricksapps.com/api/version")
     redirect = httpx.Response(302, headers={"Location": "/oidc/oauth2/v2.0/authorize"})
@@ -317,7 +315,7 @@ def test_initial_host_token_defers_local_auth_until_rejected(
         "Bearer runner-refreshed-token",
     ]
     assert resolve_calls == [1]
-    assert mint_calls == [1]
+    assert mint_calls == []
 
 
 def test_owner_mint_preferred_over_host_bearer(
@@ -336,7 +334,7 @@ def test_owner_mint_preferred_over_host_bearer(
     monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
     monkeypatch.setattr(
         "omnigent.runner._entry._mint_managed_owner_token",
-        lambda mint_url, server_url, binding_token: ("owner-jwt", time.time() + 1800),
+        lambda mint_url, server_url, binding_token, **_kw: ("owner-jwt", time.time() + 1800),
     )
 
     factory = _make_auth_token_factory()
@@ -374,11 +372,15 @@ def test_host_bearer_kept_when_owner_mint_fails_transiently(
 def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """After the host bearer is rejected, a managed runner falls back to managed mint.
+    """A managed runner with no SDK/OIDC credential runs on the managed mint.
 
-    When no SDK/OIDC credential is available (managed sandbox with no user
-    credential), the fallback must reach the managed-mint path rather than
-    returning None and bricking all HTTP callbacks.
+    Fork semantics (shared team hosts): with OMNIGENT_RUNNER_DELEGATED_AUTH=1
+    a successful owner mint is adopted UP FRONT, before the host bearer — the
+    bearer cannot read guest-owned sessions (the server masks no-access as
+    404, which never trips the lazy rejection fallback). Upstream instead
+    serves the bearer first and reaches the mint only on rejection; this test
+    is upstream's scenario re-asserted under the fork's ordering, and the
+    no-SDK sandbox still ends on a minted JWT rather than a bricked callback.
     """
     mint_calls: list[int] = []
 
@@ -403,21 +405,12 @@ def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
 
     factory = _make_auth_token_factory()
 
-    assert isinstance(factory, _InitialAuthTokenFactory)
-    assert factory() == "host-bootstrap-token"
-    assert mint_calls == []
-
-    request = httpx.Request("GET", "https://app.databricksapps.com/api/version")
-    redirect = httpx.Response(302, headers={"Location": "/oidc/oauth2/v2.0/authorize"})
-    captured = _drive_auth_flow(_RunnerDatabricksAuth(factory), request, redirect)
-
-    # After the initial bearer is rejected, the fallback must mint via the
-    # managed-mint path rather than returning None and bricking callbacks.
-    assert captured == [
-        "Bearer host-bootstrap-token",
-        "Bearer managed-minted-token",
-    ]
+    # The working mint wins immediately; the bearer never serves a request.
+    assert isinstance(factory, _ManagedMintTokenFactory)
+    assert factory() == "managed-minted-token"
     assert len(mint_calls) >= 1
+    # The bearer is still consumed out of the environment either way.
+    assert RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR not in os.environ
 
 
 def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(
@@ -842,6 +835,11 @@ def test_initial_host_token_re_resolves_to_sdk_when_remint_403s_after_expiry(
     ``None`` here means a raised callback, and before the fix it was ``None``
     forever.
 
+    Fork note: with a working mint the fork adopts it up front and this chain
+    never forms, so the construction-time probe is made to DECLINE (400) once —
+    the bearer is kept, and the mint is installed by the lazy fallback exactly
+    as upstream's flow builds it.
+
     :param monkeypatch: Pytest environment patch fixture.
     :returns: None.
     """
@@ -855,11 +853,15 @@ def test_initial_host_token_re_resolves_to_sdk_when_remint_403s_after_expiry(
 
     calls: list[int] = []
 
-    def _mint_ok_then_403(*args: Any, **kwargs: Any) -> tuple[str, float]:
+    def _mint_decline_ok_then_403(*args: Any, **kwargs: Any) -> tuple[str, float]:
         calls.append(1)
-        if len(calls) == 1:
-            return ("minted-jwt", time.time() + 3600)
         request = httpx.Request("POST", "https://app.databricksapps.com/v1/runners/r/token")
+        if len(calls) == 1:  # construction-time probe: decline, keep the bearer
+            raise httpx.HTTPStatusError(
+                "400", request=request, response=httpx.Response(400, request=request)
+            )
+        if len(calls) == 2:  # lazy fallback installs the mint
+            return ("minted-jwt", time.time() + 3600)
         raise httpx.HTTPStatusError(
             "403", request=request, response=httpx.Response(403, request=request)
         )
@@ -870,7 +872,9 @@ def test_initial_host_token_re_resolves_to_sdk_when_remint_403s_after_expiry(
     monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
     monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
-    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint_ok_then_403)
+    monkeypatch.setattr(
+        "omnigent.runner._entry._mint_managed_owner_token", _mint_decline_ok_then_403
+    )
 
     factory = _make_auth_token_factory()
     assert isinstance(factory, _InitialAuthTokenFactory)

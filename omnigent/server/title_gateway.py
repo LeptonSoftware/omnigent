@@ -35,6 +35,7 @@ from typing import Any
 
 import httpx
 
+from omnigent.model_fallbacks import TITLE_GATEWAY_DEFAULT_MODEL
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INSTRUCTIONS,
     BACKGROUND_TITLE_MAX_OUTPUT_TOKENS,
@@ -46,14 +47,11 @@ _logger = logging.getLogger(__name__)
 
 DEFAULT_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/v1"
 
-# Deliberately a NON-REASONING model. A title is capped at
-# BACKGROUND_TITLE_MAX_OUTPUT_TOKENS (32), and a reasoning model spends that
-# whole budget thinking and returns empty content — measured against this
-# gateway, ``openai/gpt-5-mini`` returned 0 completion tokens at 32 and needed
-# ~73 to answer at all, while this model answered in 7. Override with
+# Deliberately a NON-REASONING model — see the _TITLE_GATEWAY_PREFERENCE
+# record in omnigent.model_fallbacks for the measurements. Override with
 # OMNIGENT_TITLE_GATEWAY_MODEL only after checking the model returns content
-# within the cap.
-DEFAULT_TITLE_MODEL = "anthropic/claude-haiku-4.5"
+# within the 32-token cap.
+DEFAULT_TITLE_MODEL = TITLE_GATEWAY_DEFAULT_MODEL
 
 # Titles are a few hundred input tokens and ~10 output; a slow gateway must not
 # hold a generation slot for the full runner-path timeout.

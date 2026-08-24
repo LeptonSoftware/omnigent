@@ -34,6 +34,22 @@ _CODEX_ARM_PREFERENCE = StaticModelFallback(
     discovery_gap="a workspace listing ranks models by neither recency nor capability",
 )
 
+# Deliberately a NON-REASONING model. A title is capped at 32 output tokens,
+# and a reasoning model spends that whole budget thinking and returns empty
+# content — measured against the Vercel AI gateway, ``openai/gpt-5-mini``
+# returned 0 completion tokens at 32 and needed ~73 to answer at all, while
+# this model answered in 7. Consumed by omnigent.server.title_gateway;
+# override per-deployment with OMNIGENT_TITLE_GATEWAY_MODEL.
+_TITLE_GATEWAY_PREFERENCE = StaticModelFallback(
+    model_ids=("anthropic/claude-haiku-4.5",),
+    owner="Fork: server-side session titles (omnigent.server.title_gateway)",
+    provenance="Latency/empty-output measurements against the Vercel AI gateway, 2026-08",
+    discovery_gap="the AI gateway exposes no catalog ranking non-reasoning models for tiny caps",
+)
+
+#: Default model for the gateway title generator (see the record above).
+TITLE_GATEWAY_DEFAULT_MODEL = _TITLE_GATEWAY_PREFERENCE.model_ids[0]
+
 _STATIC_MODEL_FALLBACKS: dict[tuple[str, str], StaticModelFallback] = {
     (SUBSCRIPTION_KIND, "codex"): _CODEX_ARM_PREFERENCE,
 }

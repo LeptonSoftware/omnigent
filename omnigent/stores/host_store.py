@@ -735,7 +735,7 @@ class HostStore:
         :param user_id: The caller, e.g. ``"bob@example.com"``.
         :returns: List of :class:`Host` entities, owned and shared.
         """
-        with self._session() as session:
+        with self._session("list_hosts_accessible_by") as session:
             grant_exists = (
                 select(SqlHostPermission.host_id)
                 .where(
@@ -776,7 +776,7 @@ class HostStore:
         :raises ValueError: If *level* is not a known access level.
         """
         code = encode_host_permission_level(level)
-        with self._session() as session:
+        with self._session("grant_host_access") as session:
             host = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
@@ -825,7 +825,7 @@ class HostStore:
         :param user_id: The grantee to revoke, e.g. ``"bob@example.com"``.
         :returns: ``True`` if a grant was deleted, ``False`` if none existed.
         """
-        with self._session() as session:
+        with self._session("revoke_host_access") as session:
             result = session.execute(
                 sql_delete(SqlHostPermission).where(
                     SqlHostPermission.workspace_id == current_workspace_id(),
@@ -847,7 +847,7 @@ class HostStore:
         :param user_id: The user, e.g. ``"bob@example.com"``.
         :returns: ``"read"`` / ``"use"``, or ``None`` if not granted.
         """
-        with self._session() as session:
+        with self._session("get_host_access_level") as session:
             row = session.execute(
                 select(SqlHostPermission).where(
                     SqlHostPermission.workspace_id == current_workspace_id(),
@@ -869,7 +869,7 @@ class HostStore:
         :param host_id: The host to query, e.g. ``"host_a1b2c3d4..."``.
         :returns: List of :class:`HostGrant` objects.
         """
-        with self._session() as session:
+        with self._session("list_host_grants") as session:
             rows = (
                 session.query(SqlHostPermission)
                 .filter(
