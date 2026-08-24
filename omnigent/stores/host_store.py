@@ -16,6 +16,7 @@ import hmac
 import json
 import logging
 from dataclasses import dataclass
+from typing import Protocol, cast
 
 from sqlalchemy import Engine, or_, select, update
 from sqlalchemy import delete as sql_delete
@@ -54,6 +55,12 @@ from omnigent.harness_availability import HarnessAvailability, is_harness_availa
 # (PING_INTERVAL_S * PING_MISS_THRESHOLD) so a healthy host that is
 # still heart-beating is never falsely aged out.
 HOST_LIVENESS_TTL_S = 90
+
+
+class _RowCountResult(Protocol):
+    """DML results expose rowcount; sqlalchemy types the base Result without it."""
+
+    rowcount: int
 
 
 @dataclass
@@ -833,7 +840,7 @@ class HostStore:
                     SqlHostPermission.user_id == user_id,
                 )
             )
-            return result.rowcount > 0
+            return cast("_RowCountResult", result).rowcount > 0
 
     def get_host_access_level(self, host_id: str, user_id: str) -> str | None:
         """
