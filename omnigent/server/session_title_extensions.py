@@ -214,7 +214,7 @@ def prepare_session_title(
             coordinator=coordinator, conversation=conversation, event=event
         )
     if (
-        coordinator is None
+        not isinstance(coordinator, ForkAwareTitleCoordinator)
         or conversation.parent_conversation_id is not None
         or not _is_fork_placeholder(conversation.title, conversation.labels)
         or not coordinator._harness_allows_titling(conversation.harness_override)
