@@ -284,20 +284,57 @@ export function markConversationUnread(conversationId: string, updatedAt: number
   void syncReadState(conversationId);
 }
 
+function subscribeToMirror(onChange: () => void): () => void {
+  subscribers.add(onChange);
+  return () => subscribers.delete(onChange);
+}
+
 /**
  * Subscribes the caller to read-state mirror writes and returns the current
  * write version, so a component re-renders (and recomputes
  * `isConversationUnseen`) the instant the user marks a row read/unread — not
  * on the next conversations poll.
+ *
+ * The tick only re-renders; it does NOT make a bare `isConversationUnseen`
+ * call downstream recompute — the React Compiler memoizes that call against
+ * its arguments, which a mirror write doesn't change. Anything deriving
+ * render output from the mirror belongs on {@link useConversationUnseen} /
+ * {@link useExplicitlyUnread}; the tick remains for effect dependencies
+ * (see useIdleNotifications), where the version number genuinely flows
+ * into the dependency array.
  */
 export function useUnseenTick(): number {
   return useSyncExternalStore(
-    (onChange) => {
-      subscribers.add(onChange);
-      return () => subscribers.delete(onChange);
-    },
+    subscribeToMirror,
     () => writeVersion,
     () => writeVersion,
+  );
+}
+
+/**
+ * Reactive {@link isConversationUnseen}: recomputes the moment the read-state
+ * mirror changes (mark read/unread), not just when the row's props change.
+ * useSyncExternalStore's snapshot is the one place a mirror read is
+ * contractually re-run on every store write.
+ */
+export function useConversationUnseen(
+  conversationId: string,
+  updatedAt: number,
+  status: string | undefined,
+): boolean {
+  return useSyncExternalStore(
+    subscribeToMirror,
+    () => isConversationUnseen(conversationId, updatedAt, status),
+    () => isConversationUnseen(conversationId, updatedAt, status),
+  );
+}
+
+/** Reactive {@link isExplicitlyUnread} — same contract as {@link useConversationUnseen}. */
+export function useExplicitlyUnread(conversationId: string): boolean {
+  return useSyncExternalStore(
+    subscribeToMirror,
+    () => isExplicitlyUnread(conversationId),
+    () => isExplicitlyUnread(conversationId),
   );
 }
 

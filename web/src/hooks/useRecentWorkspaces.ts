@@ -1,7 +1,7 @@
 // localStorage-backed recent workspace directories, keyed per host
 // (paths are host-specific). Feeds the combobox "Recent" group.
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useState } from "react";
 
 const STORAGE_KEY = "omnigent:recent-workspaces";
 const MAX_PER_HOST = 8;
@@ -59,31 +59,30 @@ export interface RecentWorkspaces {
  *   ``addRecent`` (nothing is host-scoped yet).
  * @returns The host's recent paths plus an ``addRecent`` recorder.
  */
-export function useRecentWorkspaces(hostId: string | null): RecentWorkspaces {
-  // Bumped by addRecent to recompute after a write; the host's list is read
-  // synchronously below, not hydrated via an effect.
-  const [revision, setRevision] = useState(0);
+const NO_RECENTS: string[] = [];
 
-  // Read synchronously and keyed on hostId so ``recent`` is always consistent
-  // with the current host on the same render. A prior effect-based hydration
-  // lagged one render behind hostId, which let a consumer briefly observe the
-  // previous host's paths right after a host switch (a cross-host leak).
-  const recent = useMemo(() => {
-    void revision;
-    return hostId === null ? [] : (readAll()[hostId] ?? []);
-  }, [hostId, revision]);
+export function useRecentWorkspaces(hostId: string | null): RecentWorkspaces {
+  // State owns the whole per-host map; localStorage is only its durable
+  // mirror. The previous shape read storage inside a useMemo keyed on a
+  // bumped counter — an impure memo the React Compiler correctly freezes.
+  // Deriving from state keyed on hostId keeps ``recent`` consistent with the
+  // current host on the same render (an effect-based hydration lagged one
+  // render behind hostId, briefly leaking the previous host's paths).
+  const [all, setAll] = useState<Record<string, string[]>>(readAll);
+  const recent = hostId === null ? NO_RECENTS : (all[hostId] ?? NO_RECENTS);
 
   const addRecent = useCallback(
     (path: string) => {
       if (hostId === null) return;
       const trimmed = path.trim();
       if (!trimmed) return;
-      const all = readAll();
-      const existing = all[hostId] ?? [];
-      const next = [trimmed, ...existing.filter((p) => p !== trimmed)].slice(0, MAX_PER_HOST);
-      all[hostId] = next;
-      writeAll(all);
-      setRevision((r) => r + 1);
+      setAll((prev) => {
+        const existing = prev[hostId] ?? [];
+        const next = [trimmed, ...existing.filter((p) => p !== trimmed)].slice(0, MAX_PER_HOST);
+        const nextAll = { ...prev, [hostId]: next };
+        writeAll(nextAll);
+        return nextAll;
+      });
     },
     [hostId],
   );

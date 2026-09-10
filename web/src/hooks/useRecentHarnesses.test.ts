@@ -79,8 +79,9 @@ describe("useRecentHarnesses", () => {
     });
     const { result } = renderHook(() => useRecentHarnesses());
     // Non-fatal: the in-memory list still updates so the current session sees
-    // the promotion; only persistence is lost.
+    // the promotion; only persistence is lost. (State owns the list; storage
+    // is just its durable mirror.)
     act(() => result.current.addRecentHarness("pi-native"));
-    expect(result.current.recentHarnesses).toEqual([]);
+    expect(result.current.recentHarnesses).toEqual(["pi-native"]);
   });
 });

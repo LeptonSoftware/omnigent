@@ -150,9 +150,9 @@ import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
-  isExplicitlyUnread,
   markConversationUnread,
-  useUnseenTick,
+  useConversationUnseen,
+  useExplicitlyUnread,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -3186,20 +3186,25 @@ function ConversationRow({
   }, [conversation.title, pendingTitle, rename.isSuccess, rename.isError]);
 
   const label = pendingTitle ?? conversationDisplayLabel(conversation);
-  // Recompute unseen state the moment the last-seen map changes (e.g. the
-  // user picks "Mark as unread" on this row) rather than waiting for the
-  // next conversations poll.
-  useUnseenTick();
+  // Reactive mirror reads, so the dot recomputes the moment the last-seen
+  // map changes (e.g. "Mark as unread" on this row) rather than waiting for
+  // the next conversations poll. Must be the hook forms: a bare
+  // `isConversationUnseen(...)` call is memoized against its arguments by
+  // the React Compiler, and a mirror write changes none of them.
+  const contentUnseen = useConversationUnseen(
+    conversation.id,
+    conversation.updated_at,
+    conversation.status,
+  );
+  const explicitlyUnread = useExplicitlyUnread(conversation.id);
   // The dot shows when the conversation is content-unseen AND either the
   // row isn't the one you're viewing OR you explicitly marked it unread.
-  // `isConversationUnseen` still gates on status, so a *running* turn never
+  // `useConversationUnseen` still gates on status, so a *running* turn never
   // shows the dot — marking a working session unread is recorded but stays
   // invisible until the turn finishes (then the dot lights like any unseen
   // row). The explicit override only lifts the active-row suppression, so
   // flagging the thread you're currently viewing surfaces the dot at once.
-  const hasUnseenMessages =
-    isConversationUnseen(conversation.id, conversation.updated_at, conversation.status) &&
-    (!isActive || isExplicitlyUnread(conversation.id));
+  const hasUnseenMessages = contentUnseen && (!isActive || explicitlyUnread);
   // "Mark as unread" is offered on any row not already showing the dot.
   const canMarkUnread = !hasUnseenMessages;
   // Badge precedence: a pending approval ("Needs response") outranks the
