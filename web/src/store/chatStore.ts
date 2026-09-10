@@ -80,7 +80,12 @@ import type {
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
-import { createInitialConversationState, isConversationStateKey } from "./conversationState";
+import {
+  createInitialConversationState,
+  HISTORY_RENDER_GROWTH_STEP,
+  INITIAL_HISTORY_RENDER_COUNT,
+  isConversationStateKey,
+} from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import {
   SSE_STALL_TIMEOUT_MS,
@@ -378,6 +383,14 @@ export interface ConversationState {
   hasMoreHistory: boolean;
   /** True while a `loadMoreHistory` fetch is in flight. */
   loadingMoreHistory: boolean;
+  /**
+   * How many trailing bubbles this conversation renders. Loaded history
+   * beyond it stays in `blocks` but is not mounted — rendering ~100
+   * markdown bubbles per switch is what made switches slow. Grows via
+   * `growHistoryRenderWindow` on scroll-up (before any network page) and
+   * `expandHistoryRenderWindow` for jump-to-top.
+   */
+  historyRenderCount: number;
   /**
    * The item id at the start of the current `blocks` history window —
    * used as the `before` cursor for the next `loadMoreHistory` page
@@ -762,6 +775,17 @@ export interface ChatActions {
    * or there is no active conversation / oldest-item cursor yet.
    */
   loadMoreHistory: () => Promise<void>;
+  /**
+   * Reveal one more step of already-loaded history (scroll-up hit the top of
+   * the rendered window while unrendered blocks exist in memory). Cheaper
+   * than `loadMoreHistory` — no fetch — so callers try this first.
+   */
+  growHistoryRenderWindow: () => void;
+  /**
+   * Render every loaded block (jump-to-top; the reader asked for the whole
+   * history, so windowing would just fight the pinned scroll position).
+   */
+  expandHistoryRenderWindow: () => void;
   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
   flashUserMessage: (itemId: string) => void;
   /** Queue an "@"-mention chip into the active composer from outside it. */
@@ -801,6 +825,10 @@ export interface ChatActions {
 export interface ChatState extends ConversationState, AppChatState, ChatActions {}
 
 let queryClient: QueryClient | null = null;
+// Whether any conversation has bound its stream since this page load. The
+// first bind passes `refresh_state=true` (see bindStream) so a browser
+// reload re-probes the runner; later binds are in-app switches and skip it.
+let hasBoundStreamThisLoad = false;
 
 /**
  * Evict a conversation from the live registry.
@@ -1148,6 +1176,15 @@ export function bindConversationForTest(
 }
 
 /**
+ * Test-only seam: make the next `bindStream` behave like the first bind of a
+ * page load (`refresh_state=true`). The flag is module state, so without this
+ * a test's binds inherit whether some earlier test already bound a stream.
+ */
+export function resetFirstBindForTest(): void {
+  hasBoundStreamThisLoad = false;
+}
+
+/**
  * Initialize the store with the app's QueryClient. Called once at app
  * boot from `main.tsx`. Without this the store can't fetch items
  * through the cache or invalidate the conversations query when a new
@@ -1302,6 +1339,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   claudePermissionMode: "",
   hasMoreHistory: false,
   loadingMoreHistory: false,
+  historyRenderCount: INITIAL_HISTORY_RENDER_COUNT,
   oldestItemId: null,
   flashItemId: null,
   pendingComposerAttachments: [],
@@ -2344,6 +2382,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       pageSet({ loadingMoreHistory: false, hasMoreHistory: false });
     }
   },
+
+  growHistoryRenderWindow: () => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    setterFor(conversationId)((state) => ({
+      historyRenderCount: state.historyRenderCount + HISTORY_RENDER_GROWTH_STEP,
+    }));
+  },
+
+  expandHistoryRenderWindow: () => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    setterFor(conversationId)({ historyRenderCount: Number.MAX_SAFE_INTEGER });
+  },
 }));
 
 // ── Store-action setter ──────────────────────────────────
@@ -3075,10 +3127,19 @@ async function bindStream(
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
     // the reader sees as the transcript shifting seconds after it settled.
+    //
+    // `refresh_state` asks the server to re-probe the runner before answering
+    // — a host-tunnel round trip measured at 300–900ms on live sessions. Its
+    // purpose is piercing stale server-side capability caches after a BROWSER
+    // reload, so only the first bind of a page load pays it; in-app switches
+    // take the server's cached state (kept current by the SSE stream, and by
+    // `refreshSessionState` for explicit refreshes).
+    const refreshState = !hasBoundStreamThisLoad;
+    hasBoundStreamThisLoad = true;
     const [session, page] = await Promise.all([
       queryClient.fetchQuery({
         queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id, { refreshState: true }),
+        queryFn: () => getSessionSlim(id, { refreshState }),
         staleTime: 0,
         retry: false,
       }),

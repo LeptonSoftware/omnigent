@@ -1905,6 +1905,18 @@ function MainAgentSurface({
     [streamBubbles],
   );
 
+  // Only the trailing render window mounts. The rest of the loaded history
+  // stays in the store and is revealed by scroll-up (HistoryAutoLoader grows
+  // the window before it pages the network) — mounting ~100 markdown bubbles
+  // per switch was the dominant switch cost, and content-visibility only
+  // skips layout/paint, not the component render itself.
+  const historyRenderCount = useChatStore((s) => s.historyRenderCount);
+  const hiddenBubbleCount = Math.max(0, streamBubbles.length - historyRenderCount);
+  const renderedBubbles = useMemo(
+    () => (hiddenBubbleCount === 0 ? streamBubbles : streamBubbles.slice(hiddenBubbleCount)),
+    [streamBubbles, hiddenBubbleCount],
+  );
+
   // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — the composer's own unmodified
   // ArrowUp/Down history-recall skips modified arrows, so this fires there too.
   useEffect(() => {
@@ -2151,7 +2163,10 @@ function MainAgentSurface({
                 <ScrollToBottomOnSend nonce={sendScrollNonce} />
                 <KeepBottomOnViewportResize />
                 <ConversationScrollRefBridge onScroller={setScroller} />
-                <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
+                <HistoryAutoLoader
+                  scrollElement={scroller?.el ?? null}
+                  hiddenBubbleCount={hiddenBubbleCount}
+                />
                 {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
                   // Cold launch: a centered spinner instead of the "ready to
                   // type" empty state (the create-then-send path uses the
@@ -2181,12 +2196,14 @@ function MainAgentSurface({
                   <>
                     {/* Older pages prepend here while their request is in flight. */}
                     {loadingMoreHistory && <HistoryLoadingIndicator />}
-                    {streamBubbles.map((bubble, bubbleIndex) => (
+                    {renderedBubbles.map((bubble, bubbleIndex) => (
                       <BubbleView
                         key={bubbleKey(bubble)}
                         bubble={bubble}
-                        isLastAssistant={bubbleIndex === lastAssistantIndex}
-                        showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
+                        isLastAssistant={bubbleIndex + hiddenBubbleCount === lastAssistantIndex}
+                        showsWorking={
+                          showsWorking && bubbleIndex + hiddenBubbleCount === lastAssistantIndex
+                        }
                       />
                     ))}
                     {/* Pending elicitation cards, floated to the bottom of the
@@ -2508,8 +2525,11 @@ const TOUCH_DRAG_SLOP_PX = 8;
 
 export function HistoryAutoLoader({
   scrollElement,
+  hiddenBubbleCount = 0,
 }: {
   scrollElement?: HTMLElement | null;
+  /** Loaded-but-unrendered bubbles above the render window (see ConversationView). */
+  hiddenBubbleCount?: number;
 } = {}) {
   // useStickToBottomContext exposes scrollRef (the actual scroll container
   // element) in the runtime context even though the public TS types only
@@ -2527,6 +2547,7 @@ export function HistoryAutoLoader({
   const [scrollRevision, setScrollRevision] = useState(0);
   const handledScrollRevisionRef = useRef(scrollRevision);
   const oldestItemIdRef = useRef(oldestItemId);
+  const hiddenBubbleCountRef = useRef(hiddenBubbleCount);
   // Whether the reader has asked to move the transcript upward yet.
   //
   // "Near the top" alone is not a request for older history: opening a session
@@ -2610,8 +2631,13 @@ export function HistoryAutoLoader({
     const itemsChanged = !generationChanged && oldestItemIdRef.current !== oldestItemId;
     const scrollPositionChanged =
       !generationChanged && handledScrollRevisionRef.current !== scrollRevision;
+    // A grow-step reveal continues paging the same way a prepend does: while
+    // the reader stays near the top, each reveal re-runs this effect until the
+    // hidden backlog is exhausted and network paging takes over.
+    const revealChanged = !generationChanged && hiddenBubbleCountRef.current !== hiddenBubbleCount;
     oldestItemIdRef.current = oldestItemId;
     handledScrollRevisionRef.current = scrollRevision;
+    hiddenBubbleCountRef.current = hiddenBubbleCount;
 
     if (generationChanged) {
       generationRef.current = historyGeneration;
@@ -2629,18 +2655,25 @@ export function HistoryAutoLoader({
     // request, and this waits for the reader to actually scroll up.
     if (
       !scrolledUpRef.current ||
-      !state.oldestItemId ||
-      !state.hasMoreHistory ||
-      state.loadingMoreHistory ||
-      !(itemsChanged || scrollPositionChanged) ||
+      !(itemsChanged || scrollPositionChanged || revealChanged) ||
       el.scrollTop >= historyLoadThreshold(el)
     ) {
       return;
     }
 
+    // Already-loaded history first: reveal it (a store write, no fetch)
+    // before asking the server for anything older.
+    if (hiddenBubbleCount > 0) {
+      state.growHistoryRenderWindow();
+      return;
+    }
+
+    if (!state.oldestItemId || !state.hasMoreHistory || state.loadingMoreHistory) return;
+
     void state.loadMoreHistory();
   }, [
     ctx.scrollRef,
+    hiddenBubbleCount,
     historyGeneration,
     loadingMoreHistory,
     oldestItemId,
@@ -2912,9 +2945,13 @@ export function JumpToTopButton({
     };
   }, [scrollEl]);
 
-  // Somewhere to go: older pages exist, or we're scrolled down within the
-  // loaded window. At the very first message there's nothing to jump to.
-  const canJump = hasMoreHistory || !atTop;
+  // Somewhere to go: older pages exist, loaded blocks sit above the render
+  // window, or we're scrolled down within it. At the very first message
+  // there's nothing to jump to. blocks-vs-count is an overestimate of hidden
+  // *bubbles* (blocks group into bubbles) — worst case the pill shows and the
+  // jump is a near-no-op.
+  const hasUnrenderedHistory = useChatStore((s) => s.blocks.length > s.historyRenderCount);
+  const canJump = hasMoreHistory || hasUnrenderedHistory || !atTop;
   const visible = jumping || ((hovering || scrolledUp) && canJump);
 
   const jumpToTop = useCallback(async () => {
@@ -2935,6 +2972,12 @@ export function JumpToTopButton({
       stopScroll();
       state.isAtBottom = false;
       state.escapedFromLock = true;
+
+      // Mount everything already loaded — the render window would otherwise
+      // keep the oldest in-memory bubbles unmounted and "top" would land
+      // mid-history.
+      useChatStore.getState().expandHistoryRenderWindow();
+      await nextFrame();
 
       // Page in every older block before scrolling. loadMoreHistory serializes
       // via its own loadingMoreHistory guard (so a concurrent HistoryAutoLoader

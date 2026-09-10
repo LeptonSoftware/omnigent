@@ -287,7 +287,12 @@ export function useWorkspaceChangedFiles(
     // (runner-emitted after file-mutating tools, throttled) drives
     // refetches via chatStore, and ``useTrailingInvalidate`` backstops
     // the final state at end-of-turn. The cold GET on mount bootstraps.
-    staleTime: 5_000,
+    // Long staleTime on purpose: AppShell mounts this for EVERY visible
+    // conversation, so a short window made each chat switch re-fire the
+    // environment→changes chain (2 runner round-trips) for data the SSE
+    // invalidation already keeps correct. Switches inside the window now
+    // serve cache; invalidations still force refetches regardless of it.
+    staleTime: 120_000,
   });
 }
 
@@ -423,7 +428,10 @@ export function useWorkspaceAllFiles(
     // the session's `failed` status downstream, not by retries.
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
-    staleTime: 5_000,
+    // Same reasoning as the changed-files query above: `useTrailingInvalidate`
+    // and the SSE invalidation own freshness; a short window only made every
+    // chat switch redo the runner filesystem listing.
+    staleTime: 60_000,
   });
 }
 

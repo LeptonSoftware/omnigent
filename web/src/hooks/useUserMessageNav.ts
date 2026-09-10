@@ -50,16 +50,34 @@ function getScrollParent(node: Element): Element | null {
  * @param flash - Optional highlight callback fired when the scroll settles.
  */
 export function scrollToUserMessage(itemId: string, flash?: (id: string) => void): void {
-  const el = document.querySelector(
-    // CSS.escape is defensive — itemIds are alphanumeric today.
-    `[data-user-message-id="${CSS.escape(itemId)}"]`,
-  );
-  if (!el) {
-    // Fail loud: id exists in the list but DOM anchor is missing.
-    console.warn(`scrollToUserMessage: no element for itemId=${itemId}`);
+  const find = () =>
+    document.querySelector(
+      // CSS.escape is defensive — itemIds are alphanumeric today.
+      `[data-user-message-id="${CSS.escape(itemId)}"]`,
+    );
+  const el = find();
+  if (el) {
+    scrollToElement(el, itemId, flash);
     return;
   }
+  // The message may be loaded but above the history render window (only the
+  // trailing window of bubbles mounts). Mount everything and retry once the
+  // expansion has committed.
+  useChatStore.getState().expandHistoryRenderWindow();
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      const retried = find();
+      if (!retried) {
+        // Fail loud: id exists in the list but DOM anchor is missing.
+        console.warn(`scrollToUserMessage: no element for itemId=${itemId}`);
+        return;
+      }
+      scrollToElement(retried, itemId, flash);
+    });
+  });
+}
 
+function scrollToElement(el: Element, itemId: string, flash?: (id: string) => void): void {
   // Supersede the previous jump's pending flash so rapid nav only flashes
   // the message we finally land on.
   cancelPendingFlash?.();

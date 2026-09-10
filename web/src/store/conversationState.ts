@@ -10,6 +10,17 @@
 
 import type { ConversationState } from "./chatStore";
 
+/**
+ * How many trailing bubbles a conversation renders when it first paints. The
+ * rest of the loaded history stays in the store and is revealed by
+ * `growHistoryRenderWindow` as the reader scrolls up — rendering all ~100
+ * markdown bubbles on every switch is what made switches slow, not fetching.
+ */
+export const INITIAL_HISTORY_RENDER_COUNT = 20;
+
+/** How many more bubbles each `growHistoryRenderWindow` call reveals. */
+export const HISTORY_RENDER_GROWTH_STEP = 30;
+
 // Exhaustive by construction: `Record<keyof ConversationState, true>` rejects a
 // missing key and a stale one.
 const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
@@ -35,6 +46,7 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   claudePermissionMode: true,
   hasMoreHistory: true,
   loadingMoreHistory: true,
+  historyRenderCount: true,
   oldestItemId: true,
   llmModel: true,
   pendingModelChange: true,
@@ -94,6 +106,7 @@ export function createInitialConversationState(): ConversationState {
     claudePermissionMode: "",
     hasMoreHistory: false,
     loadingMoreHistory: false,
+    historyRenderCount: INITIAL_HISTORY_RENDER_COUNT,
     oldestItemId: null,
     llmModel: null,
     pendingModelChange: null,

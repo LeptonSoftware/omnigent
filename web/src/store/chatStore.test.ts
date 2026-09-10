@@ -63,6 +63,7 @@ import {
   type FrameScheduler,
   bindConversationForTest,
   releaseConversation,
+  resetFirstBindForTest,
 } from "./chatStore";
 import { conversationRegistry } from "./conversationRegistry";
 import {
@@ -463,6 +464,9 @@ beforeEach(() => {
   sessionSubagentRoutingOverrides = new Map();
   sessionLabels = new Map();
   initChatStore(client);
+  // Each test starts as a fresh page load: its first bind refreshes runner
+  // state, later binds in the same test are in-app switches.
+  resetFirstBindForTest();
   // Generous, deterministic slots for tests that aren't about the cap; the
   // dedicated stream-slot tests install their own small-capacity manager.
   setStreamSlotManagerForTest(makeFakeSlotManager());
