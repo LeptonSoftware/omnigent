@@ -2547,6 +2547,28 @@ function isConversationStreamCurrent(id: string): boolean {
 }
 
 /**
+ * Warm a conversation in the background: create its registry entry and bind
+ * its stream, so the first click on it is a warm switch (instant mirror paint)
+ * instead of a cold bind. The entry is a normal background entry — evictable
+ * by the LRU slot pressure, kept current by its SSE stream.
+ *
+ * No-ops when the conversation is active, already live, or *retained-but-dead*
+ * (that entry may hold unsent work; `switchTo` owns that rebind). Never sends
+ * `refresh_state` — the runner probe belongs to a user-driven first bind.
+ */
+export async function prefetchConversation(id: string): Promise<void> {
+  if (useChatStore.getState().conversationId === id) return;
+  if (conversationRegistry.has(id)) return;
+  const entry = conversationRegistry.acquire(id);
+  // Same as switchTo's cold path: if the user clicks mid-prefetch, the page
+  // must show the hydrating placeholder, not the empty state (the entry is
+  // stream-current the moment bindStream installs its controller, so the
+  // click mirrors this entry rather than re-binding).
+  entry.setState({ loadingConversation: true });
+  await bindStream(id, entrySetter(entry), entryGetter(entry), true, { refreshState: false });
+}
+
+/**
  * Tear down an entry's stream, keeping the entry itself alive.
  *
  * Needed before re-binding a live entry: a failed snapshot leaves
@@ -3048,6 +3070,15 @@ async function bindStream(
   set: Setter,
   get: Getter,
   hydratePending = false,
+  opts?: {
+    /**
+     * Override the first-bind-of-this-page-load `refresh_state` heuristic.
+     * A background prefetch passes `false`: it must stay cheap on the server
+     * (no runner tunnel probe) and must not consume the page-load flag — the
+     * first *user-driven* bind still gets its refresh.
+     */
+    refreshState?: boolean;
+  },
 ): Promise<void> {
   racedNativeModelOptions.delete(id);
   const controller = new AbortController();
@@ -3134,8 +3165,8 @@ async function bindStream(
     // reload, so only the first bind of a page load pays it; in-app switches
     // take the server's cached state (kept current by the SSE stream, and by
     // `refreshSessionState` for explicit refreshes).
-    const refreshState = !hasBoundStreamThisLoad;
-    hasBoundStreamThisLoad = true;
+    const refreshState = opts?.refreshState ?? !hasBoundStreamThisLoad;
+    if (opts?.refreshState === undefined) hasBoundStreamThisLoad = true;
     const [session, page] = await Promise.all([
       queryClient.fetchQuery({
         queryKey: ["session", id],

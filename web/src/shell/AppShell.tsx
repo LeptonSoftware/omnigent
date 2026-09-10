@@ -16,6 +16,7 @@ import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
+import { usePrefetchRecentConversations } from "@/hooks/usePrefetchConversations";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
@@ -370,6 +371,9 @@ export function AppShell() {
     [conversationsData],
   );
   useSeedReadState(allConversations);
+  // Warm the most recent threads in the background (one pass, after the
+  // active conversation has settled) so their first click is a warm switch.
+  usePrefetchRecentConversations(allConversations, conversationId);
   const activeConv = useMemo(() => {
     if (!conversationId) return null;
     return (

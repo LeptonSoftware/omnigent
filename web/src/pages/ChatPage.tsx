@@ -2160,6 +2160,7 @@ function MainAgentSurface({
                 )}
               >
                 {/* Scroll helpers — must live inside StickToBottom to access context. */}
+                <ScrollToEndOnSwitch />
                 <ScrollToBottomOnSend nonce={sendScrollNonce} />
                 <KeepBottomOnViewportResize />
                 <ConversationScrollRefBridge onScroller={setScroller} />
@@ -2436,6 +2437,65 @@ function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageN
  * up while streaming, but an explicit send should bring the fresh user bubble
  * and ensuing response back into view.
  */
+/**
+ * Land every conversation switch pinned to the newest message, before paint.
+ *
+ * The StickToBottom instance is shared across switches (ChatPage stays
+ * mounted), so scrolling up in one conversation sets `escapedFromLock` and the
+ * NEXT conversation would inherit a released bottom-lock — its resize
+ * corrections bail and hydration leaves the reader stranded mid-history. And
+ * even with the lock held, the library's correction is ResizeObserver-driven
+ * (async), so a hydration commit paints 1-3 frames at the wrong position
+ * before snapping down. Re-arming the lock and scrolling in a layout effect
+ * makes the first painted frame of a switch already sit at the bottom.
+ *
+ * Runs on: the switch itself and the cold bind's first hydration (`hasBlocks`
+ * flip). Deliberately NOT on render-window growth, history prepends, or a
+ * reconnect's window reset — those happen while the reader may be scrolled
+ * up, and yanking them down would fight the read.
+ */
+function ScrollToEndOnSwitch() {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef?: React.RefObject<HTMLElement>;
+  };
+  const { state, scrollToBottom, scrollRef } = ctx;
+  const conversationId = useChatStore((s) => s.conversationId);
+  const hasBlocks = useChatStore((s) => s.blocks.length > 0);
+
+  useLayoutEffect(() => {
+    state.escapedFromLock = false;
+    state.isAtBottom = true;
+    // Direct write first so the pre-paint position is right even if the
+    // library queues; its own instant scroll keeps internal state consistent.
+    const el = scrollRef?.current;
+    if (el) el.scrollTop = el.scrollHeight;
+    scrollToBottom("instant");
+    // Late-arriving height (async syntax highlighting, images, fonts) keeps
+    // growing a fresh transcript for a couple of seconds after the commit,
+    // and the library's ResizeObserver correction paints a frame late every
+    // time — each growth is a visible "jump up". Hold the bottom every frame
+    // through the settle window; a reader's scroll-up (escapedFromLock) wins
+    // immediately.
+    let frame = 0;
+    let ticks = 0;
+    const HOLD_FRAMES = 180; // ~3s at 60fps — covers the async-content settle
+    const hold = (): void => {
+      frame = 0;
+      if (state.escapedFromLock) return;
+      const target = scrollRef?.current;
+      if (target && target.scrollHeight - target.scrollTop - target.clientHeight > 1) {
+        target.scrollTop = target.scrollHeight;
+      }
+      ticks += 1;
+      if (ticks < HOLD_FRAMES) frame = requestAnimationFrame(hold);
+    };
+    frame = requestAnimationFrame(hold);
+    return () => cancelAnimationFrame(frame);
+  }, [conversationId, hasBlocks, scrollRef, scrollToBottom, state]);
+
+  return null;
+}
+
 function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
   const { scrollToBottom } = useStickToBottomContext();
 

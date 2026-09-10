@@ -62,6 +62,7 @@ import {
   type ConversationState,
   type FrameScheduler,
   bindConversationForTest,
+  prefetchConversation,
   releaseConversation,
   resetFirstBindForTest,
 } from "./chatStore";
@@ -980,6 +981,48 @@ describe("chatStore — switchTo", () => {
     expect((blocks[0] as UserMessageBlock).content).toEqual([
       { type: "input_text", text: "fresh server message" },
     ]);
+  });
+
+  it("prefetchConversation warms a background entry without touching the active conversation", async () => {
+    seedSession("conv_active", [userMessage("resp_a", "active thread")]);
+    seedSession("conv_warm", [userMessage("resp_w", "warmed thread")]);
+    await useChatStore.getState().switchTo("conv_active");
+
+    await prefetchConversation("conv_warm");
+
+    // Active conversation untouched; the warm entry hydrated in the background.
+    expect(useChatStore.getState().conversationId).toBe("conv_active");
+    expect(conversationRegistry.peek("conv_warm")?.getState().blocks).toHaveLength(1);
+    // A prefetch bind must never send the runner probe.
+    const warmFetches = fetchMock.mock.calls.filter(([u]) =>
+      String(u).startsWith("/v1/sessions/conv_warm?"),
+    );
+    expect(warmFetches).toHaveLength(1);
+    expect(String(warmFetches[0]?.[0])).not.toContain("refresh_state=true");
+
+    // Switching to the warmed conversation is the live path: no re-fetch.
+    fetchMock.mockClear();
+    await useChatStore.getState().switchTo("conv_warm");
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+    expect(
+      fetchMock.mock.calls.filter(([u]) => String(u).includes("conv_warm/items")),
+    ).toHaveLength(0);
+  });
+
+  it("prefetchConversation must not consume the page-load runner probe", async () => {
+    seedSession("conv_warm", [userMessage("resp_w", "warmed thread")]);
+    seedSession("conv_user", [userMessage("resp_u", "user opened")]);
+
+    await prefetchConversation("conv_warm");
+    await useChatStore.getState().switchTo("conv_user");
+
+    // The user-driven first bind still refreshes runner state even though a
+    // prefetch bound first.
+    const userFetches = fetchMock.mock.calls.filter(([u]) =>
+      String(u).startsWith("/v1/sessions/conv_user?"),
+    );
+    expect(userFetches).toHaveLength(1);
+    expect(String(userFetches[0]?.[0])).toContain("refresh_state=true");
   });
 
   it("hydrates from paginated session items instead of the capped session snapshot", async () => {
