@@ -3,7 +3,7 @@
 // list alongside the fully supported ones, instead of leaving it behind "More"
 // forever.
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const STORAGE_KEY = "omnigent:recent-harnesses";
 const MAX_ENTRIES = 4;
@@ -58,6 +58,16 @@ export function useRecentHarnesses(): RecentHarnesses {
   // Compiler correctly memoizes it once and the list never updates.
   const [recentHarnesses, setRecentHarnesses] = useState<string[]>(readAll);
 
+  // Mirror to storage after commit, not inside the updater: React may invoke an
+  // updater more than once or discard its result. Starts holding the value just
+  // read, so mount writes nothing back.
+  const mirrored = useRef(recentHarnesses);
+  useEffect(() => {
+    if (mirrored.current === recentHarnesses) return;
+    mirrored.current = recentHarnesses;
+    writeAll(recentHarnesses);
+  }, [recentHarnesses]);
+
   const addRecentHarness = useCallback((harness: string) => {
     const trimmed = harness.trim();
     if (!trimmed) return;
@@ -65,9 +75,7 @@ export function useRecentHarnesses(): RecentHarnesses {
       // Already the newest entry → nothing to reorder, so skip the write and
       // the re-render (the common case: relaunching the same harness).
       if (existing[0] === trimmed) return existing;
-      const next = [trimmed, ...existing.filter((h) => h !== trimmed)].slice(0, MAX_ENTRIES);
-      writeAll(next);
-      return next;
+      return [trimmed, ...existing.filter((h) => h !== trimmed)].slice(0, MAX_ENTRIES);
     });
   }, []);
 

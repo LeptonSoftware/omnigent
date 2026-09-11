@@ -144,6 +144,7 @@ import { useActiveRootSessionId } from "@/hooks/useSession";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
+import { isOwnedByViewer } from "@/lib/conversationOwnership";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
@@ -153,6 +154,7 @@ import {
   markConversationUnread,
   useConversationUnseen,
   useExplicitlyUnread,
+  useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -1080,7 +1082,6 @@ function ProjectFolder({
   windowConversations,
   expanded,
   active,
-  marker,
   onToggleCollapsed,
   pinnedConversationIds,
   activeOverride,
@@ -1107,7 +1108,6 @@ function ProjectFolder({
   expanded: boolean;
   /** Whether the new-session composer is currently scoped to this project. */
   active: boolean;
-  marker: SessionState | null;
   onToggleCollapsed: () => void;
   pinnedConversationIds: string[];
   activeOverride: ActiveChatOverride | null;
@@ -1129,6 +1129,7 @@ function ProjectFolder({
   onConversationsLoaded?: (name: string, conversations: Conversation[]) => void;
 }) {
   const query = useProjectSessions(name, expanded);
+  const marker = useProjectMarker(windowConversations);
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const conversations = useMemo(() => {
     // Union the folder's own pages with its members from the globally-loaded
@@ -1281,24 +1282,9 @@ interface ConversationListProps {
   getVisibleIdsRef: RefObject<() => string[]>;
 }
 
-// Ownership drives the My-vs-Shared split and every owner-only row action.
-// It is derived purely from the session's `owner` (the creator's user id),
-// NOT from `permission_level` — the sidebar carries no effective-level info,
-// so the server can list rows without resolving the caller's grant per
-// session. A `null`/absent owner (permissions disabled — the server emits
-// `owner` only when a permission store is wired) reads as owned, matching the
-// prior permissive-on-null stance; otherwise the viewer owns it iff they are
-// the owner. In single-user mode the owner grant is the reserved `"local"`
-// id, and `viewerId` is `"local"` too (see `useViewerId`), so it matches via
-// the equality branch. `viewerId` is `null` until identity resolves — treated
-// as "not the owner" for shared rows so they don't briefly flash into "My
-// sessions" before the id lands.
-function isOwnedByViewer(conversation: Conversation, viewerId: string | null): boolean {
-  const owner = conversation.owner ?? null;
-  if (owner === null) return true;
-  return owner === viewerId;
-}
-
+// Ownership drives the My-vs-Shared split and every owner-only row action; see
+// `isOwnedByViewer`.
+//
 // The current viewer's user id, resolved reactively. Uses `getCurrentUserId`
 // (NOT `getCurrentAuthorId`): ownership compares against the session's `owner`
 // grant, which in single-user mode is the reserved `"local"` id — and
@@ -1967,9 +1953,6 @@ function ConversationList({
                       windowConversations={group.conversations}
                       expanded={expandedProjects.includes(group.name)}
                       active={newSessionProjectName === group.name}
-                      // Best-effort marker from the globally-loaded window: a
-                      // collapsed folder hasn't fetched its own sessions yet.
-                      marker={projectMarkerState(group.conversations)}
                       onToggleCollapsed={() => toggleProjectExpanded(group.name)}
                       pinnedConversationIds={pinnedConversationIds}
                       activeOverride={activeOverride}
@@ -2177,7 +2160,28 @@ function UngroupDropZone() {
  * {@link SessionState} so a collapsed project header can render the exact
  * same {@link SessionStateBadge} the rows do. ``null`` = no marker.
  */
-function projectMarkerState(conversations: Conversation[]): SessionState | null {
+/**
+ * Reactive {@link projectMarkerState}: the unseen read inside it is module
+ * state, so without the mirror version in a dependency array the React Compiler
+ * memoizes the call against an unchanged conversation list and a collapsed
+ * folder's marker never notices a mark-read/unread.
+ */
+function useProjectMarker(conversations: Conversation[]): SessionState | null {
+  const mirrorVersion = useUnseenTick();
+  return useMemo(
+    () => projectMarkerState(conversations, mirrorVersion),
+    [conversations, mirrorVersion],
+  );
+}
+
+/** Best-effort marker from the globally-loaded window: a collapsed folder has
+    not fetched its own sessions yet. */
+function projectMarkerState(
+  conversations: Conversation[],
+  /** Read-state mirror version — unread here, but it is what re-runs the call
+      when the module-state unseen reads below would answer differently. */
+  _mirrorVersion: number,
+): SessionState | null {
   let awaiting = 0;
   let unseen = false;
   let running = false;

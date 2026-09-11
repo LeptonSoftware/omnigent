@@ -1009,6 +1009,39 @@ describe("chatStore — switchTo", () => {
     ).toHaveLength(0);
   });
 
+  it("a denied warm-up never disposes a conversation the reader opened while it waited", async () => {
+    seedSession("conv_warm", [userMessage("resp_w", "warmed thread")]);
+    // First tryAcquire (the warm-up's) parks until `openGate`, then reports a
+    // saturated origin; the reader's own bind after it is granted normally.
+    let openGate = (): void => {};
+    const gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    let first = true;
+    setStreamSlotManagerForTest({
+      tryAcquire: async (): Promise<StreamSlot | null> => {
+        if (first) {
+          first = false;
+          await gate;
+          return null;
+        }
+        return { release: () => Promise.resolve() };
+      },
+    });
+
+    const warming = prefetchConversation("conv_warm");
+    // The reader clicks that very thread while the warm-up is still waiting.
+    await useChatStore.getState().switchTo("conv_warm");
+    openGate();
+    await warming;
+
+    // The warm-up yields its claim on the entry; it must not take the reader's
+    // live conversation down with it.
+    expect(useChatStore.getState().conversationId).toBe("conv_warm");
+    expect(conversationRegistry.peek("conv_warm")).not.toBeUndefined();
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+  });
+
   it("prefetchConversation must not consume the page-load runner probe", async () => {
     seedSession("conv_warm", [userMessage("resp_w", "warmed thread")]);
     seedSession("conv_user", [userMessage("resp_u", "user opened")]);

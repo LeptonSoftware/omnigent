@@ -44,6 +44,7 @@ import {
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import { useStickToBottomContext } from "use-stick-to-bottom";
+import { publishBottomLock } from "@/lib/bottomLock";
 import {
   Message,
   MessageActions,
@@ -1913,6 +1914,16 @@ function MainAgentSurface({
   // skips layout/paint, not the component render itself.
   const historyHiddenCount = useChatStore((s) => s.historyHiddenCount);
   const hiddenBubbleCount = resolveHiddenBubbleCount(historyHiddenCount, streamBubbles.length);
+  // Pin the window to a concrete count as soon as this conversation has
+  // bubbles. An unfrozen (null) window re-derives from the current length, so
+  // an append would unmount the oldest rendered bubble and a prepended page
+  // would be hidden the instant it arrived.
+  const freezeHistoryRenderWindow = useChatStore((s) => s.freezeHistoryRenderWindow);
+  useEffect(() => {
+    if (historyHiddenCount === null && streamBubbles.length > 0) {
+      freezeHistoryRenderWindow(streamBubbles.length);
+    }
+  }, [freezeHistoryRenderWindow, historyHiddenCount, streamBubbles.length]);
   const renderedBubbles = useMemo(
     () => (hiddenBubbleCount === 0 ? streamBubbles : streamBubbles.slice(hiddenBubbleCount)),
     [streamBubbles, hiddenBubbleCount],
@@ -2479,13 +2490,21 @@ function ScrollToEndOnSwitch() {
     // immediately.
     let frame = 0;
     let ticks = 0;
+    let pinnedTop: number | null = null;
     const HOLD_FRAMES = 180; // ~3s at 60fps — covers the async-content settle
     const hold = (): void => {
       frame = 0;
       if (state.escapedFromLock) return;
       const target = scrollRef?.current;
-      if (target && target.scrollHeight - target.scrollTop - target.clientHeight > 1) {
-        target.scrollTop = target.scrollHeight;
+      if (target) {
+        // An upward move means something wants to leave the bottom: the reader,
+        // or jump-to-top / rail navigation, neither of which flips
+        // escapedFromLock. Re-pin after growth, never fight a move.
+        if (pinnedTop !== null && target.scrollTop < pinnedTop - 1) return;
+        if (target.scrollHeight - target.scrollTop - target.clientHeight > 1) {
+          target.scrollTop = target.scrollHeight;
+        }
+        pinnedTop = target.scrollTop;
       }
       ticks += 1;
       if (ticks < HOLD_FRAMES) frame = requestAnimationFrame(hold);
@@ -2909,7 +2928,12 @@ function ConversationScrollRefBridge({
     // Runs after commit, when StickToBottom has populated scrollRef.current.
     const el = ctx.scrollRef?.current ?? null;
     onScroller(el ? { el, state: ctx.state, stopScroll: ctx.stopScroll } : null);
-    return () => onScroller(null);
+    // Same lock, reachable from non-components (see `releaseBottomLock`).
+    publishBottomLock(el ? ctx.state : null);
+    return () => {
+      onScroller(null);
+      publishBottomLock(null);
+    };
   }, [ctx.scrollRef, ctx.state, ctx.stopScroll, onScroller]);
   return null;
 }
@@ -3011,13 +3035,10 @@ export function JumpToTopButton({
   // there's nothing to jump to. blocks-vs-count is an overestimate of hidden
   // *bubbles* (blocks group into bubbles) — worst case the pill shows and the
   // jump is a near-no-op.
-  // `null` means the window has not been derived yet, so history may still be
-  // hidden; a positive count means it definitely is. Deliberately measured in
-  // the store's own terms — an overestimate only shows the pill when the jump
-  // is a near-no-op, which the comment above already allows.
-  const hasUnrenderedHistory = useChatStore(
-    (s) => s.historyHiddenCount === null || s.historyHiddenCount > 0,
-  );
+  // A frozen window reports a real count; `null` only survives the frame before
+  // the freeze effect runs, and treating that as "history is hidden" would pin
+  // the pill on for every conversation, including a three-message one.
+  const hasUnrenderedHistory = useChatStore((s) => (s.historyHiddenCount ?? 0) > 0);
   const canJump = hasMoreHistory || hasUnrenderedHistory || !atTop;
   const visible = jumping || ((hovering || scrolledUp) && canJump);
 

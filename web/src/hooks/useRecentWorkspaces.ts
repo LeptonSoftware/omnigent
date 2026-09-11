@@ -1,7 +1,7 @@
 // localStorage-backed recent workspace directories, keyed per host
 // (paths are host-specific). Feeds the combobox "Recent" group.
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const STORAGE_KEY = "omnigent:recent-workspaces";
 const MAX_PER_HOST = 8;
@@ -71,6 +71,17 @@ export function useRecentWorkspaces(hostId: string | null): RecentWorkspaces {
   const [all, setAll] = useState<Record<string, string[]>>(readAll);
   const recent = hostId === null ? NO_RECENTS : (all[hostId] ?? NO_RECENTS);
 
+  // Mirror to storage after commit, not inside the updater: React may invoke an
+  // updater more than once or discard its result, so a write in there is
+  // neither guaranteed-once nor guaranteed to match committed state. Starts
+  // holding the value just read, so mount writes nothing back.
+  const mirrored = useRef(all);
+  useEffect(() => {
+    if (mirrored.current === all) return;
+    mirrored.current = all;
+    writeAll(all);
+  }, [all]);
+
   const addRecent = useCallback(
     (path: string) => {
       if (hostId === null) return;
@@ -79,9 +90,7 @@ export function useRecentWorkspaces(hostId: string | null): RecentWorkspaces {
       setAll((prev) => {
         const existing = prev[hostId] ?? [];
         const next = [trimmed, ...existing.filter((p) => p !== trimmed)].slice(0, MAX_PER_HOST);
-        const nextAll = { ...prev, [hostId]: next };
-        writeAll(nextAll);
-        return nextAll;
+        return { ...prev, [hostId]: next };
       });
     },
     [hostId],

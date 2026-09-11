@@ -9,6 +9,7 @@
 // would each hold their own anchor and diverge.
 
 import { useCallback, useMemo, useState } from "react";
+import { releaseBottomLock } from "@/lib/bottomLock";
 import { useChatStore } from "@/store/chatStore";
 
 export interface UserMessageNav {
@@ -25,6 +26,9 @@ const SCROLL_SETTLE_MS = 120;
 const SCROLL_SETTLE_MAX_MS = 1200;
 
 let cancelPendingFlash: (() => void) | null = null;
+// Bumped by every jump. The expand-and-retry path resumes two frames later, so
+// it has to check it is still the newest jump before scrolling anywhere.
+let navSeq = 0;
 
 // Nearest scrollable ancestor — the element scrollIntoView actually moves and
 // whose `scroll` events tell us when motion stops. Falls back to window.
@@ -50,6 +54,15 @@ function getScrollParent(node: Element): Element | null {
  * @param flash - Optional highlight callback fired when the scroll settles.
  */
 export function scrollToUserMessage(itemId: string, flash?: (id: string) => void): void {
+  // Supersede the previous jump here, synchronously: deferring it to
+  // scrollToElement lets a jump that takes the two-frame retry path below
+  // cancel the flash of a LATER jump that landed immediately.
+  cancelPendingFlash?.();
+  const seq = ++navSeq;
+  // The reader is deliberately leaving the bottom. Without this the switch pin
+  // re-pins every frame for ~3s and cancels the smooth scroll below.
+  releaseBottomLock();
+  const conversationId = useChatStore.getState().conversationId;
   const find = () =>
     document.querySelector(
       // CSS.escape is defensive — itemIds are alphanumeric today.
@@ -66,6 +79,9 @@ export function scrollToUserMessage(itemId: string, flash?: (id: string) => void
   useChatStore.getState().expandHistoryRenderWindow();
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
+      // A newer jump, or a switch, owns the transcript now.
+      if (seq !== navSeq) return;
+      if (useChatStore.getState().conversationId !== conversationId) return;
       const retried = find();
       if (!retried) {
         // Fail loud: id exists in the list but DOM anchor is missing.
@@ -78,10 +94,6 @@ export function scrollToUserMessage(itemId: string, flash?: (id: string) => void
 }
 
 function scrollToElement(el: Element, itemId: string, flash?: (id: string) => void): void {
-  // Supersede the previous jump's pending flash so rapid nav only flashes
-  // the message we finally land on.
-  cancelPendingFlash?.();
-
   el.scrollIntoView({ block: "center", behavior: "smooth" });
 
   // Nothing to defer when there's no flash to fire — the smooth-scroll runs

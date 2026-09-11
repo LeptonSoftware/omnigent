@@ -181,6 +181,11 @@ export class ConversationRegistry {
     if (id !== this.activeId) this.prefetchedIds.add(id);
   }
 
+  /** Whether `id` is the conversation on screen. */
+  isActive(id: string): boolean {
+    return this.activeId === id;
+  }
+
   /** The conversation on screen, or `null`. */
   getActive(): ConversationEntry | null {
     if (this.activeId === null) return null;

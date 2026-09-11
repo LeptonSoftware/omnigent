@@ -276,6 +276,15 @@ describe("ConversationRegistry", () => {
     registry.release("conv_a");
     expect(registry.getActive()).toBeNull();
   });
+
+  it("reports whether an id is the conversation on screen", () => {
+    registry.acquire("conv_a");
+    registry.acquire("conv_b");
+    registry.setActive("conv_a");
+    expect(registry.isActive("conv_a")).toBe(true);
+    expect(registry.isActive("conv_b")).toBe(false);
+    expect(registry.isActive("conv_missing")).toBe(false);
+  });
 });
 
 describe("ConversationRegistry — background-prefetched entries", () => {

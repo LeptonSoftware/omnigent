@@ -84,6 +84,7 @@ import {
   createInitialConversationState,
   HISTORY_RENDER_GROWTH_STEP,
   isConversationStateKey,
+  resolveHiddenBubbleCount,
 } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import {
@@ -785,6 +786,16 @@ export interface ChatActions {
    * BUBBLES, and only the view knows how `blocks` folded into them.
    */
   growHistoryRenderWindow: (currentHidden: number) => void;
+  /**
+   * Freeze the initial render window, in bubbles, once a conversation has any.
+   *
+   * Until a concrete count is stored, the window re-derives from the CURRENT
+   * bubble count on every render — so an appended turn would unmount the oldest
+   * rendered bubble and a prepended history page would be hidden the moment it
+   * landed. Only the view can call this: the count is in bubbles and the store
+   * holds blocks. No-ops once a count exists, so it never fights a reveal.
+   */
+  freezeHistoryRenderWindow: (totalBubbles: number) => void;
   /**
    * Render every loaded block (jump-to-top; the reader asked for the whole
    * history, so windowing would just fight the pinned scroll position).
@@ -2035,12 +2046,33 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Paint whatever the entry already holds. For a live entry that is the
     // current transcript; for a fresh one it is the initial state.
     mirrorActiveEntry();
+
+    const bindWillRefresh = !wasLive && !hasBoundStreamThisLoad;
+    // A live entry needs nothing: its open stream delivers `session_skills` /
+    // `session_model_options` / `agent_changed`, which is exactly why returning
+    // to it costs zero fetches.
     if (wasLive) return;
 
     // Cold entry: bind its stream and hydrate history. `hydratePending` replays
     // the snapshot's un-consumed native messages — correct here because a fresh
     // entry has no live optimistic bubbles to overwrite.
     await bindStream(conversationId, entrySetter(entry), entryGetter(entry), true);
+
+    // Runner-backed fields (`model_options`, skills) are process-cached server
+    // side and only a `refresh_state` read re-asks the runner. A cold bind after
+    // the first of this page load skips that probe to stay off the critical path
+    // (300-900ms), and no stream was open to carry an event for a change that
+    // already happened — so converge it in the background, or `useSession`
+    // (staleTime: Infinity, sharing this cache key) serves the previous agent's
+    // catalog until a hard reload. Strictly AFTER the bind: both read the same
+    // query key, so an in-flight refreshed read would dedupe the bind's cheap
+    // one onto it and put the probe straight back on the paint path.
+    if (!bindWillRefresh) {
+      void refetchRunnerBackedSessionState(conversationId, {
+        refreshState: true,
+        applyBindingPatch: true,
+      });
+    }
   },
 
   submitApproval: async (elicitationId, action, content) => {
@@ -2387,6 +2419,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
+  freezeHistoryRenderWindow: (totalBubbles: number) => {
+    const { conversationId, historyHiddenCount } = get();
+    if (!conversationId || historyHiddenCount !== null) return;
+    setterFor(conversationId)({
+      historyHiddenCount: resolveHiddenBubbleCount(null, totalBubbles),
+    });
+  },
+
   growHistoryRenderWindow: (currentHidden: number) => {
     const { conversationId } = get();
     if (!conversationId) return;
@@ -2587,6 +2627,7 @@ export async function prefetchConversation(id: string): Promise<void> {
   await bindStream(id, entrySetter(entry), entryGetter(entry), true, {
     refreshState: false,
     opportunisticSlot: true,
+    entry,
   });
 }
 
@@ -3105,9 +3146,31 @@ async function bindStream(
      * raise the budget banner. Background warm-up only.
      */
     opportunisticSlot?: boolean;
+    /**
+     * The entry this bind writes through, when the caller captured one.
+     *
+     * Liveness is then entry IDENTITY, not id. A background bind can be
+     * release-and-reacquired for the same conversation while it awaits a slot
+     * (the reader clicks that row, and `switchTo` sees no controller installed
+     * yet), and an id-keyed check would green-light writes, a second pump, and
+     * a slot hand-back against the reader's live entry.
+     */
+    entry?: ConversationEntry;
   },
 ): Promise<void> {
   racedNativeModelOptions.delete(id);
+  const expected = opts?.entry;
+  /** Whether this bind still owns the entry it set out to fill. */
+  const stillOurs = (): boolean =>
+    expected === undefined
+      ? !isConversationDisposed(id)
+      : !expected.disposed && conversationRegistry.peek(id) === expected;
+  /** Hand a held slot back only when no entry relies on it (slots key by id). */
+  const releaseSlotIfUnused = (): void => {
+    if (expected === undefined || conversationRegistry.peek(id) === undefined) {
+      releaseStreamSlot(id);
+    }
+  };
   const controller = new AbortController();
   // Take an origin-wide stream slot before opening the connection, evicting our
   // own LRU background stream to make room. A fresh tab that finds every slot
@@ -3115,14 +3178,17 @@ async function bindStream(
   const gotSlot = await acquireStreamSlot(id, opts?.opportunisticSlot === true);
   if (opts?.opportunisticSlot === true && !gotSlot) {
     // Origin is saturated by real conversations (this tab's or another's).
-    // Warm-up yields rather than competing for the budget.
-    conversationRegistry.release(id);
+    // Warm-up yields rather than competing for the budget — but drop the entry
+    // only while it is still ours and unopened: the reader may have opened this
+    // very conversation while we awaited the slot, or replaced the entry
+    // outright, and releasing by id would take theirs down.
+    if (stillOurs() && !conversationRegistry.isActive(id)) conversationRegistry.release(id);
     return;
   }
-  if (isConversationDisposed(id)) {
-    // Switched away / evicted while awaiting the slot — don't open a dead
-    // entry's stream, and hand any slot we took back to the origin.
-    releaseStreamSlot(id);
+  if (!stillOurs()) {
+    // Switched away / evicted / replaced while awaiting the slot — don't open a
+    // dead entry's stream, and hand any slot we took back to the origin.
+    releaseSlotIfUnused();
     return;
   }
   set({ abortController: controller });
@@ -3148,8 +3214,8 @@ async function bindStream(
     // Liveness, not the visible id: a background bind must survive a switch away
     // (that is the whole feature). Only a dispose (evicted) bails — and then the
     // slot taken above has to go back to the origin.
-    if (isConversationDisposed(id)) {
-      releaseStreamSlot(id);
+    if (!stillOurs()) {
+      releaseSlotIfUnused();
       return;
     }
   }
@@ -3209,7 +3275,7 @@ async function bindStream(
       }),
       fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS }),
     ]);
-    if (isConversationDisposed(id)) return;
+    if (!stillOurs()) return;
     const items = page.items;
 
     // Sticky-pref handoff for CLI-created sessions with no override.
@@ -3450,7 +3516,7 @@ async function bindStream(
     }
     racedNativeModelOptions.delete(id);
   } catch (err) {
-    if (isConversationDisposed(id)) return;
+    if (!stillOurs()) return;
     set({
       loadingConversation: false,
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),

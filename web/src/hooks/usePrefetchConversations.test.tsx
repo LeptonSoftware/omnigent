@@ -4,6 +4,7 @@
 //   slots for the active conversation and one user-driven open.
 // - Oldest target binds first so registry LRU order ends recency-aligned.
 // - Active and archived conversations are never prefetched.
+// - Sessions the viewer does not own are never prefetched (presence leak).
 
 import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,7 +17,12 @@ vi.mock("@/store/chatStore", () => ({ prefetchConversation }));
 const maxLiveConversations = vi.hoisted(() => vi.fn(() => 30));
 vi.mock("@/store/conversationRegistry", () => ({ maxLiveConversations }));
 
-function conv(id: string, updatedAt: number, archived = false): Conversation {
+const VIEWER = "viewer@example.com";
+const resolveIdentity = vi.hoisted(() => vi.fn(() => Promise.resolve<string | null>(null)));
+const getCurrentUserId = vi.hoisted(() => vi.fn((): string | null => null));
+vi.mock("@/lib/identity", () => ({ getCurrentUserId, resolveIdentity }));
+
+function conv(id: string, updatedAt: number, archived = false, owner?: string): Conversation {
   return {
     id,
     object: "conversation",
@@ -26,6 +32,7 @@ function conv(id: string, updatedAt: number, archived = false): Conversation {
     labels: {},
     permission_level: null,
     archived,
+    ...(owner === undefined ? {} : { owner }),
   };
 }
 
@@ -41,6 +48,8 @@ describe("usePrefetchRecentConversations", () => {
     resetPrefetchForTest();
     prefetchConversation.mockClear();
     maxLiveConversations.mockReturnValue(30);
+    getCurrentUserId.mockReturnValue(VIEWER);
+    resolveIdentity.mockResolvedValue(VIEWER);
   });
 
   afterEach(() => {
@@ -95,5 +104,34 @@ describe("usePrefetchRecentConversations", () => {
     await flushAsync();
 
     expect(prefetchConversation.mock.calls.map((c) => c[0])).toEqual(["b", "a"]);
+  });
+
+  it("never warms a session the viewer does not own, so presence stays truthful", async () => {
+    // Binding registers the viewer in the session's presence registry, which
+    // broadcasts the viewer list to co-viewers.
+    const conversations = [
+      conv("mine-old", 1, false, VIEWER),
+      conv("theirs", 2, false, "someone-else@example.com"),
+      conv("ownerless", 3),
+    ];
+    renderHook(() => usePrefetchRecentConversations(conversations, null));
+    await vi.advanceTimersByTimeAsync(2_500);
+    await flushAsync();
+
+    expect(prefetchConversation.mock.calls.map(([id]) => id)).toEqual(["mine-old", "ownerless"]);
+  });
+
+  it("skips every owner-stamped session when identity never resolves", async () => {
+    getCurrentUserId.mockReturnValue(null);
+    resolveIdentity.mockResolvedValue(null);
+    const conversations = [
+      conv("theirs", 2, false, "someone-else@example.com"),
+      conv("mine", 1, false, VIEWER),
+    ];
+    renderHook(() => usePrefetchRecentConversations(conversations, null));
+    await vi.advanceTimersByTimeAsync(2_500);
+    await flushAsync();
+
+    expect(prefetchConversation.mock.calls.map(([id]) => id)).toEqual([]);
   });
 });

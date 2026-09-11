@@ -7,10 +7,18 @@
 // background entries: evictable under stream-slot pressure, kept current by
 // their SSE streams, and never marked seen (read-state writes are tied to
 // viewing, not to binding).
+//
+// Only the viewer's OWN sessions are warmed. Binding a stream registers the
+// viewer in the session's presence registry, which broadcasts the viewer list
+// to every co-viewer — so warming a shared session would tell a collaborator
+// someone is reading a thread they never opened, and make presence useless as
+// a signal. Own sessions have no co-viewer to mislead.
 
 import { useEffect, useRef } from "react";
 import { prefetchConversation } from "@/store/chatStore";
 import { maxLiveConversations } from "@/store/conversationRegistry";
+import { isOwnedByViewer } from "@/lib/conversationOwnership";
+import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import type { Conversation } from "@/hooks/useConversations";
 
 /**
@@ -61,14 +69,29 @@ export function usePrefetchRecentConversations(
     setTimeout(() => {
       const latest = latestRef.current;
       const budget = Math.min(PREFETCH_MAX, maxLiveConversations() - PREFETCH_RESERVED_SLOTS);
-      if (budget <= 0 || latest.conversations === undefined) return;
-      const targets = [...latest.conversations]
-        .filter((c) => c.archived !== true && c.id !== latest.activeConversationId)
-        .sort((a, b) => b.updated_at - a.updated_at)
-        .slice(0, budget)
-        // Oldest first, so the most recent thread ends most-recently-used.
-        .reverse();
+      const available = latest.conversations;
+      if (budget <= 0 || available === undefined) return;
       void (async () => {
+        // Identity is normally resolved well before this fires; await it so a
+        // slow resolve can't read every shared session as unowned. A rejected
+        // resolve must not cancel the pass — fall back to whatever is known.
+        try {
+          await resolveIdentity();
+        } catch {
+          // Best-effort: `getCurrentUserId` may still hold a cached id.
+        }
+        const viewerId = getCurrentUserId();
+        const targets = [...available]
+          .filter(
+            (c) =>
+              c.archived !== true &&
+              c.id !== latest.activeConversationId &&
+              isOwnedByViewer(c, viewerId),
+          )
+          .sort((a, b) => b.updated_at - a.updated_at)
+          .slice(0, budget)
+          // Oldest first, so the most recent thread ends most-recently-used.
+          .reverse();
         // Sequential on purpose: one bind's fetches at a time keeps the
         // warm-up invisible next to user-driven traffic.
         /* oxlint-disable no-await-in-loop */

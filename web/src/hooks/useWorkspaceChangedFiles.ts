@@ -293,6 +293,11 @@ export function useWorkspaceChangedFiles(
     // invalidation already keeps correct. Switches inside the window now
     // serve cache; invalidations still force refetches regardless of it.
     staleTime: 120_000,
+    // The one thing the SSE invalidations cannot announce is a change nobody
+    // told us about: a human editing on the host, a second session in the same
+    // workspace, an invalidation missed while this tab was throttled. Focus is
+    // the cheap correction point, and it overrides the global `false`.
+    refetchOnWindowFocus: true,
   });
 }
 
@@ -432,6 +437,8 @@ export function useWorkspaceAllFiles(
     // and the SSE invalidation own freshness; a short window only made every
     // chat switch redo the runner filesystem listing.
     staleTime: 60_000,
+    // Same reasoning: on-disk state can change with nothing to announce it.
+    refetchOnWindowFocus: true,
   });
 }
 
