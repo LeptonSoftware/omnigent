@@ -265,7 +265,12 @@ export default defineConfig({
     // are excluded: compiling them adds nothing, and mock components inside
     // `vi.mock` factories close over dynamically-imported bindings that the
     // compiler's outlining breaks.
-    babel({ presets: [reactCompilerPresetWithoutTests()] }),
+    // Kill switch: `OMNI_REACT_COMPILER=0` builds without the compiler, so a
+    // suspected compiler regression can be bisected — and shipped around —
+    // without reverting code.
+    ...(process.env.OMNI_REACT_COMPILER === "0"
+      ? []
+      : [babel({ presets: [reactCompilerPresetWithoutTests()] })]),
     tailwindcss(),
   ],
   resolve: {

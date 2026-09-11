@@ -122,6 +122,7 @@ import {
   type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
+import { resolveHiddenBubbleCount } from "@/store/conversationState";
 import {
   isNativeTerminalSession,
   nativeCodingAgentForSession,
@@ -1910,8 +1911,8 @@ function MainAgentSurface({
   // the window before it pages the network) — mounting ~100 markdown bubbles
   // per switch was the dominant switch cost, and content-visibility only
   // skips layout/paint, not the component render itself.
-  const historyRenderCount = useChatStore((s) => s.historyRenderCount);
-  const hiddenBubbleCount = Math.max(0, streamBubbles.length - historyRenderCount);
+  const historyHiddenCount = useChatStore((s) => s.historyHiddenCount);
+  const hiddenBubbleCount = resolveHiddenBubbleCount(historyHiddenCount, streamBubbles.length);
   const renderedBubbles = useMemo(
     () => (hiddenBubbleCount === 0 ? streamBubbles : streamBubbles.slice(hiddenBubbleCount)),
     [streamBubbles, hiddenBubbleCount],
@@ -2724,7 +2725,7 @@ export function HistoryAutoLoader({
     // Already-loaded history first: reveal it (a store write, no fetch)
     // before asking the server for anything older.
     if (hiddenBubbleCount > 0) {
-      state.growHistoryRenderWindow();
+      state.growHistoryRenderWindow(hiddenBubbleCount);
       return;
     }
 
@@ -3010,7 +3011,13 @@ export function JumpToTopButton({
   // there's nothing to jump to. blocks-vs-count is an overestimate of hidden
   // *bubbles* (blocks group into bubbles) — worst case the pill shows and the
   // jump is a near-no-op.
-  const hasUnrenderedHistory = useChatStore((s) => s.blocks.length > s.historyRenderCount);
+  // `null` means the window has not been derived yet, so history may still be
+  // hidden; a positive count means it definitely is. Deliberately measured in
+  // the store's own terms — an overestimate only shows the pill when the jump
+  // is a near-no-op, which the comment above already allows.
+  const hasUnrenderedHistory = useChatStore(
+    (s) => s.historyHiddenCount === null || s.historyHiddenCount > 0,
+  );
   const canJump = hasMoreHistory || hasUnrenderedHistory || !atTop;
   const visible = jumping || ((hovering || scrolledUp) && canJump);
 

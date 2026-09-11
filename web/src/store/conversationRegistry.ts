@@ -117,6 +117,16 @@ export class ConversationRegistry {
   private readonly listeners = new Set<ChangeListener>();
   /** Conversation currently on screen; exempt from eviction. */
   private activeId: string | null = null;
+  /**
+   * Entries warmed by background prefetch that the user has never opened.
+   *
+   * They are evicted BEFORE anything the user actually visited. Without this
+   * a prefetched thread — freshly `acquire`d, therefore most-recently-used —
+   * would outrank the conversation the reader just switched away from, and
+   * warming a thread nobody asked for would cold-evict the one they are
+   * likely to return to. Cleared by `setActive`: opening it makes it real.
+   */
+  private readonly prefetchedIds = new Set<string>();
 
   /**
    * Subscribe to state changes across all entries.
@@ -159,7 +169,16 @@ export class ConversationRegistry {
    */
   setActive(id: string | null): void {
     this.activeId = id;
-    if (id !== null) this.touch(id);
+    if (id !== null) {
+      // Opening it promotes it out of the prefetch tier.
+      this.prefetchedIds.delete(id);
+      this.touch(id);
+    }
+  }
+
+  /** Mark `id` as background-warmed, so it is the first thing evicted. */
+  markPrefetched(id: string): void {
+    if (id !== this.activeId) this.prefetchedIds.add(id);
   }
 
   /** The conversation on screen, or `null`. */
@@ -194,6 +213,7 @@ export class ConversationRegistry {
     const entry = this.entries.get(id);
     if (entry === undefined) return;
     this.entries.delete(id);
+    this.prefetchedIds.delete(id);
     entry.dispose();
   }
 
@@ -201,6 +221,7 @@ export class ConversationRegistry {
   clear(): void {
     for (const entry of [...this.entries.values()]) entry.dispose();
     this.entries.clear();
+    this.prefetchedIds.clear();
     this.activeId = null;
   }
 
@@ -228,12 +249,20 @@ export class ConversationRegistry {
    * decides what to do with a saturated origin.
    */
   evictLruEvictable(exemptId?: string): string | null {
-    for (const [id, entry] of this.entries) {
-      if (id === this.activeId || id === exemptId) continue;
-      if (hasUnsentWork(entry.getState())) continue;
-      this.entries.delete(id);
-      entry.dispose();
-      return id;
+    const evictable = (id: string, entry: ConversationEntry): boolean =>
+      id !== this.activeId && id !== exemptId && !hasUnsentWork(entry.getState());
+    // Never-opened prefetch first, in LRU order, then genuinely visited
+    // conversations. Both passes walk `entries`, so recency still decides
+    // within a tier.
+    for (const tier of [true, false]) {
+      for (const [id, entry] of this.entries) {
+        if (this.prefetchedIds.has(id) !== tier) continue;
+        if (!evictable(id, entry)) continue;
+        this.entries.delete(id);
+        this.prefetchedIds.delete(id);
+        entry.dispose();
+        return id;
+      }
     }
     return null;
   }

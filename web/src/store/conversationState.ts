@@ -21,6 +21,36 @@ export const INITIAL_HISTORY_RENDER_COUNT = 20;
 /** How many more bubbles each `growHistoryRenderWindow` call reveals. */
 export const HISTORY_RENDER_GROWTH_STEP = 30;
 
+/**
+ * Resolve how many leading bubbles stay unmounted, given what the conversation
+ * has stored and how many bubbles exist right now.
+ *
+ * The window is anchored at its TOP (a count of hidden leading bubbles), not
+ * at the end. Anchoring it to the end — "render the last N" — sounds
+ * equivalent and is not: every event that changes the length then moves the
+ * top. A turn streaming in while the reader is scrolled up would unmount the
+ * bubble they are reading (length grows, so the Nth-from-last slides down the
+ * list), and a prepended history page would be hidden the moment it arrived
+ * (length grows at the front, so the same trailing N stays on screen).
+ * Hidden-from-top makes both correct by construction: an append leaves the
+ * reader's position untouched, and a prepend reveals exactly what it fetched.
+ *
+ * `null` means "not chosen yet" — the initial window is derived here rather
+ * than at store-init, because a conversation's blocks land after its state
+ * does. Reset to `null` whenever the history window itself resets (rebind,
+ * reconnect re-hydrate), so the new window re-derives instead of inheriting a
+ * count that described the old one.
+ */
+export function resolveHiddenBubbleCount(stored: number | null, total: number): number {
+  if (stored === null) return Math.max(0, total - INITIAL_HISTORY_RENDER_COUNT);
+  // Never hide every bubble. The window counts bubbles while the store counts
+  // blocks — several of which fold into one bubble — so a count that leaks
+  // across that boundary overshoots. Clamping to "at least one rendered"
+  // makes the worst case a short transcript the reader can scroll, never a
+  // blank one that looks like the conversation failed to load.
+  return Math.min(Math.max(0, stored), Math.max(0, total - 1));
+}
+
 // Exhaustive by construction: `Record<keyof ConversationState, true>` rejects a
 // missing key and a stale one.
 const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
@@ -46,7 +76,7 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   claudePermissionMode: true,
   hasMoreHistory: true,
   loadingMoreHistory: true,
-  historyRenderCount: true,
+  historyHiddenCount: true,
   oldestItemId: true,
   llmModel: true,
   pendingModelChange: true,
@@ -106,7 +136,7 @@ export function createInitialConversationState(): ConversationState {
     claudePermissionMode: "",
     hasMoreHistory: false,
     loadingMoreHistory: false,
-    historyRenderCount: INITIAL_HISTORY_RENDER_COUNT,
+    historyHiddenCount: null,
     oldestItemId: null,
     llmModel: null,
     pendingModelChange: null,
