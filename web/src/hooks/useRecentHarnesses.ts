@@ -3,7 +3,7 @@
 // list alongside the fully supported ones, instead of leaving it behind "More"
 // forever.
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const STORAGE_KEY = "omnigent:recent-harnesses";
 const MAX_ENTRIES = 4;
@@ -52,25 +52,31 @@ export interface RecentHarnesses {
  * @returns The recent harness ids plus an ``addRecentHarness`` recorder.
  */
 export function useRecentHarnesses(): RecentHarnesses {
-  // Bumped by addRecentHarness to recompute after a write; the list is read
-  // synchronously below rather than hydrated via an effect, so the picker never
-  // renders one frame behind the stored value.
-  const [revision, setRevision] = useState(0);
+  // State owns the list; localStorage is only its durable mirror. Reading
+  // storage inside a useMemo keyed on a bumped counter looked equivalent, but
+  // that memo lies about its dependencies (the read is impure) — the React
+  // Compiler correctly memoizes it once and the list never updates.
+  const [recentHarnesses, setRecentHarnesses] = useState<string[]>(readAll);
 
-  const recentHarnesses = useMemo(() => {
-    void revision;
-    return readAll();
-  }, [revision]);
+  // Mirror to storage after commit, not inside the updater: React may invoke an
+  // updater more than once or discard its result. Starts holding the value just
+  // read, so mount writes nothing back.
+  const mirrored = useRef(recentHarnesses);
+  useEffect(() => {
+    if (mirrored.current === recentHarnesses) return;
+    mirrored.current = recentHarnesses;
+    writeAll(recentHarnesses);
+  }, [recentHarnesses]);
 
   const addRecentHarness = useCallback((harness: string) => {
     const trimmed = harness.trim();
     if (!trimmed) return;
-    const existing = readAll();
-    // Already the newest entry → nothing to reorder, so skip the write and the
-    // re-render it would trigger (the common case: relaunching the same harness).
-    if (existing[0] === trimmed) return;
-    writeAll([trimmed, ...existing.filter((h) => h !== trimmed)].slice(0, MAX_ENTRIES));
-    setRevision((r) => r + 1);
+    setRecentHarnesses((existing) => {
+      // Already the newest entry → nothing to reorder, so skip the write and
+      // the re-render (the common case: relaunching the same harness).
+      if (existing[0] === trimmed) return existing;
+      return [trimmed, ...existing.filter((h) => h !== trimmed)].slice(0, MAX_ENTRIES);
+    });
   }, []);
 
   return { recentHarnesses, addRecentHarness };

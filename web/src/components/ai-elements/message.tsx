@@ -37,6 +37,10 @@ export const Message = ({ className, from, ...props }: MessageProps) => (
   <div
     className={cn(
       // min-w-0 lets this flex item shrink below its content's intrinsic width instead of widening the column.
+      // (No content-visibility here: its lazy measurement of above-viewport
+      // bubbles keeps mutating scrollHeight after a switch lands, which reads
+      // as the transcript jumping. The history render window in ChatPage
+      // already caps how many bubbles mount, so there's little to skip.)
       "group flex w-full min-w-0 max-w-[95%] flex-col gap-2",
       from === "user" ? "is-user ml-auto justify-end" : "is-assistant",
       className,

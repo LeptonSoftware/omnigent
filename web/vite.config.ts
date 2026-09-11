@@ -2,7 +2,8 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
-import react from "@vitejs/plugin-react";
+import babel from "@rolldown/plugin-babel";
+import react, { reactCompilerPreset } from "@vitejs/plugin-react";
 import type { Plugin, ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
 
@@ -238,8 +239,40 @@ function safariLookbehindWorkarounds(): Plugin {
   };
 }
 
+// The stock preset filters by code shape only; also exclude test files. Mock
+// components inside `vi.mock` factories close over dynamically-imported
+// bindings (`await import("react")`) that the compiler's outlining breaks,
+// and compiling tests buys nothing.
+function reactCompilerPresetWithoutTests() {
+  const preset = reactCompilerPreset({ target: "18" });
+  (preset.rolldown as { filter: { id?: unknown } }).filter.id = {
+    exclude: ["**/*.{test,spec}.*", "**/test-setup.ts"],
+  };
+  return preset;
+}
+
 export default defineConfig({
-  plugins: [emitServiceWorkerTombstone(), safariLookbehindWorkarounds(), react(), tailwindcss()],
+  plugins: [
+    emitServiceWorkerTombstone(),
+    safariLookbehindWorkarounds(),
+    react(),
+    // React Compiler: auto-memoizes components and hooks (equivalent to
+    // exhaustive React.memo/useMemo/useCallback), which is what keeps a chat
+    // switch from re-rendering every sidebar row, rail tick and bubble that
+    // didn't change. Bails out per-component on any rules-of-react violation
+    // it can't prove safe. `target: '18'` routes the memo cache through
+    // react-compiler-runtime instead of React 19's built-in hook. Test files
+    // are excluded: compiling them adds nothing, and mock components inside
+    // `vi.mock` factories close over dynamically-imported bindings that the
+    // compiler's outlining breaks.
+    // Kill switch: `OMNI_REACT_COMPILER=0` builds without the compiler, so a
+    // suspected compiler regression can be bisected — and shipped around —
+    // without reverting code.
+    ...(process.env.OMNI_REACT_COMPILER === "0"
+      ? []
+      : [babel({ presets: [reactCompilerPresetWithoutTests()] })]),
+    tailwindcss(),
+  ],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

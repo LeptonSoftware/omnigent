@@ -276,4 +276,71 @@ describe("ConversationRegistry", () => {
     registry.release("conv_a");
     expect(registry.getActive()).toBeNull();
   });
+
+  it("reports whether an id is the conversation on screen", () => {
+    registry.acquire("conv_a");
+    registry.acquire("conv_b");
+    registry.setActive("conv_a");
+    expect(registry.isActive("conv_a")).toBe(true);
+    expect(registry.isActive("conv_b")).toBe(false);
+    expect(registry.isActive("conv_missing")).toBe(false);
+  });
+});
+
+describe("ConversationRegistry — background-prefetched entries", () => {
+  let registry: ConversationRegistry;
+
+  beforeEach(() => {
+    registry = new ConversationRegistry();
+  });
+
+  it("evicts a never-opened prefetch before a conversation the user visited", () => {
+    // The user visited this one and switched away — the registry exists to
+    // keep it warm for the trip back.
+    registry.acquire("conv_visited");
+    registry.setActive("conv_visited");
+    registry.setActive("conv_open");
+    registry.acquire("conv_open");
+
+    // Warmed in the background afterwards, so it is the most recently
+    // *acquired* entry — and must still be the first to go.
+    registry.acquire("conv_warmed");
+    registry.markPrefetched("conv_warmed");
+
+    expect(registry.evictLruEvictable()).toBe("conv_warmed");
+    expect(registry.has("conv_visited")).toBe(true);
+  });
+
+  it("stops treating a prefetched conversation as disposable once it is opened", () => {
+    registry.acquire("conv_warmed");
+    registry.markPrefetched("conv_warmed");
+    registry.acquire("conv_other");
+    registry.setActive("conv_other");
+
+    // Opening it promotes it out of the prefetch tier...
+    registry.setActive("conv_warmed");
+    // ...so the next eviction takes the other one instead.
+    expect(registry.evictLruEvictable()).toBe("conv_other");
+    expect(registry.has("conv_warmed")).toBe(true);
+  });
+
+  it("never evicts the active conversation to make room for warm-up", () => {
+    registry.acquire("conv_active");
+    registry.setActive("conv_active");
+    expect(registry.evictLruEvictable()).toBeNull();
+    expect(registry.has("conv_active")).toBe(true);
+  });
+
+  it("forgets the prefetch mark when the entry is released", () => {
+    // `conv_stale` is the least-recently-used entry, so ordinary LRU picks it.
+    registry.acquire("conv_stale");
+    registry.acquire("conv_warmed");
+    registry.markPrefetched("conv_warmed");
+    registry.release("conv_warmed");
+    // Re-acquired by a real visit: it must not inherit the disposable tier.
+    // If the mark survived the release, the prefetch tier would beat LRU and
+    // evict `conv_warmed` instead — which is what this discriminates.
+    registry.acquire("conv_warmed");
+    expect(registry.evictLruEvictable()).toBe("conv_stale");
+  });
 });

@@ -62,7 +62,9 @@ import {
   type ConversationState,
   type FrameScheduler,
   bindConversationForTest,
+  prefetchConversation,
   releaseConversation,
+  resetFirstBindForTest,
 } from "./chatStore";
 import { conversationRegistry } from "./conversationRegistry";
 import {
@@ -463,6 +465,9 @@ beforeEach(() => {
   sessionSubagentRoutingOverrides = new Map();
   sessionLabels = new Map();
   initChatStore(client);
+  // Each test starts as a fresh page load: its first bind refreshes runner
+  // state, later binds in the same test are in-app switches.
+  resetFirstBindForTest();
   // Generous, deterministic slots for tests that aren't about the cap; the
   // dedicated stream-slot tests install their own small-capacity manager.
   setStreamSlotManagerForTest(makeFakeSlotManager());
@@ -976,6 +981,81 @@ describe("chatStore — switchTo", () => {
     expect((blocks[0] as UserMessageBlock).content).toEqual([
       { type: "input_text", text: "fresh server message" },
     ]);
+  });
+
+  it("prefetchConversation warms a background entry without touching the active conversation", async () => {
+    seedSession("conv_active", [userMessage("resp_a", "active thread")]);
+    seedSession("conv_warm", [userMessage("resp_w", "warmed thread")]);
+    await useChatStore.getState().switchTo("conv_active");
+
+    await prefetchConversation("conv_warm");
+
+    // Active conversation untouched; the warm entry hydrated in the background.
+    expect(useChatStore.getState().conversationId).toBe("conv_active");
+    expect(conversationRegistry.peek("conv_warm")?.getState().blocks).toHaveLength(1);
+    // A prefetch bind must never send the runner probe.
+    const warmFetches = fetchMock.mock.calls.filter(([u]) =>
+      String(u).startsWith("/v1/sessions/conv_warm?"),
+    );
+    expect(warmFetches).toHaveLength(1);
+    expect(String(warmFetches[0]?.[0])).not.toContain("refresh_state=true");
+
+    // Switching to the warmed conversation is the live path: no re-fetch.
+    fetchMock.mockClear();
+    await useChatStore.getState().switchTo("conv_warm");
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+    expect(
+      fetchMock.mock.calls.filter(([u]) => String(u).includes("conv_warm/items")),
+    ).toHaveLength(0);
+  });
+
+  it("a denied warm-up never disposes a conversation the reader opened while it waited", async () => {
+    seedSession("conv_warm", [userMessage("resp_w", "warmed thread")]);
+    // First tryAcquire (the warm-up's) parks until `openGate`, then reports a
+    // saturated origin; the reader's own bind after it is granted normally.
+    let openGate = (): void => {};
+    const gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    let first = true;
+    setStreamSlotManagerForTest({
+      tryAcquire: async (): Promise<StreamSlot | null> => {
+        if (first) {
+          first = false;
+          await gate;
+          return null;
+        }
+        return { release: () => Promise.resolve() };
+      },
+    });
+
+    const warming = prefetchConversation("conv_warm");
+    // The reader clicks that very thread while the warm-up is still waiting.
+    await useChatStore.getState().switchTo("conv_warm");
+    openGate();
+    await warming;
+
+    // The warm-up yields its claim on the entry; it must not take the reader's
+    // live conversation down with it.
+    expect(useChatStore.getState().conversationId).toBe("conv_warm");
+    expect(conversationRegistry.peek("conv_warm")).not.toBeUndefined();
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+  });
+
+  it("prefetchConversation must not consume the page-load runner probe", async () => {
+    seedSession("conv_warm", [userMessage("resp_w", "warmed thread")]);
+    seedSession("conv_user", [userMessage("resp_u", "user opened")]);
+
+    await prefetchConversation("conv_warm");
+    await useChatStore.getState().switchTo("conv_user");
+
+    // The user-driven first bind still refreshes runner state even though a
+    // prefetch bound first.
+    const userFetches = fetchMock.mock.calls.filter(([u]) =>
+      String(u).startsWith("/v1/sessions/conv_user?"),
+    );
+    expect(userFetches).toHaveLength(1);
+    expect(String(userFetches[0]?.[0])).toContain("refresh_state=true");
   });
 
   it("hydrates from paginated session items instead of the capped session snapshot", async () => {

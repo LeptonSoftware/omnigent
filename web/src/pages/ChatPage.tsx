@@ -44,6 +44,7 @@ import {
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import { useStickToBottomContext } from "use-stick-to-bottom";
+import { publishBottomLock } from "@/lib/bottomLock";
 import {
   Message,
   MessageActions,
@@ -122,6 +123,7 @@ import {
   type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
+import { resolveHiddenBubbleCount } from "@/store/conversationState";
 import {
   isNativeTerminalSession,
   nativeCodingAgentForSession,
@@ -1905,6 +1907,28 @@ function MainAgentSurface({
     [streamBubbles],
   );
 
+  // Only the trailing render window mounts. The rest of the loaded history
+  // stays in the store and is revealed by scroll-up (HistoryAutoLoader grows
+  // the window before it pages the network) — mounting ~100 markdown bubbles
+  // per switch was the dominant switch cost, and content-visibility only
+  // skips layout/paint, not the component render itself.
+  const historyHiddenCount = useChatStore((s) => s.historyHiddenCount);
+  const hiddenBubbleCount = resolveHiddenBubbleCount(historyHiddenCount, streamBubbles.length);
+  // Pin the window to a concrete count as soon as this conversation has
+  // bubbles. An unfrozen (null) window re-derives from the current length, so
+  // an append would unmount the oldest rendered bubble and a prepended page
+  // would be hidden the instant it arrived.
+  const freezeHistoryRenderWindow = useChatStore((s) => s.freezeHistoryRenderWindow);
+  useEffect(() => {
+    if (historyHiddenCount === null && streamBubbles.length > 0) {
+      freezeHistoryRenderWindow(streamBubbles.length);
+    }
+  }, [freezeHistoryRenderWindow, historyHiddenCount, streamBubbles.length]);
+  const renderedBubbles = useMemo(
+    () => (hiddenBubbleCount === 0 ? streamBubbles : streamBubbles.slice(hiddenBubbleCount)),
+    [streamBubbles, hiddenBubbleCount],
+  );
+
   // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) — the composer's own unmodified
   // ArrowUp/Down history-recall skips modified arrows, so this fires there too.
   useEffect(() => {
@@ -2148,10 +2172,14 @@ function MainAgentSurface({
                 )}
               >
                 {/* Scroll helpers — must live inside StickToBottom to access context. */}
+                <ScrollToEndOnSwitch />
                 <ScrollToBottomOnSend nonce={sendScrollNonce} />
                 <KeepBottomOnViewportResize />
                 <ConversationScrollRefBridge onScroller={setScroller} />
-                <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
+                <HistoryAutoLoader
+                  scrollElement={scroller?.el ?? null}
+                  hiddenBubbleCount={hiddenBubbleCount}
+                />
                 {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
                   // Cold launch: a centered spinner instead of the "ready to
                   // type" empty state (the create-then-send path uses the
@@ -2181,12 +2209,14 @@ function MainAgentSurface({
                   <>
                     {/* Older pages prepend here while their request is in flight. */}
                     {loadingMoreHistory && <HistoryLoadingIndicator />}
-                    {streamBubbles.map((bubble, bubbleIndex) => (
+                    {renderedBubbles.map((bubble, bubbleIndex) => (
                       <BubbleView
                         key={bubbleKey(bubble)}
                         bubble={bubble}
-                        isLastAssistant={bubbleIndex === lastAssistantIndex}
-                        showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
+                        isLastAssistant={bubbleIndex + hiddenBubbleCount === lastAssistantIndex}
+                        showsWorking={
+                          showsWorking && bubbleIndex + hiddenBubbleCount === lastAssistantIndex
+                        }
                       />
                     ))}
                     {/* Pending elicitation cards, floated to the bottom of the
@@ -2419,6 +2449,73 @@ function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageN
  * up while streaming, but an explicit send should bring the fresh user bubble
  * and ensuing response back into view.
  */
+/**
+ * Land every conversation switch pinned to the newest message, before paint.
+ *
+ * The StickToBottom instance is shared across switches (ChatPage stays
+ * mounted), so scrolling up in one conversation sets `escapedFromLock` and the
+ * NEXT conversation would inherit a released bottom-lock — its resize
+ * corrections bail and hydration leaves the reader stranded mid-history. And
+ * even with the lock held, the library's correction is ResizeObserver-driven
+ * (async), so a hydration commit paints 1-3 frames at the wrong position
+ * before snapping down. Re-arming the lock and scrolling in a layout effect
+ * makes the first painted frame of a switch already sit at the bottom.
+ *
+ * Runs on: the switch itself and the cold bind's first hydration (`hasBlocks`
+ * flip). Deliberately NOT on render-window growth, history prepends, or a
+ * reconnect's window reset — those happen while the reader may be scrolled
+ * up, and yanking them down would fight the read.
+ */
+function ScrollToEndOnSwitch() {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef?: React.RefObject<HTMLElement>;
+  };
+  const { state, scrollToBottom, scrollRef } = ctx;
+  const conversationId = useChatStore((s) => s.conversationId);
+  const hasBlocks = useChatStore((s) => s.blocks.length > 0);
+
+  useLayoutEffect(() => {
+    state.escapedFromLock = false;
+    state.isAtBottom = true;
+    // Direct write first so the pre-paint position is right even if the
+    // library queues; its own instant scroll keeps internal state consistent.
+    const el = scrollRef?.current;
+    if (el) el.scrollTop = el.scrollHeight;
+    scrollToBottom("instant");
+    // Late-arriving height (async syntax highlighting, images, fonts) keeps
+    // growing a fresh transcript for a couple of seconds after the commit,
+    // and the library's ResizeObserver correction paints a frame late every
+    // time — each growth is a visible "jump up". Hold the bottom every frame
+    // through the settle window; a reader's scroll-up (escapedFromLock) wins
+    // immediately.
+    let frame = 0;
+    let ticks = 0;
+    let pinnedTop: number | null = null;
+    const HOLD_FRAMES = 180; // ~3s at 60fps — covers the async-content settle
+    const hold = (): void => {
+      frame = 0;
+      if (state.escapedFromLock) return;
+      const target = scrollRef?.current;
+      if (target) {
+        // An upward move means something wants to leave the bottom: the reader,
+        // or jump-to-top / rail navigation, neither of which flips
+        // escapedFromLock. Re-pin after growth, never fight a move.
+        if (pinnedTop !== null && target.scrollTop < pinnedTop - 1) return;
+        if (target.scrollHeight - target.scrollTop - target.clientHeight > 1) {
+          target.scrollTop = target.scrollHeight;
+        }
+        pinnedTop = target.scrollTop;
+      }
+      ticks += 1;
+      if (ticks < HOLD_FRAMES) frame = requestAnimationFrame(hold);
+    };
+    frame = requestAnimationFrame(hold);
+    return () => cancelAnimationFrame(frame);
+  }, [conversationId, hasBlocks, scrollRef, scrollToBottom, state]);
+
+  return null;
+}
+
 function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
   const { scrollToBottom } = useStickToBottomContext();
 
@@ -2508,8 +2605,11 @@ const TOUCH_DRAG_SLOP_PX = 8;
 
 export function HistoryAutoLoader({
   scrollElement,
+  hiddenBubbleCount = 0,
 }: {
   scrollElement?: HTMLElement | null;
+  /** Loaded-but-unrendered bubbles above the render window (see ConversationView). */
+  hiddenBubbleCount?: number;
 } = {}) {
   // useStickToBottomContext exposes scrollRef (the actual scroll container
   // element) in the runtime context even though the public TS types only
@@ -2527,6 +2627,7 @@ export function HistoryAutoLoader({
   const [scrollRevision, setScrollRevision] = useState(0);
   const handledScrollRevisionRef = useRef(scrollRevision);
   const oldestItemIdRef = useRef(oldestItemId);
+  const hiddenBubbleCountRef = useRef(hiddenBubbleCount);
   // Whether the reader has asked to move the transcript upward yet.
   //
   // "Near the top" alone is not a request for older history: opening a session
@@ -2610,8 +2711,13 @@ export function HistoryAutoLoader({
     const itemsChanged = !generationChanged && oldestItemIdRef.current !== oldestItemId;
     const scrollPositionChanged =
       !generationChanged && handledScrollRevisionRef.current !== scrollRevision;
+    // A grow-step reveal continues paging the same way a prepend does: while
+    // the reader stays near the top, each reveal re-runs this effect until the
+    // hidden backlog is exhausted and network paging takes over.
+    const revealChanged = !generationChanged && hiddenBubbleCountRef.current !== hiddenBubbleCount;
     oldestItemIdRef.current = oldestItemId;
     handledScrollRevisionRef.current = scrollRevision;
+    hiddenBubbleCountRef.current = hiddenBubbleCount;
 
     if (generationChanged) {
       generationRef.current = historyGeneration;
@@ -2629,18 +2735,25 @@ export function HistoryAutoLoader({
     // request, and this waits for the reader to actually scroll up.
     if (
       !scrolledUpRef.current ||
-      !state.oldestItemId ||
-      !state.hasMoreHistory ||
-      state.loadingMoreHistory ||
-      !(itemsChanged || scrollPositionChanged) ||
+      !(itemsChanged || scrollPositionChanged || revealChanged) ||
       el.scrollTop >= historyLoadThreshold(el)
     ) {
       return;
     }
 
+    // Already-loaded history first: reveal it (a store write, no fetch)
+    // before asking the server for anything older.
+    if (hiddenBubbleCount > 0) {
+      state.growHistoryRenderWindow(hiddenBubbleCount);
+      return;
+    }
+
+    if (!state.oldestItemId || !state.hasMoreHistory || state.loadingMoreHistory) return;
+
     void state.loadMoreHistory();
   }, [
     ctx.scrollRef,
+    hiddenBubbleCount,
     historyGeneration,
     loadingMoreHistory,
     oldestItemId,
@@ -2815,7 +2928,12 @@ function ConversationScrollRefBridge({
     // Runs after commit, when StickToBottom has populated scrollRef.current.
     const el = ctx.scrollRef?.current ?? null;
     onScroller(el ? { el, state: ctx.state, stopScroll: ctx.stopScroll } : null);
-    return () => onScroller(null);
+    // Same lock, reachable from non-components (see `releaseBottomLock`).
+    publishBottomLock(el ? ctx.state : null);
+    return () => {
+      onScroller(null);
+      publishBottomLock(null);
+    };
   }, [ctx.scrollRef, ctx.state, ctx.stopScroll, onScroller]);
   return null;
 }
@@ -2912,9 +3030,16 @@ export function JumpToTopButton({
     };
   }, [scrollEl]);
 
-  // Somewhere to go: older pages exist, or we're scrolled down within the
-  // loaded window. At the very first message there's nothing to jump to.
-  const canJump = hasMoreHistory || !atTop;
+  // Somewhere to go: older pages exist, loaded blocks sit above the render
+  // window, or we're scrolled down within it. At the very first message
+  // there's nothing to jump to. blocks-vs-count is an overestimate of hidden
+  // *bubbles* (blocks group into bubbles) — worst case the pill shows and the
+  // jump is a near-no-op.
+  // A frozen window reports a real count; `null` only survives the frame before
+  // the freeze effect runs, and treating that as "history is hidden" would pin
+  // the pill on for every conversation, including a three-message one.
+  const hasUnrenderedHistory = useChatStore((s) => (s.historyHiddenCount ?? 0) > 0);
+  const canJump = hasMoreHistory || hasUnrenderedHistory || !atTop;
   const visible = jumping || ((hovering || scrolledUp) && canJump);
 
   const jumpToTop = useCallback(async () => {
@@ -2935,6 +3060,12 @@ export function JumpToTopButton({
       stopScroll();
       state.isAtBottom = false;
       state.escapedFromLock = true;
+
+      // Mount everything already loaded — the render window would otherwise
+      // keep the oldest in-memory bubbles unmounted and "top" would land
+      // mid-history.
+      useChatStore.getState().expandHistoryRenderWindow();
+      await nextFrame();
 
       // Page in every older block before scrolling. loadMoreHistory serializes
       // via its own loadingMoreHistory guard (so a concurrent HistoryAutoLoader

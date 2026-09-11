@@ -154,6 +154,13 @@ describe("useUserMessageNav", () => {
     const { result } = renderHook(() => useUserMessageNav(["a"]));
 
     act(() => result.current.goPrev());
+    // A missing anchor first expands the history render window and retries on
+    // the next frame (the message may be loaded but unmounted); the warn only
+    // fires once the retry also comes up empty.
+    act(() => {
+      vi.advanceTimersToNextFrame();
+      vi.advanceTimersToNextFrame();
+    });
 
     expect(warn).toHaveBeenCalledOnce();
     expect(warn.mock.calls[0][0]).toMatch(/no element/i);

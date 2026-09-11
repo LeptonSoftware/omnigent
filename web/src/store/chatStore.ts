@@ -80,7 +80,12 @@ import type {
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
-import { createInitialConversationState, isConversationStateKey } from "./conversationState";
+import {
+  createInitialConversationState,
+  HISTORY_RENDER_GROWTH_STEP,
+  isConversationStateKey,
+  resolveHiddenBubbleCount,
+} from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import {
   SSE_STALL_TIMEOUT_MS,
@@ -378,6 +383,16 @@ export interface ConversationState {
   hasMoreHistory: boolean;
   /** True while a `loadMoreHistory` fetch is in flight. */
   loadingMoreHistory: boolean;
+  /**
+   * How many leading bubbles this conversation leaves unmounted. Loaded
+   * history above the window stays in `blocks` but is not rendered —
+   * mounting ~100 markdown bubbles per switch is what made switches slow.
+   * Shrinks via `growHistoryRenderWindow` on scroll-up (before any network
+   * page) and `expandHistoryRenderWindow` for jump-to-top. `null` until the
+   * first render derives it; see `resolveHiddenBubbleCount` for why the
+   * window is anchored at its top rather than counted from the end.
+   */
+  historyHiddenCount: number | null;
   /**
    * The item id at the start of the current `blocks` history window —
    * used as the `before` cursor for the next `loadMoreHistory` page
@@ -762,6 +777,30 @@ export interface ChatActions {
    * or there is no active conversation / oldest-item cursor yet.
    */
   loadMoreHistory: () => Promise<void>;
+  /**
+   * Reveal one more step of already-loaded history (scroll-up hit the top of
+   * the rendered window while unrendered bubbles exist in memory). Cheaper
+   * than `loadMoreHistory` — no fetch — so callers try this first.
+   *
+   * Takes the hidden-bubble count the caller rendered with: the window counts
+   * BUBBLES, and only the view knows how `blocks` folded into them.
+   */
+  growHistoryRenderWindow: (currentHidden: number) => void;
+  /**
+   * Freeze the initial render window, in bubbles, once a conversation has any.
+   *
+   * Until a concrete count is stored, the window re-derives from the CURRENT
+   * bubble count on every render — so an appended turn would unmount the oldest
+   * rendered bubble and a prepended history page would be hidden the moment it
+   * landed. Only the view can call this: the count is in bubbles and the store
+   * holds blocks. No-ops once a count exists, so it never fights a reveal.
+   */
+  freezeHistoryRenderWindow: (totalBubbles: number) => void;
+  /**
+   * Render every loaded block (jump-to-top; the reader asked for the whole
+   * history, so windowing would just fight the pinned scroll position).
+   */
+  expandHistoryRenderWindow: () => void;
   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
   flashUserMessage: (itemId: string) => void;
   /** Queue an "@"-mention chip into the active composer from outside it. */
@@ -801,6 +840,10 @@ export interface ChatActions {
 export interface ChatState extends ConversationState, AppChatState, ChatActions {}
 
 let queryClient: QueryClient | null = null;
+// Whether any conversation has bound its stream since this page load. The
+// first bind passes `refresh_state=true` (see bindStream) so a browser
+// reload re-probes the runner; later binds are in-app switches and skip it.
+let hasBoundStreamThisLoad = false;
 
 /**
  * Evict a conversation from the live registry.
@@ -1148,6 +1191,15 @@ export function bindConversationForTest(
 }
 
 /**
+ * Test-only seam: make the next `bindStream` behave like the first bind of a
+ * page load (`refresh_state=true`). The flag is module state, so without this
+ * a test's binds inherit whether some earlier test already bound a stream.
+ */
+export function resetFirstBindForTest(): void {
+  hasBoundStreamThisLoad = false;
+}
+
+/**
  * Initialize the store with the app's QueryClient. Called once at app
  * boot from `main.tsx`. Without this the store can't fetch items
  * through the cache or invalidate the conversations query when a new
@@ -1302,6 +1354,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   claudePermissionMode: "",
   hasMoreHistory: false,
   loadingMoreHistory: false,
+  historyHiddenCount: null,
   oldestItemId: null,
   flashItemId: null,
   pendingComposerAttachments: [],
@@ -1993,12 +2046,33 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Paint whatever the entry already holds. For a live entry that is the
     // current transcript; for a fresh one it is the initial state.
     mirrorActiveEntry();
+
+    const bindWillRefresh = !wasLive && !hasBoundStreamThisLoad;
+    // A live entry needs nothing: its open stream delivers `session_skills` /
+    // `session_model_options` / `agent_changed`, which is exactly why returning
+    // to it costs zero fetches.
     if (wasLive) return;
 
     // Cold entry: bind its stream and hydrate history. `hydratePending` replays
     // the snapshot's un-consumed native messages — correct here because a fresh
     // entry has no live optimistic bubbles to overwrite.
     await bindStream(conversationId, entrySetter(entry), entryGetter(entry), true);
+
+    // Runner-backed fields (`model_options`, skills) are process-cached server
+    // side and only a `refresh_state` read re-asks the runner. A cold bind after
+    // the first of this page load skips that probe to stay off the critical path
+    // (300-900ms), and no stream was open to carry an event for a change that
+    // already happened — so converge it in the background, or `useSession`
+    // (staleTime: Infinity, sharing this cache key) serves the previous agent's
+    // catalog until a hard reload. Strictly AFTER the bind: both read the same
+    // query key, so an in-flight refreshed read would dedupe the bind's cheap
+    // one onto it and put the probe straight back on the paint path.
+    if (!bindWillRefresh) {
+      void refetchRunnerBackedSessionState(conversationId, {
+        refreshState: true,
+        applyBindingPatch: true,
+      });
+    }
   },
 
   submitApproval: async (elicitationId, action, content) => {
@@ -2344,6 +2418,33 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       pageSet({ loadingMoreHistory: false, hasMoreHistory: false });
     }
   },
+
+  freezeHistoryRenderWindow: (totalBubbles: number) => {
+    const { conversationId, historyHiddenCount } = get();
+    if (!conversationId || historyHiddenCount !== null) return;
+    setterFor(conversationId)({
+      historyHiddenCount: resolveHiddenBubbleCount(null, totalBubbles),
+    });
+  },
+
+  growHistoryRenderWindow: (currentHidden: number) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    // The caller passes the hidden count it actually rendered with. The store
+    // cannot derive it: the window is measured in BUBBLES, and the store holds
+    // `blocks` — several of which fold into one bubble. Deriving it here from
+    // `blocks.length` overshoots the bubble array and renders an empty
+    // transcript.
+    setterFor(conversationId)({
+      historyHiddenCount: Math.max(0, currentHidden - HISTORY_RENDER_GROWTH_STEP),
+    });
+  },
+
+  expandHistoryRenderWindow: () => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    setterFor(conversationId)({ historyHiddenCount: 0 });
+  },
 }));
 
 // ── Store-action setter ──────────────────────────────────
@@ -2402,9 +2503,17 @@ const heldStreamSlots = new Map<string, StreamSlot>();
  * has nothing of its own to reclaim; the active conversation then opens over
  * budget (the caller proceeds anyway) and the too-many-tabs banner is raised.
  */
-async function acquireStreamSlot(id: string): Promise<boolean> {
+async function acquireStreamSlot(id: string, opportunistic = false): Promise<boolean> {
   if (heldStreamSlots.has(id)) return true; // rebinding a still-slotted stream
   let slot = await getStreamSlotManager().tryAcquire();
+  // Background warm-up takes a slot only if one is genuinely free. It must
+  // never evict to make room (warming a thread nobody opened would cold-evict
+  // the one the reader just left) and never raise the too-many-tabs banner,
+  // which is a statement about the user's own tabs.
+  if (opportunistic) {
+    if (slot !== null) heldStreamSlots.set(id, slot);
+    return slot !== null;
+  }
   // Inherently sequential: each iteration must fully release a reclaimed slot
   // (so the freed lock is observable) before re-checking, or we'd over-evict.
   /* eslint-disable no-await-in-loop */
@@ -2492,6 +2601,34 @@ function isConversationStreamCurrent(id: string): boolean {
   if (entry === undefined || entry.disposed) return false;
   const state = entry.getState();
   return state.abortController !== null && state.conversationLoadError === null;
+}
+
+/**
+ * Warm a conversation in the background: create its registry entry and bind
+ * its stream, so the first click on it is a warm switch (instant mirror paint)
+ * instead of a cold bind. The entry is a normal background entry — evictable
+ * by the LRU slot pressure, kept current by its SSE stream.
+ *
+ * No-ops when the conversation is active, already live, or *retained-but-dead*
+ * (that entry may hold unsent work; `switchTo` owns that rebind). Never sends
+ * `refresh_state` — the runner probe belongs to a user-driven first bind.
+ */
+export async function prefetchConversation(id: string): Promise<void> {
+  if (useChatStore.getState().conversationId === id) return;
+  if (conversationRegistry.has(id)) return;
+  const entry = conversationRegistry.acquire(id);
+  // Evict-first until the user actually opens it.
+  conversationRegistry.markPrefetched(id);
+  // Same as switchTo's cold path: if the user clicks mid-prefetch, the page
+  // must show the hydrating placeholder, not the empty state (the entry is
+  // stream-current the moment bindStream installs its controller, so the
+  // click mirrors this entry rather than re-binding).
+  entry.setState({ loadingConversation: true });
+  await bindStream(id, entrySetter(entry), entryGetter(entry), true, {
+    refreshState: false,
+    opportunisticSlot: true,
+    entry,
+  });
 }
 
 /**
@@ -2996,17 +3133,62 @@ async function bindStream(
   set: Setter,
   get: Getter,
   hydratePending = false,
+  opts?: {
+    /**
+     * Override the first-bind-of-this-page-load `refresh_state` heuristic.
+     * A background prefetch passes `false`: it must stay cheap on the server
+     * (no runner tunnel probe) and must not consume the page-load flag — the
+     * first *user-driven* bind still gets its refresh.
+     */
+    refreshState?: boolean;
+    /**
+     * Take a stream slot only if one is free — never evict to get one, never
+     * raise the budget banner. Background warm-up only.
+     */
+    opportunisticSlot?: boolean;
+    /**
+     * The entry this bind writes through, when the caller captured one.
+     *
+     * Liveness is then entry IDENTITY, not id. A background bind can be
+     * release-and-reacquired for the same conversation while it awaits a slot
+     * (the reader clicks that row, and `switchTo` sees no controller installed
+     * yet), and an id-keyed check would green-light writes, a second pump, and
+     * a slot hand-back against the reader's live entry.
+     */
+    entry?: ConversationEntry;
+  },
 ): Promise<void> {
   racedNativeModelOptions.delete(id);
+  const expected = opts?.entry;
+  /** Whether this bind still owns the entry it set out to fill. */
+  const stillOurs = (): boolean =>
+    expected === undefined
+      ? !isConversationDisposed(id)
+      : !expected.disposed && conversationRegistry.peek(id) === expected;
+  /** Hand a held slot back only when no entry relies on it (slots key by id). */
+  const releaseSlotIfUnused = (): void => {
+    if (expected === undefined || conversationRegistry.peek(id) === undefined) {
+      releaseStreamSlot(id);
+    }
+  };
   const controller = new AbortController();
   // Take an origin-wide stream slot before opening the connection, evicting our
   // own LRU background stream to make room. A fresh tab that finds every slot
   // held by other tabs opens over budget (no slot) and raises the banner.
-  await acquireStreamSlot(id);
-  if (isConversationDisposed(id)) {
-    // Switched away / evicted while awaiting the slot — don't open a dead
-    // entry's stream, and hand any slot we took back to the origin.
-    releaseStreamSlot(id);
+  const gotSlot = await acquireStreamSlot(id, opts?.opportunisticSlot === true);
+  if (opts?.opportunisticSlot === true && !gotSlot) {
+    // Origin is saturated by real conversations (this tab's or another's).
+    // Warm-up yields rather than competing for the budget — but drop the entry
+    // only while it is still ours and unopened: the reader may have opened this
+    // very conversation while we awaited the slot, or replaced the entry
+    // outright, and releasing by id would take theirs down.
+    if (stillOurs() && !conversationRegistry.isActive(id)) conversationRegistry.release(id);
+    return;
+  }
+  if (!stillOurs()) {
+    // Switched away / evicted / replaced while awaiting the slot — don't open a
+    // dead entry's stream, and hand any slot we took back to the origin.
+    releaseSlotIfUnused();
     return;
   }
   set({ abortController: controller });
@@ -3032,8 +3214,8 @@ async function bindStream(
     // Liveness, not the visible id: a background bind must survive a switch away
     // (that is the whole feature). Only a dispose (evicted) bails — and then the
     // slot taken above has to go back to the origin.
-    if (isConversationDisposed(id)) {
-      releaseStreamSlot(id);
+    if (!stillOurs()) {
+      releaseSlotIfUnused();
       return;
     }
   }
@@ -3075,16 +3257,25 @@ async function bindStream(
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
     // the reader sees as the transcript shifting seconds after it settled.
+    //
+    // `refresh_state` asks the server to re-probe the runner before answering
+    // — a host-tunnel round trip measured at 300–900ms on live sessions. Its
+    // purpose is piercing stale server-side capability caches after a BROWSER
+    // reload, so only the first bind of a page load pays it; in-app switches
+    // take the server's cached state (kept current by the SSE stream, and by
+    // `refreshSessionState` for explicit refreshes).
+    const refreshState = opts?.refreshState ?? !hasBoundStreamThisLoad;
+    if (opts?.refreshState === undefined) hasBoundStreamThisLoad = true;
     const [session, page] = await Promise.all([
       queryClient.fetchQuery({
         queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id, { refreshState: true }),
+        queryFn: () => getSessionSlim(id, { refreshState }),
         staleTime: 0,
         retry: false,
       }),
       fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS }),
     ]);
-    if (isConversationDisposed(id)) return;
+    if (!stillOurs()) return;
     const items = page.items;
 
     // Sticky-pref handoff for CLI-created sessions with no override.
@@ -3264,6 +3455,9 @@ async function bindStream(
         oldestItemId,
         // The window cursor was reset: void any in-flight loadMoreHistory.
         historyGeneration: state.historyGeneration + 1,
+        // ...and re-derive the render window against this history, rather
+        // than inheriting a hidden count that described the old one.
+        historyHiddenCount: null,
         // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
         sessionStatus: session.status,
@@ -3322,7 +3516,7 @@ async function bindStream(
     }
     racedNativeModelOptions.delete(id);
   } catch (err) {
-    if (isConversationDisposed(id)) return;
+    if (!stillOurs()) return;
     set({
       loadingConversation: false,
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
@@ -3694,6 +3888,8 @@ async function rehydrateWindowOnReconnect(
       loadingMoreHistory: false,
       // The window cursor was reset: void any in-flight loadMoreHistory.
       historyGeneration: s.historyGeneration + 1,
+      // ...and re-derive the render window against this history.
+      historyHiddenCount: null,
     };
   });
 }
