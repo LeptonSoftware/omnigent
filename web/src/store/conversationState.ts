@@ -22,6 +22,51 @@ export const INITIAL_HISTORY_RENDER_COUNT = 20;
 export const HISTORY_RENDER_GROWTH_STEP = 30;
 
 /**
+ * Exchanges the first paint always includes, when the transcript has them.
+ *
+ * A flat bubble count is the wrong unit for "enough context to know where you
+ * are": one agent turn is usually one bubble, but a turn that yields mid-task
+ * (dispatching sub-agents) continues in further assistant bubbles, and routing
+ * and compaction rows take slots too — so a trailing count alone can open a
+ * conversation on nothing but the tail of one long turn, with the reader's own
+ * last question above the fold. Counting back to the Nth-most-recent user
+ * message guarantees the question AND the answer are on screen.
+ */
+export const INITIAL_HISTORY_RENDER_ROUNDS = 2;
+
+/**
+ * Ceiling on the first paint, even when the rounds guarantee asks for more.
+ * One enormous turn would otherwise unwind the whole point of the window;
+ * beyond this the reader scrolls, which reveals the rest.
+ */
+export const MAX_INITIAL_HISTORY_RENDER_COUNT = 60;
+
+/**
+ * How many trailing bubbles the first paint should mount.
+ *
+ * `INITIAL_HISTORY_RENDER_COUNT` is the floor, the last
+ * `INITIAL_HISTORY_RENDER_ROUNDS` user messages (and everything after them) the
+ * guarantee, and `MAX_INITIAL_HISTORY_RENDER_COUNT` the ceiling.
+ *
+ * @param isUserBubble - One flag per bubble, transcript order, marking the
+ *   reader's own messages. Taken as flags rather than bubbles so the store
+ *   layer never has to know the bubble union.
+ */
+export function initialHistoryRenderCount(isUserBubble: readonly boolean[]): number {
+  let rounds = 0;
+  let needed = 0;
+  for (let i = isUserBubble.length - 1; i >= 0; i -= 1) {
+    if (isUserBubble[i] === true) {
+      rounds += 1;
+      // Include this user message itself, and stop once we have enough.
+      needed = isUserBubble.length - i;
+      if (rounds >= INITIAL_HISTORY_RENDER_ROUNDS) break;
+    }
+  }
+  return Math.min(Math.max(needed, INITIAL_HISTORY_RENDER_COUNT), MAX_INITIAL_HISTORY_RENDER_COUNT);
+}
+
+/**
  * Resolve how many leading bubbles stay unmounted, given what the conversation
  * has stored and how many bubbles exist right now.
  *
@@ -41,8 +86,12 @@ export const HISTORY_RENDER_GROWTH_STEP = 30;
  * reconnect re-hydrate), so the new window re-derives instead of inheriting a
  * count that described the old one.
  */
-export function resolveHiddenBubbleCount(stored: number | null, total: number): number {
-  if (stored === null) return Math.max(0, total - INITIAL_HISTORY_RENDER_COUNT);
+export function resolveHiddenBubbleCount(
+  stored: number | null,
+  total: number,
+  initialVisible: number,
+): number {
+  if (stored === null) return Math.max(0, total - initialVisible);
   // Never hide every bubble. The window counts bubbles while the store counts
   // blocks — several of which fold into one bubble — so a count that leaks
   // across that boundary overshoots. Clamping to "at least one rendered"

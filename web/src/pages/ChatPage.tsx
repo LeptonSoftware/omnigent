@@ -123,7 +123,7 @@ import {
   type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
-import { resolveHiddenBubbleCount } from "@/store/conversationState";
+import { initialHistoryRenderCount, resolveHiddenBubbleCount } from "@/store/conversationState";
 import {
   isNativeTerminalSession,
   nativeCodingAgentForSession,
@@ -1913,7 +1913,19 @@ function MainAgentSurface({
   // per switch was the dominant switch cost, and content-visibility only
   // skips layout/paint, not the component render itself.
   const historyHiddenCount = useChatStore((s) => s.historyHiddenCount);
-  const hiddenBubbleCount = resolveHiddenBubbleCount(historyHiddenCount, streamBubbles.length);
+  // Sized in EXCHANGES, not bubbles: the first paint always carries the
+  // reader's last couple of messages and the replies to them, so a
+  // conversation never opens on the tail of one long turn with no question in
+  // sight. See `initialHistoryRenderCount`.
+  const initialVisibleBubbles = useMemo(
+    () => initialHistoryRenderCount(streamBubbles.map((b) => b.kind === "user")),
+    [streamBubbles],
+  );
+  const hiddenBubbleCount = resolveHiddenBubbleCount(
+    historyHiddenCount,
+    streamBubbles.length,
+    initialVisibleBubbles,
+  );
   // Pin the window to a concrete count as soon as this conversation has
   // bubbles. An unfrozen (null) window re-derives from the current length, so
   // an append would unmount the oldest rendered bubble and a prepended page
@@ -1921,9 +1933,9 @@ function MainAgentSurface({
   const freezeHistoryRenderWindow = useChatStore((s) => s.freezeHistoryRenderWindow);
   useEffect(() => {
     if (historyHiddenCount === null && streamBubbles.length > 0) {
-      freezeHistoryRenderWindow(streamBubbles.length);
+      freezeHistoryRenderWindow(streamBubbles.length, initialVisibleBubbles);
     }
-  }, [freezeHistoryRenderWindow, historyHiddenCount, streamBubbles.length]);
+  }, [freezeHistoryRenderWindow, historyHiddenCount, initialVisibleBubbles, streamBubbles.length]);
   const renderedBubbles = useMemo(
     () => (hiddenBubbleCount === 0 ? streamBubbles : streamBubbles.slice(hiddenBubbleCount)),
     [streamBubbles, hiddenBubbleCount],
