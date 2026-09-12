@@ -795,7 +795,7 @@ export interface ChatActions {
    * landed. Only the view can call this: the count is in bubbles and the store
    * holds blocks. No-ops once a count exists, so it never fights a reveal.
    */
-  freezeHistoryRenderWindow: (totalBubbles: number) => void;
+  freezeHistoryRenderWindow: (totalBubbles: number, initialVisible: number) => void;
   /**
    * Render every loaded block (jump-to-top; the reader asked for the whole
    * history, so windowing would just fight the pinned scroll position).
@@ -2419,11 +2419,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  freezeHistoryRenderWindow: (totalBubbles: number) => {
+  freezeHistoryRenderWindow: (totalBubbles: number, initialVisible: number) => {
     const { conversationId, historyHiddenCount } = get();
     if (!conversationId || historyHiddenCount !== null) return;
     setterFor(conversationId)({
-      historyHiddenCount: resolveHiddenBubbleCount(null, totalBubbles),
+      historyHiddenCount: resolveHiddenBubbleCount(null, totalBubbles, initialVisible),
     });
   },
 
