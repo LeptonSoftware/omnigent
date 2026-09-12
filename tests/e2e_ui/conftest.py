@@ -110,6 +110,42 @@ def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> No
     page.get_by_role("menuitem", name=mode, exact=True).click()
 
 
+# ── hermetic subprocess environment ─────────────────────────────────────────
+#
+# Every `OMNIGENT_RUNNER_*` variable describes ONE ambient runner: its identity,
+# its auth mode, its primary session, even an inherited file descriptor. This
+# suite is frequently run from inside an Omnigent session (an agent running the
+# tests), and that session exports all of them — so spreading `os.environ` into
+# a spawned server or runner handed the test runner the *ambient* runner's
+# wiring. With `OMNIGENT_RUNNER_DELEGATED_AUTH=1` inherited, the test runner
+# mints its token through a delegated provider the local test server does not
+# have: `POST /v1/runners/{id}/token` answers 401, the runner stops after a few
+# attempts, and every test in the shard dies in `live_server` with
+# `online: false` — while an identical run from a plain shell passes.
+# `OMNIGENT_RUNNER_PRIMARY_SESSION_ID` is just as bad in a quieter way: it
+# redirects the spawned server's logs into the ambient session's log file, so
+# the test's own `runner.log` is empty when you go looking for the reason.
+_AMBIENT_RUNNER_ENV_PREFIX = "OMNIGENT_RUNNER_"
+_AMBIENT_RUNNER_ENV_KEYS = frozenset({"RUNNER_SERVER_URL", "OMNIGENT_PROCESS_LOG_FILE"})
+
+
+def _hermetic_env() -> dict[str, str]:
+    """``os.environ`` with any ambient runner's wiring stripped out.
+
+    Callers spread this instead of ``os.environ`` and then set the few
+    runner variables they actually mean, so a spawned server or runner is
+    configured by the fixture alone — never by the session the tests run in.
+
+    :returns: A copy of the environment minus ``OMNIGENT_RUNNER_*`` and the
+        other ambient-runner keys.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(_AMBIENT_RUNNER_ENV_PREFIX) and key not in _AMBIENT_RUNNER_ENV_KEYS
+    }
+
+
 # Populated by ``live_server`` so test-scoped fixtures can access the
 # server PID and runner id without changing ``live_server``'s return
 # type (which other tests depend on).
@@ -861,7 +897,7 @@ def _spawn_runner_against_external_server(
     runner_id = token_bound_runner_id(binding_token)
 
     env = {
-        **os.environ,
+        **_hermetic_env(),
         "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_RUNNER_ID": runner_id,
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
@@ -1010,7 +1046,7 @@ def live_server(
     # exactly the sibling runner's WebSocket tunnel.
     mock_url = mock_llm_server_url
     env: dict[str, str] = {
-        **os.environ,
+        **_hermetic_env(),
         "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         "OMNIGENT_BUILTIN_AGENT_DIRS": os.pathsep.join(builtin_dirs),
         # Point the openai-agents harness at the mock LLM server so no
@@ -1071,13 +1107,17 @@ def live_server(
     )
     base_url = f"http://127.0.0.1:{port}"
 
-    # Spawn the runner as a sibling subprocess (the server no longer
-    # starts its own runner). The runner retries its WS tunnel until
-    # the server is ready, so launching them concurrently is safe.
+    # The runner is spawned only once the server ANSWERS, never alongside it.
+    # Its first dial goes out ~2s after exec, and a dial that lands on a port
+    # nothing is listening to yet is NOT retried: the runner stays alive and
+    # silent, never registers, and every test in the shard then dies in this
+    # fixture with `online: false` and an empty runner log. Server bring-up here
+    # is 1-6s (imports, fourteen built-in agent registrations, uvicorn bind), so
+    # spawning them together was a race — lost whenever the box is busy.
     runner_log_path = server_tmp / "runner.log"
     runner_log_handle = open(runner_log_path, "w")  # noqa: SIM115
     runner_env = {
-        **os.environ,
+        **_hermetic_env(),
         "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_RUNNER_ID": runner_id,
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
@@ -1089,15 +1129,10 @@ def live_server(
         "OPENAI_BASE_URL": f"{mock_url}/v1",
         "OPENAI_API_KEY": "mock-key",
     }
-    runner_proc = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env=runner_env,
-        stdout=runner_log_handle,
-        stderr=subprocess.STDOUT,
-    )
+    runner_proc: subprocess.Popen[bytes] | None = None
 
-    # Poll /health and the runner status until the server can
-    # actually route a turn. Time-based polling mirrors
+    # One budget covers the whole bring-up: the server answering /health, and
+    # then the runner registering. Time-based polling mirrors
     # tests/_helpers/live_server.py:start_live_server — the
     # alternative (asyncio.Event signalling) doesn't apply because
     # the subprocess is opaque to this process.
@@ -1110,25 +1145,35 @@ def live_server(
             break
         try:
             resp = httpx.get(f"{base_url}/health", timeout=2)
-            if resp.status_code == 200:
-                status_resp = httpx.get(
-                    f"{base_url}/v1/runners/{runner_id}/status",
-                    timeout=2,
-                )
-                if status_resp.status_code == 200 and status_resp.json()["online"] is True:
-                    ready = True
-                    break
-                last_error = (
-                    f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
-                )
-            else:
+            if resp.status_code != 200:
                 last_error = f"health HTTP {resp.status_code}: {resp.text[:200]}"
+                time.sleep(_HEALTH_POLL_INTERVAL_S)
+                continue
+            if runner_proc is None:
+                # The port is open, so the runner's first dial can land.
+                runner_proc = subprocess.Popen(
+                    [sys.executable, "-m", "omnigent.runner._entry"],
+                    env=runner_env,
+                    stdout=runner_log_handle,
+                    stderr=subprocess.STDOUT,
+                )
+                last_error = "runner spawned, not online yet"
+                time.sleep(_HEALTH_POLL_INTERVAL_S)
+                continue
+            status_resp = httpx.get(
+                f"{base_url}/v1/runners/{runner_id}/status",
+                timeout=2,
+            )
+            if status_resp.status_code == 200 and status_resp.json()["online"] is True:
+                ready = True
+                break
+            last_error = f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
         except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
         time.sleep(_HEALTH_POLL_INTERVAL_S)
 
     if not ready:
-        if runner_proc.poll() is None:
+        if runner_proc is not None and runner_proc.poll() is None:
             runner_proc.send_signal(signal.SIGTERM)
             try:
                 runner_proc.wait(timeout=5)
@@ -1175,7 +1220,7 @@ def live_server(
         yield base_url
     finally:
         _server_state.clear()
-        if runner_proc.poll() is None:
+        if runner_proc is not None and runner_proc.poll() is None:
             runner_proc.send_signal(signal.SIGTERM)
             try:
                 runner_proc.wait(timeout=5)
@@ -1335,7 +1380,7 @@ def _ensure_runner_online(
     log_path = runner_tmp / "runner.log"
     log_handle = open(log_path, "w")  # noqa: SIM115 — fd dup'd into child; closed below
     env = {
-        **os.environ,
+        **_hermetic_env(),
         "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_RUNNER_ID": runner_id,
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
@@ -2899,7 +2944,7 @@ def mocked_native_codex_session(
     runner_id = token_bound_runner_id(binding_token)
     base_url = f"http://127.0.0.1:{port}"
     shared_env = {
-        **os.environ,
+        **_hermetic_env(),
         "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_CONFIG_HOME": str(config_home),
         "OMNIGENT_CODEX_NATIVE_STATE_DIR": str(state_dir),
