@@ -11,16 +11,25 @@
 // without importing the block dispatcher that renders them.
 
 import type React from "react";
-import { useMemo } from "react";
+import { useCallback, useMemo } from "react";
 import { GitPullRequestIcon } from "lucide-react";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
 import {
+  EXTERNAL_REF_ATTR,
+  EXTERNAL_REF_KIND_ATTR,
+  EXTERNAL_REF_REPO_ATTR,
+  isBranchCandidate,
+  parseRefFromUrl,
+} from "@/components/ai-elements/refMarkdown";
+import {
   splitWorkspaceFileCitation,
   WORKSPACE_FILE_LINK_ATTR,
 } from "@/components/ai-elements/streamdown-security";
+import { ExternalRefChip } from "@/components/blocks/ExternalRefChip";
+import type { RefKind } from "@/lib/refsApi";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import { withBasePath } from "@/lib/basePath";
@@ -162,6 +171,12 @@ function WorkspacePathInlineCode({
   // non-openable one just stays styled inline code — only an explicit
   // markdown link (WorkspaceFileLink) earns dead-path feedback.
   const { open: openWorkspaceFile } = useWorkspaceFileOpener(text);
+  const refClick = useExternalRefClick();
+
+  // Not a workspace file, but shaped like a branch name (`user/topic`): offer
+  // it to the ref resolver. It links only if the branch actually exists in a
+  // configured repo, so ordinary path-like inline code stays plain.
+  const branchCandidate = !openWorkspaceFile && isBranchCandidate(text);
 
   if (openWorkspaceFile) {
     // Rendered as an inline <code> (not a <button>): a button is laid out as
@@ -196,7 +211,7 @@ function WorkspacePathInlineCode({
   }
   // Match Streamdown's default inline-code styling so non-path inline code
   // looks unchanged.
-  return (
+  const plainCode = (
     <code
       className={cn("rounded bg-muted px-1.5 py-0.5 font-mono text-ui", className)}
       data-streamdown="inline-code"
@@ -205,6 +220,23 @@ function WorkspacePathInlineCode({
       {codeChildren}
     </code>
   );
+  if (branchCandidate) {
+    return (
+      <ExternalRefChip kind="branch" refText={text} fallback={plainCode} onClick={refClick}>
+        <code
+          className={cn(
+            "rounded bg-muted px-1.5 py-0.5 font-mono text-ui underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors",
+            className,
+          )}
+          data-streamdown="inline-code"
+          {...codeProps}
+        >
+          {codeChildren}
+        </code>
+      </ExternalRefChip>
+    );
+  }
+  return plainCode;
 }
 
 // Streamdown's own anchor styling and marker attribute. Overriding the `a`
@@ -263,6 +295,21 @@ function followLinkWithPopupFallback(
   link.click();
 }
 
+/**
+ * Click handler for an ExternalRefChip anchor: the chip always renders
+ * `target="_blank"`, so it needs the same popup / native-shell fallback as any
+ * other external chat link. Reads the href off the anchor itself because the
+ * chip resolves its own URL for bare references.
+ */
+function useExternalRefClick() {
+  const conversationId = useFileViewerConversationId();
+  return useCallback(
+    (event: React.MouseEvent<HTMLAnchorElement>) =>
+      followLinkWithPopupFallback(event, event.currentTarget.href, conversationId),
+    [conversationId],
+  );
+}
+
 function PullRequestLinkLabel({ children }: { children: React.ReactNode }) {
   const words = typeof children === "string" ? children.match(/^(\S+)([\s\S]*)$/) : null;
   const prefix = (
@@ -303,6 +350,27 @@ function WorkspaceFileLink({
   const { open: openWorkspaceFile, unopenable, resolvedPath } = useWorkspaceFileOpener(path, true);
   // Scopes the desktop in-app browser route to this conversation's view.
   const conversationId = useFileViewerConversationId();
+  const refClick = useExternalRefClick();
+
+  // An external-reference candidate wrapped by `linkifyExternalRefs`. The chip
+  // decides whether it links (configured + verified) or stays plain text.
+  const refProps = props as Record<string, unknown>;
+  const refToken = refProps[EXTERNAL_REF_ATTR];
+  const refKind = refProps[EXTERNAL_REF_KIND_ATTR];
+  if (typeof refToken === "string" && typeof refKind === "string") {
+    const refRepo = refProps[EXTERNAL_REF_REPO_ATTR];
+    return (
+      <ExternalRefChip
+        kind={refKind as RefKind}
+        refText={refToken}
+        repo={typeof refRepo === "string" ? refRepo : undefined}
+        className={cn(STREAMDOWN_LINK_CLASS, className)}
+        onClick={refClick}
+      >
+        {children}
+      </ExternalRefChip>
+    );
+  }
 
   if (!path) {
     // Rebase an app-internal link (e.g. an agent's `/clear` "the new chat"
@@ -314,6 +382,32 @@ function WorkspaceFileLink({
     // popup fallback so a click still works where new tabs can't open.
     const blankHref = props.target === "_blank" && typeof rebased === "string" ? rebased : null;
     const pullRequest = githubPullRequest(rebased);
+    // A real URL that names a ticket / PR / commit keeps its href but gains
+    // the same hover card as a bare reference. The chip's anchor needs the
+    // same popup fallback as any other external link, and a GitHub PR URL
+    // keeps its icon label whether or not the card resolves.
+    const parsed = typeof href === "string" ? parseRefFromUrl(href) : null;
+    if (parsed && typeof rebased === "string") {
+      return (
+        <ExternalRefChip
+          kind={parsed.kind}
+          refText={parsed.ref}
+          repo={parsed.repo}
+          href={rebased}
+          className={cn(STREAMDOWN_LINK_CLASS, className)}
+          title={title ?? (pullRequest ? rebased : undefined)}
+          onClick={refClick}
+        >
+          {pullRequest ? (
+            <PullRequestLinkLabel>
+              {children === href ? pullRequest : children}
+            </PullRequestLinkLabel>
+          ) : (
+            children
+          )}
+        </ExternalRefChip>
+      );
+    }
     return (
       <a
         href={rebased}
