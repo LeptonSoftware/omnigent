@@ -3044,6 +3044,64 @@
         "title": "ReasoningTextDeltaEvent",
         "type": "object"
       },
+      "RefSpec": {
+        "description": "One reference the client wants resolved.",
+        "properties": {
+          "kind": {
+            "enum": [
+              "ticket",
+              "github",
+              "commit",
+              "branch"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "ref": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Ref",
+            "type": "string"
+          },
+          "repo": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repo"
+          }
+        },
+        "required": [
+          "kind",
+          "ref"
+        ],
+        "title": "RefSpec",
+        "type": "object"
+      },
+      "ResolveRefsRequest": {
+        "description": "Batch resolve request; the cap bounds upstream fan-out per call.",
+        "properties": {
+          "refs": {
+            "items": {
+              "$ref": "#/components/schemas/RefSpec"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Refs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "refs"
+        ],
+        "title": "ResolveRefsRequest",
+        "type": "object"
+      },
       "ResourceEventData": {
         "description": "Data payload for a persisted resource lifecycle event.\n\nThese items are written to the conversation store when a\nsession resource is created or deleted, so reconnecting\nclients can discover resource history without replaying the\nlive SSE stream.  The agent loop filters them out of the\nLLM's message context (they are metadata, not conversation\ncontent).",
         "properties": {
@@ -9114,6 +9172,74 @@
         "summary": "Update Project",
         "tags": [
           "projects"
+        ]
+      }
+    },
+    "/v1/refs/config": {
+      "get": {
+        "description": "Describe which reference kinds this server can resolve.\n\nThe web UI shapes its linkification grammar from this: which ticket\nprefixes are live, where their issues live, and whether bare `#n`\nhas candidate repos to resolve against. Credentials never appear.\n\n**Returns:** Per-provider routing info, `None` for absent providers.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode.",
+        "operationId": "get_refs_config_v1_refs_config_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Refs Config V1 Refs Config Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Refs Config",
+        "tags": [
+          "refs"
+        ]
+      }
+    },
+    "/v1/refs/resolve": {
+      "post": {
+        "description": "Resolve a batch of references to display cards.\n\nEvery requested ref gets a result; unresolvable ones come back\n`found: false`. Bare `#n` may return several cards (one per\ncandidate repo that has it).\n\n**Parameters**\n\n- `body` \u2014 The references to resolve (at most 50).\n\n**Returns:** `{\"object\": \"list\", \"data\": [RefResult, ...]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode.",
+        "operationId": "resolve_refs_v1_refs_resolve_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveRefsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Resolve Refs V1 Refs Resolve Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resolve Refs",
+        "tags": [
+          "refs"
         ]
       }
     },

@@ -16,7 +16,16 @@ import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
+import {
+  EXTERNAL_REF_ATTR,
+  EXTERNAL_REF_KIND_ATTR,
+  EXTERNAL_REF_REPO_ATTR,
+  isBranchCandidate,
+  parseRefFromUrl,
+} from "@/components/ai-elements/refMarkdown";
 import { WORKSPACE_FILE_LINK_ATTR } from "@/components/ai-elements/streamdown-security";
+import { ExternalRefChip } from "@/components/blocks/ExternalRefChip";
+import type { RefKind } from "@/lib/refsApi";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import { cn } from "@/lib/utils";
@@ -108,6 +117,11 @@ function WorkspacePathInlineCode({
   const text = typeof codeChildren === "string" ? codeChildren : "";
   const openWorkspaceFile = useWorkspaceFileOpener(text);
 
+  // Not a workspace file, but shaped like a branch name (`user/topic`): offer
+  // it to the ref resolver. It links only if the branch actually exists in a
+  // configured repo, so ordinary path-like inline code stays plain.
+  const branchCandidate = !openWorkspaceFile && isBranchCandidate(text);
+
   if (openWorkspaceFile) {
     // Rendered as an inline <code> (not a <button>): a button is laid out as
     // an atomic inline-block, so a long path can't break across lines and
@@ -141,7 +155,7 @@ function WorkspacePathInlineCode({
   }
   // Match Streamdown's default inline-code styling so non-path inline code
   // looks unchanged.
-  return (
+  const plainCode = (
     <code
       className={cn("rounded bg-muted px-1.5 py-0.5 font-mono text-ui", className)}
       data-streamdown="inline-code"
@@ -150,6 +164,23 @@ function WorkspacePathInlineCode({
       {codeChildren}
     </code>
   );
+  if (branchCandidate) {
+    return (
+      <ExternalRefChip kind="branch" refText={text} fallback={plainCode}>
+        <code
+          className={cn(
+            "rounded bg-muted px-1.5 py-0.5 font-mono text-ui underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors",
+            className,
+          )}
+          data-streamdown="inline-code"
+          {...codeProps}
+        >
+          {codeChildren}
+        </code>
+      </ExternalRefChip>
+    );
+  }
+  return plainCode;
 }
 
 // Streamdown's own anchor styling and marker attribute. Overriding the `a`
@@ -180,7 +211,42 @@ function WorkspaceFileLink({
   const path = typeof marked === "string" ? marked : "";
   const openWorkspaceFile = useWorkspaceFileOpener(path);
 
+  // An external-reference candidate wrapped by `linkifyExternalRefs`. The chip
+  // decides whether it links (configured + verified) or stays plain text.
+  const refProps = props as Record<string, unknown>;
+  const refToken = refProps[EXTERNAL_REF_ATTR];
+  const refKind = refProps[EXTERNAL_REF_KIND_ATTR];
+  if (typeof refToken === "string" && typeof refKind === "string") {
+    const refRepo = refProps[EXTERNAL_REF_REPO_ATTR];
+    return (
+      <ExternalRefChip
+        kind={refKind as RefKind}
+        refText={refToken}
+        repo={typeof refRepo === "string" ? refRepo : undefined}
+        className={cn(STREAMDOWN_LINK_CLASS, className)}
+      >
+        {children}
+      </ExternalRefChip>
+    );
+  }
+
   if (!path) {
+    // A real URL that names a ticket / PR / commit keeps its href but gains
+    // the same hover card as a bare reference.
+    const parsed = typeof href === "string" ? parseRefFromUrl(href) : null;
+    if (parsed) {
+      return (
+        <ExternalRefChip
+          kind={parsed.kind}
+          refText={parsed.ref}
+          repo={parsed.repo}
+          href={href}
+          className={cn(STREAMDOWN_LINK_CLASS, className)}
+        >
+          {children}
+        </ExternalRefChip>
+      );
+    }
     return (
       <a
         href={href}
