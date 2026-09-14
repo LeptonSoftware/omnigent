@@ -3,6 +3,7 @@ import { createMathPlugin } from "@streamdown/math";
 import { mermaid } from "@streamdown/mermaid";
 import { defaultRehypePlugins, type LinkSafetyConfig, type StreamdownProps } from "streamdown";
 import { lazyCodePlugin } from "./lazyCodePlugin";
+import { linkifyExternalRefs } from "./refMarkdown";
 
 type StreamdownRehypePlugins = NonNullable<StreamdownProps["rehypePlugins"]>;
 type StreamdownRehypePlugin = StreamdownRehypePlugins[number];
@@ -134,6 +135,9 @@ function createStreamdownRehypePlugins(markFileLinks: boolean): StreamdownRehype
     // stripped any dangerous href, leaving nothing to hand over for such a link.
     if (markFileLinks) {
       plugins.push(markWorkspaceFileLinks);
+      // Same slot for the same reason: its marker attributes must survive
+      // sanitize, and its parked fragment href must pass through harden.
+      plugins.push(linkifyExternalRefs);
     }
 
     if (!isStreamdownHardenPlugin(plugin)) {
