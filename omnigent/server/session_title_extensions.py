@@ -234,8 +234,8 @@ def prepare_session_title(
             model_override=conversation.model_override,
             sub_agent_name=conversation.sub_agent_name,
         ),
-        # CAS target: the placeholder itself.
-        expected_seed_title=conversation.title,
+        # CAS target: the caller schedules with the persisted title, which for
+        # this eligibility branch is the placeholder itself.
     )
 
 

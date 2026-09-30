@@ -328,6 +328,7 @@ describe("ConversationRegistry — background-prefetched entries", () => {
     // evict `conv_warmed` instead — which is what this discriminates.
     registry.acquire("conv_warmed");
     expect(registry.evictLruEvictable()).toBe("conv_stale");
+  });
 
   it("rekey preserves state, moves the active pointer, and drops the old id", () => {
     const temp = registry.acquire("temp:aaaa0001");

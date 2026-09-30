@@ -87,9 +87,7 @@ import { randomUUID } from "@/lib/randomUUID";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import {
   createInitialConversationState,
-  HISTORY_RENDER_GROWTH_STEP,
   isConversationStateKey,
-  resolveHiddenBubbleCount,
 } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import {
@@ -778,16 +776,6 @@ export interface ConversationState {
   /** True while a `loadMoreHistory` fetch is in flight. */
   loadingMoreHistory: boolean;
   /**
-   * How many leading bubbles this conversation leaves unmounted. Loaded
-   * history above the window stays in `blocks` but is not rendered —
-   * mounting ~100 markdown bubbles per switch is what made switches slow.
-   * Shrinks via `growHistoryRenderWindow` on scroll-up (before any network
-   * page) and `expandHistoryRenderWindow` for jump-to-top. `null` until the
-   * first render derives it; see `resolveHiddenBubbleCount` for why the
-   * window is anchored at its top rather than counted from the end.
-   */
-  historyHiddenCount: number | null;
-  /**
    * The item id at the start of the current `blocks` history window —
    * used as the `before` cursor for the next `loadMoreHistory` page
    * fetch. `null` until the first snapshot is hydrated.
@@ -1227,30 +1215,6 @@ export interface ChatActions {
    * or there is no active conversation / oldest-item cursor yet.
    */
   loadMoreHistory: () => Promise<void>;
-  /**
-   * Reveal one more step of already-loaded history (scroll-up hit the top of
-   * the rendered window while unrendered bubbles exist in memory). Cheaper
-   * than `loadMoreHistory` — no fetch — so callers try this first.
-   *
-   * Takes the hidden-bubble count the caller rendered with: the window counts
-   * BUBBLES, and only the view knows how `blocks` folded into them.
-   */
-  growHistoryRenderWindow: (currentHidden: number) => void;
-  /**
-   * Freeze the initial render window, in bubbles, once a conversation has any.
-   *
-   * Until a concrete count is stored, the window re-derives from the CURRENT
-   * bubble count on every render — so an appended turn would unmount the oldest
-   * rendered bubble and a prepended history page would be hidden the moment it
-   * landed. Only the view can call this: the count is in bubbles and the store
-   * holds blocks. No-ops once a count exists, so it never fights a reveal.
-   */
-  freezeHistoryRenderWindow: (totalBubbles: number) => void;
-  /**
-   * Render every loaded block (jump-to-top; the reader asked for the whole
-   * history, so windowing would just fight the pinned scroll position).
-   */
-  expandHistoryRenderWindow: () => void;
   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
   flashUserMessage: (itemId: string) => void;
   /** Queue an "@"-mention chip into the active composer from outside it. */
@@ -1843,7 +1807,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   codexApprovalMode: "",
   hasMoreHistory: false,
   loadingMoreHistory: false,
-  historyHiddenCount: null,
   oldestItemId: null,
   flashItemId: null,
   pendingComposerAttachments: [],
@@ -2753,7 +2716,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // current transcript; for a fresh one it is the initial state.
     mirrorActiveEntry();
 
-    const bindWillRefresh = !wasLive && !hasBoundStreamThisLoad;
     if (wasLive) {
       // An open stream is not proof the entry is current: a session stream
       // routed to the wrong replica stays open and heartbeats while delivering
@@ -2788,19 +2750,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       throw error;
     }
 
-    // Runner-backed fields (`model_options`, skills) are process-cached server
-    // side and only a `refresh_state` read re-asks the runner. A cold bind after
-    // the first of this page load skips that probe to stay off the critical path
-    // (300-900ms) — converge it in the background, strictly AFTER the bind:
-    // both read the same query key, so an in-flight refreshed read would dedupe
-    // the bind's cheap one onto it and put the probe straight back on the paint
-    // path.
-    if (!bindWillRefresh) {
-      void refetchRunnerBackedSessionState(conversationId, {
-        refreshState: true,
-        applyBindingPatch: true,
-      });
-    }
   },
 
   submitApproval: async (elicitationId, action, content, meta, conversationId) => {
@@ -3181,32 +3130,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  freezeHistoryRenderWindow: (totalBubbles: number) => {
-    const { conversationId, historyHiddenCount } = get();
-    if (!conversationId || historyHiddenCount !== null) return;
-    setterFor(conversationId)({
-      historyHiddenCount: resolveHiddenBubbleCount(null, totalBubbles),
-    });
-  },
 
-  growHistoryRenderWindow: (currentHidden: number) => {
-    const { conversationId } = get();
-    if (!conversationId) return;
-    // The caller passes the hidden count it actually rendered with. The store
-    // cannot derive it: the window is measured in BUBBLES, and the store holds
-    // `blocks` — several of which fold into one bubble. Deriving it here from
-    // `blocks.length` overshoots the bubble array and renders an empty
-    // transcript.
-    setterFor(conversationId)({
-      historyHiddenCount: Math.max(0, currentHidden - HISTORY_RENDER_GROWTH_STEP),
-    });
-  },
 
-  expandHistoryRenderWindow: () => {
-    const { conversationId } = get();
-    if (!conversationId) return;
-    setterFor(conversationId)({ historyHiddenCount: 0 });
-  },
 }));
 
 // ── Store-action setter ──────────────────────────────────
@@ -4332,8 +4257,7 @@ async function bindStream(
         historyGeneration: state.historyGeneration + 1,
         // ...and re-derive the render window against this history, rather
         // than inheriting a hidden count that described the old one.
-        historyHiddenCount: null,
-        // The voided page's stale early-return skips its own flag clear.
+              // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
         sessionStatus: session.status,
         // Mid-turn first open: the snapshot carries the in-flight turn's
@@ -4917,8 +4841,7 @@ async function rehydrateWindowOnReconnect(
       // The window cursor was reset: void any in-flight loadMoreHistory.
       historyGeneration: s.historyGeneration + 1,
       // ...and re-derive the render window against this history.
-      historyHiddenCount: null,
-    };
+        };
   });
 }
 

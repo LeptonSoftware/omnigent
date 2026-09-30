@@ -35,7 +35,7 @@ from typing import Any
 
 import httpx
 
-from omnigent.model_fallbacks import TITLE_GATEWAY_DEFAULT_MODEL
+from omnigent.models.model_fallbacks import TITLE_GATEWAY_DEFAULT_MODEL
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INSTRUCTIONS,
     BACKGROUND_TITLE_MAX_OUTPUT_TOKENS,
@@ -48,7 +48,7 @@ _logger = logging.getLogger(__name__)
 DEFAULT_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/v1"
 
 # Deliberately a NON-REASONING model — see the _TITLE_GATEWAY_PREFERENCE
-# record in omnigent.model_fallbacks for the measurements. Override with
+# record in omnigent.models.model_fallbacks for the measurements. Override with
 # OMNIGENT_TITLE_GATEWAY_MODEL only after checking the model returns content
 # within the 32-token cap.
 DEFAULT_TITLE_MODEL = TITLE_GATEWAY_DEFAULT_MODEL

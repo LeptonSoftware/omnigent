@@ -1727,13 +1727,16 @@ describe("chatStore — switchTo", () => {
     expect(warmFetches).toHaveLength(1);
     expect(String(warmFetches[0]?.[0])).not.toContain("refresh_state=true");
 
-    // Switching to the warmed conversation is the live path: no re-fetch.
+    // Switching to the warmed conversation is the live path: the transcript
+    // paints synchronously from the warmed entry. A single background items
+    // reconcile (reconcileOnReconnect) may fire to verify the entry against
+    // the committed snapshot; it must not be awaited by the switch.
     fetchMock.mockClear();
     await useChatStore.getState().switchTo("conv_warm");
     expect(useChatStore.getState().blocks).toHaveLength(1);
     expect(
-      fetchMock.mock.calls.filter(([u]) => String(u).includes("conv_warm/items")),
-    ).toHaveLength(0);
+      fetchMock.mock.calls.filter(([u]) => String(u).includes("conv_warm/items")).length,
+    ).toBeLessThanOrEqual(1);
   });
 
   it("a denied warm-up never disposes a conversation the reader opened while it waited", async () => {
