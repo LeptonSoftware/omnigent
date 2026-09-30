@@ -47,6 +47,9 @@ from omnigent.server.admin_list import resolve_data_dir
 
 logger = logging.getLogger(__name__)
 
+SESSION_TITLE_INSTRUCTIONS_KEY = "session_title_instructions"
+SESSION_TITLE_INSTRUCTIONS_MAX_CHARS = 4_000
+
 
 def resolve_config_path() -> Path | None:
     """Resolve the server config file path, or ``None`` if there is none.
@@ -101,6 +104,39 @@ def config_str_list(value: Any) -> list[str]:
     return [str(item).strip() for item in items if str(item).strip()]
 
 
+def session_title_instructions(config: Mapping[str, Any]) -> str | None:
+    """Return validated additional guidance for automatic session titles.
+
+    The setting is server-owned metadata rather than part of an agent spec.
+    Invalid values fail open to the default title prompt so a config typo can
+    never prevent a user turn from starting.
+
+    :param config: Loaded server config containing the optional
+        ``session_title_instructions`` top-level key.
+    :returns: Stripped custom instructions, or ``None`` when unset or invalid.
+    """
+    raw = config.get(SESSION_TITLE_INSTRUCTIONS_KEY)
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        logger.warning(
+            "server config %s must be a string — using default title instructions",
+            SESSION_TITLE_INSTRUCTIONS_KEY,
+        )
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if len(value) > SESSION_TITLE_INSTRUCTIONS_MAX_CHARS:
+        logger.warning(
+            "server config %s exceeds %d characters — using default title instructions",
+            SESSION_TITLE_INSTRUCTIONS_KEY,
+            SESSION_TITLE_INSTRUCTIONS_MAX_CHARS,
+        )
+        return None
+    return value
+
+
 def _config_positive_int(key: str, default: int) -> int:
     """Read a positive-int setting from the server config, else *default*.
 
@@ -148,6 +184,91 @@ def copy_total_bytes_limit() -> int:
     from omnigent.runtime.content_resolver import MAX_COPY_TOTAL_BYTES
 
     return _config_positive_int("copy_max_total_bytes", MAX_COPY_TOTAL_BYTES)
+
+
+def image_compression_concurrency() -> int:
+    """Max concurrent image uploads that materialize + decode in memory.
+
+    Bounds server peak upload memory (each holds up to the image cap in raw
+    bytes plus a decoded bitmap). Config key ``image_compression_concurrency``;
+    defaults to
+    :data:`omnigent.runtime.content_resolver.MAX_IMAGE_COMPRESSION_CONCURRENCY`.
+    Raise it on instances with more memory headroom.
+    """
+    from omnigent.runtime.content_resolver import MAX_IMAGE_COMPRESSION_CONCURRENCY
+
+    return _config_positive_int("image_compression_concurrency", MAX_IMAGE_COMPRESSION_CONCURRENCY)
+
+
+def filesystem_attachment_upload_limit() -> int:
+    """Max byte size of a single filesystem attachment.
+
+    Config key ``filesystem_attachment_max_bytes``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES`.
+    """
+    from omnigent.inner.native_attachments import MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
+
+    return _config_positive_int(
+        "filesystem_attachment_max_bytes", MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES
+    )
+
+
+def filesystem_attachment_file_limit() -> int:
+    """Max number of filesystem attachments one session may hold.
+
+    Config key ``filesystem_attachment_max_files``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_SESSION_FILESYSTEM_ATTACHMENTS`.
+    """
+    from omnigent.inner.native_attachments import MAX_SESSION_FILESYSTEM_ATTACHMENTS
+
+    return _config_positive_int(
+        "filesystem_attachment_max_files", MAX_SESSION_FILESYSTEM_ATTACHMENTS
+    )
+
+
+def filesystem_attachment_total_bytes_limit() -> int:
+    """Max summed bytes of filesystem attachments per session.
+
+    Config key ``filesystem_attachment_max_total_bytes``; defaults to
+    :data:`omnigent.inner.native_attachments.MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES`.
+    """
+    from omnigent.inner.native_attachments import MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES
+
+    return _config_positive_int(
+        "filesystem_attachment_max_total_bytes", MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES
+    )
+
+
+def filesystem_attachment_denied_extensions() -> frozenset[str]:
+    """Extensions a deployment refuses to materialize, beyond the allowlist.
+
+    Config key ``filesystem_attachment_denied_extensions``, a list of
+    extensions with or without the leading dot (``[".zip", "docx"]``).
+    Lets an operator narrow the built-in allowlist (e.g. deny archives
+    while still accepting office documents) without a code change.
+    Unparseable entries are skipped rather than failing the upload path.
+    """
+    raw = load_server_config().get("filesystem_attachment_denied_extensions")
+    if raw is None:
+        return frozenset()
+    if not isinstance(raw, list):
+        logger.warning(
+            "server config filesystem_attachment_denied_extensions=%r is not a list, ignoring",
+            raw,
+        )
+        return frozenset()
+    denied: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            logger.warning(
+                "server config filesystem_attachment_denied_extensions entry %r is not a "
+                "non-empty string, skipping",
+                entry,
+            )
+            continue
+        value = entry.strip().lower()
+        denied.add(value if value.startswith(".") else f".{value}")
+    return frozenset(denied)
 
 
 def _branding_section(config: Mapping[str, Any]) -> Mapping[str, Any]:

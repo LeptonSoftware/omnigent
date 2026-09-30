@@ -40,6 +40,10 @@ function writeAll(map: RecentMap): void {
   }
 }
 
+export function readRecentWorkspaces(hostId: string | null): string[] {
+  return hostId === null ? [] : (readAll()[hostId] ?? []);
+}
+
 export interface RecentWorkspaces {
   /** Most-recent-first absolute paths used on this host. */
   recent: string[];

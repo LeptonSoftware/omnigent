@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 
+import { getBasePath, withBasePath } from "./basePath.ts";
+
 /**
  * Embed host integration seam.
  *
@@ -30,7 +32,32 @@ export interface UserSuggestion {
  * telemetry taxonomy uses. Omitted when the element doesn't fit any of these.
  */
 export type OmnigentComponentKind =
-  "button" | "link" | "input" | "textarea" | "checkbox" | "toggle" | "select";
+  "button" | "link" | "input" | "textarea" | "checkbox" | "toggle" | "select" | "tabs";
+
+/**
+ * A multi-phase interaction whose *outcome* or *latency* matters — not just that a
+ * control was clicked. Host-agnostic; the host maps each onto its own taxonomy.
+ *   - `agent_run`      — one user prompt → model run.
+ *   - `tool_call`      — a single tool / skill / MCP invocation within a run.
+ *   - `approval`       — a human-in-the-loop permission decision.
+ *   - `list_sessions`  — loading the session list (user-initiated; not background polls).
+ *   - `get_session`    — loading a single session the user opened / switched to.
+ *   - `create_session_sandbox` / `create_session_computer` — a brand-new chat from
+ *     send to the first AI message, split by where the session runs (managed
+ *     sandbox vs the user's computer host); host kind is baked into the kind so
+ *     the host can name/segment the two without a queryable sub-dimension.
+ */
+export type OmnigentInteractionKind =
+  | "agent_run"
+  | "tool_call"
+  | "approval"
+  | "list_sessions"
+  | "get_session"
+  | "create_session_sandbox"
+  | "create_session_computer";
+
+/** Terminal outcome of an interaction, set on the `complete` phase. */
+export type OmnigentInteractionStatus = "success" | "failure" | "cancelled" | "timed_out";
 
 /**
  * A product-analytics event forwarded to the host. Each carries a stable,
@@ -38,7 +65,9 @@ export type OmnigentComponentKind =
  *
  * PII: `value` on a value-change is only ever set when the emitting call site
  * explicitly declares the value PII-free (see `useOmnigentAnalytics` in
- * `lib/analytics.ts`). Free-form field text is never forwarded.
+ * `lib/analytics.ts`). Free-form field text is never forwarded. Likewise
+ * `interaction_phase.name` must be a bounded, non-PII label (e.g. a tool name
+ * from a fixed set), never user content.
  */
 export type OmnigentAnalyticsEvent =
   | { type: "click"; componentId: string; componentKind?: OmnigentComponentKind }
@@ -48,9 +77,26 @@ export type OmnigentAnalyticsEvent =
       componentKind?: OmnigentComponentKind;
       value?: string | number | boolean;
     }
-  | { type: "page_view"; pageId: string };
+  | { type: "page_view"; pageId: string }
+  | {
+      /**
+       * Start or end of a timed interaction whose outcome or latency matters
+       * (see `OmnigentInteractionKind`). `interactionId` correlates the `start`
+       * and `complete` of one interaction; `status` and `durationMs` are set on
+       * `complete`.
+       */
+      type: "interaction_phase";
+      interactionId: string;
+      interactionKind: OmnigentInteractionKind;
+      phase: "start" | "complete";
+      status?: OmnigentInteractionStatus;
+      name?: string;
+      durationMs?: number;
+    };
 
 export interface OmnigentHostConfig {
+  /** Stable server/workspace identity used to scope browser-local extension storage. */
+  serverIdentity?: string;
   /**
    * Maps an web API path (always starting with `/v1`, `/health`, or
    * `/api/...`) to a `Response`. The host implementation is responsible for
@@ -99,6 +145,12 @@ export interface OmnigentHostConfig {
    */
   cliServerUrlSuffix?: string;
   /**
+   * Optional URL to the host's own appearance/theme settings. When the host
+   * owns light/dark (the embed's own switcher is hidden), the settings screen
+   * links here so users can find where to change it. Omitted standalone.
+   */
+  themeSettingsUrl?: string;
+  /**
    * Optional documentation links for embed-only UX hints.
    *
    * Standalone web ignores these values. Embedded hosts can pass one object
@@ -120,6 +172,15 @@ export interface OmnigentHostConfig {
 let hostConfig: OmnigentHostConfig = {};
 let hostConfigGeneration = 0;
 let embedRoot: HTMLElement | null = null;
+let embedScopeRoot: HTMLElement | null = null;
+
+export function getOmnigentServerIdentity(): string | null {
+  if (hostConfig.serverIdentity?.trim()) return hostConfig.serverIdentity.trim();
+  // Standalone has one same-origin server. Embedded hosts can proxy many
+  // backends behind one origin and must provide an explicit stable identity.
+  if (hostConfig.fetcher) return null;
+  return typeof window === "undefined" ? "server" : window.location.origin;
+}
 
 export function setOmnigentHostConfig(config: OmnigentHostConfig): void {
   // Guard: never clobber an already-installed fetcher with an empty config.
@@ -177,6 +238,14 @@ export function getOmnigentTransformShareLink(): OmnigentHostConfig["transformSh
 }
 
 /**
+ * The host-provided URL to its own theme/appearance settings, or `undefined`
+ * standalone. The settings screen links here when the host owns light/dark.
+ */
+export function getOmnigentThemeSettingsUrl(): OmnigentHostConfig["themeSettingsUrl"] {
+  return hostConfig.themeSettingsUrl;
+}
+
+/**
  * The DOM node the embed is mounted into. Used as the portal container for
  * Radix overlays so portaled content (dialogs, popovers, tooltips, menus)
  * lands inside the scoped `.omnigent-app` subtree and inherits its styles.
@@ -191,14 +260,57 @@ export function getEmbedRoot(): HTMLElement | null {
 }
 
 /**
+ * The embed's scope element (`.omnigent-app`) — the outer wrapper the scoped
+ * stylesheet collapses `:root` / `html` / `body` onto. Per-device preference DOM
+ * mutations (UI font size, `--custom-*` theme variables, the `data-theme`
+ * palette attribute) must land here (or a descendant) rather than on
+ * `document.documentElement`: the scoped `.omnigent-app` tokens shadow anything
+ * set on the real document root. Null standalone (falls back to the document
+ * root), where the scoped stylesheet isn't in play.
+ */
+export function setEmbedScopeRoot(el: HTMLElement | null): void {
+  embedScopeRoot = el;
+}
+
+export function getEmbedScopeRoot(): HTMLElement | null {
+  return embedScopeRoot;
+}
+
+/**
+ * The element preference CSS custom properties are set on (UI font size/family,
+ * `--custom-*` theme variables): the embed scope root when embedded, else the
+ * document root.
+ */
+export function getStyleRoot(): HTMLElement | null {
+  if (embedScopeRoot) return embedScopeRoot;
+  return typeof document !== "undefined" ? document.documentElement : null;
+}
+
+/**
+ * The elements theme *attributes* are stamped onto (`data-theme` palette,
+ * `data-custom-translucent-sidebar`). Embedded, both the scope root (matched by
+ * the light `:root[data-theme]` selectors) and the inner `.dark` root (matched
+ * by the dark `.dark[data-theme]` selectors) need them; standalone it's just the
+ * document root.
+ */
+export function getThemeRoots(): HTMLElement[] {
+  if (embedScopeRoot) {
+    return embedRoot ? [embedScopeRoot, embedRoot] : [embedScopeRoot];
+  }
+  return typeof document !== "undefined" ? [document.documentElement] : [];
+}
+
+/**
  * Single network choke point. Delegates to the host fetcher when embedded,
  * otherwise calls native `fetch` with the path unchanged (standalone).
  */
 export function hostFetch(path: string, init?: RequestInit): Promise<Response> {
   if (hostConfig.fetcher) {
+    // The host owns path rebasing (it proxies onto its own API surface), so
+    // the path is passed through untouched — `withBasePath` is standalone-only.
     return hostConfig.fetcher(path, init);
   }
-  return fetch(path, init);
+  return fetch(withBasePath(path), init);
 }
 
 export function resolveWebSocketUrl(path: string): string {
@@ -206,15 +318,15 @@ export function resolveWebSocketUrl(path: string): string {
     return hostConfig.resolveWebSocketUrl(path);
   }
   const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${scheme}//${window.location.host}${path}`;
+  return `${scheme}//${window.location.host}${withBasePath(path)}`;
 }
 
 /**
  * Full server URL for CLI `--server` flags shown in in-product docs.
- * Returns `window.location.origin` plus the optional
- * {@link OmnigentHostConfig.cliServerUrlSuffix}.
+ * Returns `window.location.origin` plus the configured base path plus the
+ * optional {@link OmnigentHostConfig.cliServerUrlSuffix}.
  */
 export function getCliServerUrl(): string {
   const origin = typeof window !== "undefined" ? window.location.origin : "";
-  return origin + (hostConfig.cliServerUrlSuffix ?? "");
+  return origin + getBasePath() + (hostConfig.cliServerUrlSuffix ?? "");
 }

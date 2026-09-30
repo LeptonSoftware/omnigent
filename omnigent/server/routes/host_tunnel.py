@@ -22,11 +22,16 @@ import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
+from omnigent.debug_logging import debug_event, set_current_user_id
+from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
+    IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
@@ -34,17 +39,24 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostImportedLocalSession,
+    HostImportLocalDoneFrame,
+    HostImportLocalSessionChunkFrame,
+    HostImportLocalSessionFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
+    HostMcpServersResultFrame,
     HostModelOptionsResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
+    ImportLocalSessionChunkAssembler,
     decode_host_frame,
     encode_host_frame,
 )
@@ -152,7 +164,19 @@ def create_host_tunnel_router(
             host_id = uuid_to_bytes(host_id).hex()
         except InvalidUuidError:
             _logger.warning("Refusing host tunnel: malformed host id %r", host_id)
-            await ws.close(code=4003, reason="invalid host id")
+            # Refuse with a real HTTP 400 + body rather than a bare pre-accept
+            # close: the latter reaches the client as an opaque 403 (empty
+            # body), indistinguishable from an auth failure. A 400 that names
+            # the problem lets the host surface an actionable error.
+            await _refuse_upgrade(
+                ws,
+                status=400,
+                reason=(
+                    f"Invalid host id {host_id!r}: host ids must be UUIDs. Set "
+                    "OMNIGENT_HOST_ID to a UUID (or unset it to have one "
+                    "generated) and reconnect."
+                ),
+            )
             return
 
         # Authenticate from the handshake BEFORE accepting the upgrade,
@@ -191,6 +215,12 @@ def create_host_tunnel_router(
             # deployment; RESERVED_USER_LOCAL is the accepted local owner
             # (consistent with get_user_id returning None on the HTTP side).
             tunnel_owner = RESERVED_USER_LOCAL
+
+        # Attribute debug-log records emitted while servicing this host's tunnel
+        # to its owner. This WebSocket handler runs in its own task, so the set
+        # is scoped to this connection (child loop tasks inherit it) and cannot
+        # bleed across concurrent host connections.
+        set_current_user_id(tunnel_owner)
 
         # Reject a cross-owner takeover before accept(). ``host_id`` is
         # UNIQUE, so a peer authenticated as one user dialing in on a
@@ -254,15 +284,20 @@ def create_host_tunnel_router(
                 return
 
             stage = "registration"
-            await asyncio.to_thread(
+            persisted_host = await asyncio.to_thread(
                 host_store.upsert_on_connect,
                 host_id=host_id,
                 name=frame.name,
                 user_id=tunnel_owner,
                 allow_host_id_reown=allow_host_id_reown,
                 configured_harnesses=frame.configured_harnesses,
+                managed_token=managed_token,
             )
             host_persisted = True
+            if persisted_host.account_generation is not None:
+                from omnigent.db.account_authority import bind_account_authority
+
+                bind_account_authority(tunnel_owner, persisted_host.account_generation)
 
             stage = "registry"
             conn = host_registry.register(
@@ -270,6 +305,9 @@ def create_host_tunnel_router(
                 ws,
                 frame,
                 owner=tunnel_owner,
+                # A resolved launch token is proof this is a server-provisioned
+                # sandbox, not a user machine reconnecting on a managed host id.
+                registered_with_managed_token=managed_token is not None,
             )
             # Delivered on the handshake, never persisted: a replica that just
             # started learns the host's gateway backing here, so a server
@@ -282,6 +320,12 @@ def create_host_tunnel_router(
                 frame.version,
                 frame.name,
                 frame.runners,
+                extra=debug_event(
+                    "host_tunnel",
+                    phase="connected",
+                    host_id=host_id,
+                    version=frame.version,
+                ),
             )
 
             sender_task = asyncio.create_task(
@@ -355,7 +399,11 @@ def create_host_tunnel_router(
                         )
 
         except WebSocketDisconnect:
-            _logger.warning("Host %s disconnected", host_id)
+            _logger.warning(
+                "Host %s disconnected",
+                host_id,
+                extra=debug_event("host_tunnel", phase="disconnected", host_id=host_id),
+            )
             # Only run disconnect cleanup if we actually registered this
             # host on THIS connection. A connect that failed before
             # register — e.g. the upsert IntegrityError when a peer
@@ -373,7 +421,11 @@ def create_host_tunnel_router(
                             host_id,
                         )
         except Exception as exc:
-            _logger.exception("Host tunnel error for %s", host_id)
+            _logger.exception(
+                "Host tunnel error for %s",
+                host_id,
+                extra=debug_event("host_tunnel", phase="error", host_id=host_id, stage=stage),
+            )
             retryable = stage in {"registration", "registry", "connected"}
             await _send_connection_error(
                 ws,
@@ -439,12 +491,35 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
 
     :param ws: Accepted Starlette WebSocket.
     :param conn: Host connection whose outbound queue to drain.
+    :returns: None when the queue is retired, or when the socket was
+        closed by another task (ping timeout, retire) while a send
+        raced it.
     """
     while True:
         data = await conn.outbound_queue.get()
         if data is None:
             return
-        await ws.send_text(data)
+        try:
+            await ws.send_text(data)
+        except RuntimeError:
+            if ws.application_state is WebSocketState.DISCONNECTED:
+                # The ping loop or registry retirement closed the socket
+                # concurrently; the disconnect is already logged there.
+                _logger.debug("Host %s send raced a concurrent close", conn.host_id)
+                return
+            raise
+
+
+def _import_session_queue_payload(total: int, session: HostImportedLocalSession) -> dict[str, Any]:
+    """Build the pending-import queue payload for one streamed session."""
+    return {
+        "total": total,
+        "external_session_id": session.external_session_id,
+        "workspace": session.workspace,
+        "items": session.items,
+        "title": session.title,
+        "source": session.source,
+    }
 
 
 async def _receive_loop(
@@ -474,6 +549,9 @@ async def _receive_loop(
     :param on_host_update: Callback fired after readiness changes persist;
         ``None`` skips it.
     """
+    # Per-request reassembly of chunked import sessions; buffers die with the
+    # connection, so a tunnel drop can never leak a partial session.
+    import_chunk_assemblers: dict[str, ImportLocalSessionChunkAssembler] = {}
     while True:
         message = await ws.receive()
         if message["type"] == "websocket.disconnect":
@@ -562,15 +640,26 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostRunnerExitedFrame):
-            # One-way report: a runner this host spawned died
-            # unexpectedly. Stash the cause so the runner status
-            # endpoint can answer "offline, and here is why" to the
-            # client still waiting for the runner to connect.
+            # One-way report: a runner this host spawned died unexpectedly. Stash
+            # the cause so the runner status endpoint can answer "offline, and
+            # here is why" to the client still waiting for the runner to connect.
+            # A runner-process fault; the free-text cause is unparsed, so the
+            # lifecycle stage is unknown.
             _logger.warning(
                 "Host %s reported runner %s exited: %s",
                 host_id,
                 frame.runner_id,
                 frame.error,
+                extra=debug_event(
+                    "runner_exited",
+                    host_id=host_id,
+                    runner_id=frame.runner_id,
+                    error_category=ErrorCategory.RUNNER.value,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    # The runner may have died before or during a turn; the host
+                    # can't tell from the exit alone.
+                    error_phase=ErrorPhase.UNKNOWN.value,
+                ),
             )
             if runner_exit_reports is not None:
                 runner_exit_reports.record(frame.runner_id, frame.error, conn.owner)
@@ -631,6 +720,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "worktree_path": frame.worktree_path,
+                        "workspace": frame.workspace,
                         "branch": frame.branch,
                         "error": frame.error,
                     }
@@ -728,6 +818,92 @@ async def _receive_loop(
                         "routable_models": frame.routable_models,
                         "error": frame.error,
                     }
+                )
+            continue
+        if isinstance(frame, HostSkillsResultFrame):
+            skills_future = conn.pending_skills.pop(frame.request_id, None)
+            if skills_future is not None and not skills_future.done():
+                skills_future.set_result(frame)
+            continue
+        if isinstance(frame, HostMcpServersResultFrame):
+            mcp_future = conn.pending_mcp_servers.pop(frame.request_id, None)
+            if mcp_future is not None and not mcp_future.done():
+                mcp_future.set_result(frame)
+            continue
+        if isinstance(frame, HostImportLocalSessionFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            if queue is not None:
+                queue.put_nowait(
+                    ("session", _import_session_queue_payload(frame.total, frame.session))
+                )
+            continue
+        if isinstance(frame, HostImportLocalSessionChunkFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            if queue is None:
+                # Never allocate memory for an unsolicited or expired request.
+                import_chunk_assemblers.pop(frame.request_id, None)
+                continue
+
+            # Every slice proves the host is making progress. Feed the request
+            # queue so a large session on a slow tunnel cannot hit the
+            # inter-session timeout while chunks are actively arriving.
+            queue.put_nowait(("progress", {}))
+
+            assembler = import_chunk_assemblers.setdefault(
+                frame.request_id, ImportLocalSessionChunkAssembler()
+            )
+            if assembler.opens_new_session(frame):
+                # The previous session never sent its final slice: count it as
+                # failed on its own so this one still assembles.
+                _logger.warning(
+                    "Host %s started a chunked import session before finishing the previous one",
+                    host_id,
+                )
+                queue.put_nowait(("session", {"total": frame.total}))
+            # Every in-flight request on this connection shares one buffer cap.
+            buffered_elsewhere = sum(
+                candidate.buffered_chars
+                for request_id, candidate in import_chunk_assemblers.items()
+                if request_id != frame.request_id
+            )
+            try:
+                session = assembler.add(
+                    frame,
+                    budget=IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS - buffered_elsewhere,
+                )
+            except ValueError as exc:
+                _logger.warning(
+                    "Host %s sent an unusable chunked import session: %s",
+                    host_id,
+                    exc,
+                )
+                # A payload with no external_session_id makes the import loop
+                # count one failed session and continue, keeping the stream
+                # (and the rest of the batch) alive.
+                queue.put_nowait(("session", {"total": frame.total}))
+                continue
+            if session is None:
+                continue
+            queue.put_nowait(("session", _import_session_queue_payload(frame.total, session)))
+            continue
+        if isinstance(frame, HostImportLocalDoneFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            assembler = import_chunk_assemblers.pop(frame.request_id, None)
+            if queue is not None and assembler is not None and assembler.in_progress:
+                # A stream that ends before the final slice must count the
+                # partial session as failed instead of silently dropping it.
+                queue.put_nowait(("session", {"total": 0}))
+            if queue is not None:
+                queue.put_nowait(
+                    (
+                        "done",
+                        {
+                            "status": frame.status,
+                            "error": frame.error,
+                            "failed": frame.failed,
+                            "failures": frame.failures,
+                        },
+                    )
                 )
             continue
 

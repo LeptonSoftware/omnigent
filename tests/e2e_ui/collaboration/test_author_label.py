@@ -40,7 +40,7 @@ Selectors:
   - user bubbles: ``data-testid="message-bubble"`` + ``data-role="user"``
   - author badge: ``data-testid="message-author"`` (avatar beside the
     bubble; ``aria-label`` carries the author email)
-  - composer:     placeholder ``"Ask the agent anything…"``
+  - composer:     placeholder ``"Send a message…"``
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ _BOB = f"bob-{_RUN_TAG}@example.com"
 # Mirrors auth.py — the level granting edit access.
 _LEVEL_EDIT = 2
 
-_COMPOSER_PLACEHOLDER = "Ask the agent anything…"
+_COMPOSER_PLACEHOLDER = "Send a message…"
 
 
 def _grant_edit(base_url: str, session_id: str, grantee_email: str) -> None:
@@ -268,6 +268,11 @@ def test_terminal_typed_message_shows_author_badge_to_peers(
     bob_ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": _BOB})
     try:
         bob = bob_ctx.new_page()
+        # Attribution must work even while the Shared list is inactive.
+        bob.route(
+            "**/v1/sessions?*",
+            lambda route: route.fulfill(json={"data": [], "has_more": False}),
+        )
         bob.goto(f"{base_url}/c/{session_id}")
 
         # The committed bubble from external_conversation_item should

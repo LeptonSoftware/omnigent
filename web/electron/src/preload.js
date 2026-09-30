@@ -17,7 +17,7 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 // Collapse the update states the in-page UpdateBanner renders on
-// (available / downloaded / error-security) to `idle` so the server page can
+// (available / downloading / downloaded / error-security) to `idle` so the server page can
 // never show a banner — that UI is shell-owned (the corner overlay). Kept here
 // (not main) so it applies uniformly to getStatus + every onStatus push, and
 // so error-security still reaches Settings as idle+lastError (which it shows).
@@ -25,6 +25,7 @@ function bannerSafe(status) {
   if (
     status &&
     (status.state === "available" ||
+      status.state === "downloading" ||
       status.state === "downloaded" ||
       status.state === "error-security")
   ) {
@@ -70,11 +71,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     return () => ipcRenderer.removeListener("omnigent:notification-activated", listener);
   },
   /**
-   * Subscribe to deep-link navigations. When the user clicks an
-   * `omnigent://.../c/<id>` link for a server this window is already on, the
-   * main process sends the in-app path here so the SPA routes to it in-place
-   * (no reload) — same path shape as onNotificationActivated. Returns an
-   * unsubscribe function.
+   * Subscribe to in-app navigation from the main process. Native menu actions
+   * and same-server deep links send a basename-less path so the SPA can route
+   * in place without reloading. Returns an unsubscribe function.
    * @param {(path: string) => void} callback
    * @returns {() => void}
    */
@@ -89,20 +88,21 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     return () => ipcRenderer.removeListener("omnigent:open-path", listener);
   },
   /**
-   * Title-bar server picker data: the window's current server origin and the
-   * recently-connected server URLs (most recent first). Resolves null on
-   * pages that aren't a connected server.
+   * Server picker data: the current origin plus organization-provided and
+   * recently-connected server URLs. Resolves null off a connected server.
    */
   getServerPicker: () => ipcRenderer.invoke("omnigent:get-server-picker"),
   /**
-   * Re-point this window to a previously-connected server URL (must come
-   * from getServerPicker's recentServers list; anything else rejects).
+   * Re-point this window to a URL returned by getServerPicker (anything else
+   * rejects in the main process).
    */
   switchServer: (url) => ipcRenderer.invoke("omnigent:switch-server", url),
   /** Return this window to the bundled "connect to server" setup page. */
   openServerSetup: () => {
     ipcRenderer.send("omnigent:open-server-setup");
   },
+  /** Reveal one of this machine's files in the OS file manager. */
+  revealFile: (hostId, path) => ipcRenderer.invoke("omnigent:reveal-file", hostId, path),
   /**
    * This machine's identity — `{ cliInstalled, hostId }` — read from local
    * config with no subprocess, so it's instant. Lets the SPA recognize "this
@@ -115,6 +115,20 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {"start" | "stop" | "restart"} action
    */
   controlHost: (action) => ipcRenderer.invoke("omnigent:host-control", action),
+  /**
+   * Desktop feature gates the server can't know about — currently
+   * `{ databricksInternalFeatures }` from macOS Managed Preferences, scoped
+   * to the window's server (true only on Databricks-managed servers).
+   * Resolves null off a connected server.
+   */
+  getDesktopFeatures: () => ipcRenderer.invoke("omnigent:get-desktop-features"),
+  /**
+   * Connect the user's Arca instance (Databricks-internal) to the window's
+   * server as a host, via `arca ssh`. Native consent is asked in the main
+   * process. Resolves a `{ ok, error?, authError? }` result.
+   */
+  connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
+
   /**
    * Subscribe to host status-change pings. Fired only on real events (a host
    * child connecting/exiting, or a control action) — never on a timer — so the
@@ -145,7 +159,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   // own preload + the Server menu). This bridge stays so Settings can still
   // read/write update preferences (mode, auto-install) and trigger a check, but
   // it is BANNER-SAFE: `bannerSafe()` collapses the states the in-page
-  // UpdateBanner renders on (available / downloaded / error-security) down to
+  // UpdateBanner renders on (available / downloading / downloaded /
+  // error-security) down to
   // `idle` before the page sees them. That means NO web bundle — including
   // older shipped ones that still mount the in-page banner — can show a
   // (duplicate) banner, while Settings still gets check progress and errors
@@ -161,6 +176,17 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       const listener = (_event, status) => callback(bannerSafe(status));
       ipcRenderer.on("omnigent:update-status", listener);
       return () => ipcRenderer.removeListener("omnigent:update-status", listener);
+    },
+    /** Current shell-owned update-overlay card height in CSS pixels. */
+    getOverlayHeight: () => ipcRenderer.invoke("omnigent:get-update-overlay-height"),
+    /** Subscribe to overlay height changes; returns an unsubscribe function. */
+    onOverlayHeight: (callback) => {
+      const listener = (_event, height) => {
+        const normalized = Math.max(0, Math.round(Number(height) || 0));
+        callback(normalized);
+      };
+      ipcRenderer.on("omnigent:update-overlay-height", listener);
+      return () => ipcRenderer.removeListener("omnigent:update-overlay-height", listener);
     },
   },
   /**
@@ -409,12 +435,71 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    * Persist + navigate to a server URL. Connecting this machine as a runner is
    * a separate, explicit action from the host menu — not a connect-time choice.
    * @param {string} url
+   * @param {{requestId?: string}} [opts]
    */
-  setServerUrl: (url) => ipcRenderer.invoke("omnigent:set-server-url", url),
+  setServerUrl: (url, opts) => ipcRenderer.invoke("omnigent:set-server-url", url, opts),
+  /** Cancel only this setup window's matching connection attempt. */
+  cancelServerConnection: (requestId) =>
+    ipcRenderer.invoke("omnigent:cancel-server-connection", requestId),
+  /** Subscribe to connecting/authenticating phases for a request ID. */
+  onConnectionProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress);
+    ipcRenderer.on("omnigent:connection-progress", listener);
+    return () => ipcRenderer.removeListener("omnigent:connection-progress", listener);
+  },
+  /** Organization-provided server URLs from macOS Managed Preferences. */
+  getManagedServers: () => ipcRenderer.invoke("omnigent:get-managed-servers"),
+  /** Wizard capabilities, e.g. `{v2Forced}` — v2Forced disables "Switch to
+   *  legacy" because the env var pins the selector on. */
+  getSetupCapabilities: () => ipcRenderer.invoke("omnigent:get-setup-capabilities"),
+  /** Runners the onboarding runner step offers for `url`: `{remote, bundledCli}`.
+   *  @param {string} url */
+  getRunnerOptions: (url) => ipcRenderer.invoke("omnigent:get-runner-options", url),
+  /** Connect the onboarding runner ("local" | "remote") to `url`. Resolves
+   *  `{ok, error?}`; output streams via onRunnerConnectLog.
+   *  @param {string} url @param {"local"|"remote"} runner */
+  connectRunner: (url, runner) => ipcRenderer.invoke("omnigent:connect-runner", url, runner),
+  /** Subscribe to connectRunner output. Returns an unsubscribe function.
+   *  @param {(line: string) => void} callback */
+  onRunnerConnectLog: (callback) => {
+    const listener = (_event, payload) => callback(payload?.line ?? "");
+    ipcRenderer.on("omnigent:runner-connect-log", listener);
+    return () => ipcRenderer.removeListener("omnigent:runner-connect-log", listener);
+  },
+  /** Live color-scheme override for the wizard (System/Light/Dark). Not
+   *  persisted — resets to the OS default on relaunch.
+   *  @param {"light"|"dark"|"system"} scheme */
+  setColorScheme: (scheme) => ipcRenderer.send("omnigent:setup-set-color-scheme", scheme),
+  /** Current color scheme: `{source, effective}` — the persisted-for-the-session
+   *  source (system/light/dark) and the resolved appearance. Seeds the wizard's
+   *  radio + `.dark` class on load (themeSource may hold a value set earlier). */
+  getColorScheme: () => ipcRenderer.invoke("omnigent:setup-get-color-scheme"),
+  /** Subscribe to the wizard's effective theme ("dark"/"light") so the renderer
+   *  can sync its `.dark` class; fires on set and on OS changes. */
+  onColorScheme: (callback) => {
+    const listener = (_event, theme) => callback(theme);
+    ipcRenderer.on("omnigent:setup-theme", listener);
+    return () => ipcRenderer.removeListener("omnigent:setup-theme", listener);
+  },
   /** Recently-connected server URLs, most recent first. */
   getRecentServers: () => ipcRenderer.invoke("omnigent:get-recent-servers"),
+  /** Drop one recent server from the saved list; resolves the remaining ones. */
+  forgetRecentServer: (url) => ipcRenderer.invoke("omnigent:forget-recent-server", url),
+  /**
+   * Advisory reachability probe for a server URL; resolves
+   * `{status: "ok" | "reachable" | "unreachable"}`. Never gates connecting.
+   * @param {string} url
+   */
+  checkServer: (url) => ipcRenderer.invoke("omnigent:check-server", url),
   /** Copy text from the bundled setup page to the native clipboard. */
   copyText: (text) => ipcRenderer.invoke("omnigent:copy-setup-text", text),
+  /**
+   * Toggle the revamped server selector and reload this window to the chosen
+   * setup page. `true` → new experience, `false` → classic. No-op if the env
+   * var forces the choice.
+   * @param {boolean} enabled
+   */
+  setServerSelectorV2: (enabled) => ipcRenderer.invoke("omnigent:set-server-selector-v2", enabled),
   /**
    * Whether the `omnigent` CLI is installed/runnable, e.g.
    * `{installed, path, version, source, installCommand}`.
@@ -433,4 +518,29 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    * caller then connects to `url` via setServerUrl.
    */
   startLocalServer: () => ipcRenderer.invoke("omnigent:start-local-server"),
+  /**
+   * Subscribe to the local server's startup log lines (streamed while it boots
+   * during startLocalServer). Returns an unsubscribe function. Absent on older
+   * shells → the setup page falls back to phase-only display.
+   * @param {(line: string) => void} callback
+   */
+  onLocalServerSetupLog: (callback) => {
+    const listener = (_event, payload) => callback(payload?.line ?? "");
+    ipcRenderer.on("omnigent:local-server-setup-log", listener);
+    return () => ipcRenderer.removeListener("omnigent:local-server-setup-log", listener);
+  },
+  /**
+   * Install the omnigent CLI (macOS). Resolves `{ok, error?, installed}` once
+   * the installer finishes; output streams via onCliInstallLog.
+   */
+  installCli: () => ipcRenderer.invoke("omnigent:cli-install"),
+  /**
+   * Subscribe to the CLI installer's output lines. Returns an unsubscribe fn.
+   * @param {(line: string) => void} callback
+   */
+  onCliInstallLog: (callback) => {
+    const listener = (_event, payload) => callback(payload?.line ?? "");
+    ipcRenderer.on("omnigent:cli-install-log", listener);
+    return () => ipcRenderer.removeListener("omnigent:cli-install-log", listener);
+  },
 });

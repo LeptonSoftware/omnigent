@@ -92,7 +92,12 @@ async def register_worktree_host(
     """
     conns: list[HostConnection] = []
 
-    def _register(*, create_status: str = "ok", create_error: str | None = None) -> _HostCapture:
+    def _register(
+        *,
+        create_status: str = "ok",
+        create_error: str | None = None,
+        workspace: str | None = None,
+    ) -> _HostCapture:
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
         conn = app.state.host_registry.register(
             host_id=_HOST_ID,
@@ -130,7 +135,8 @@ async def register_worktree_host(
                             fut.set_result(
                                 {
                                     "status": "ok",
-                                    "worktree_path": f"{frame.repo_path}-worktrees/{dirname}",
+                                    "worktree_path": f"{_SOURCE_REPO}-worktrees/{dirname}",
+                                    "workspace": workspace,
                                     "branch": frame.branch_name,
                                     "error": None,
                                 }
@@ -430,3 +436,91 @@ async def test_create_failure_rolls_back_omnigent_created_worktree(
     assert len(cap.remove) == 1, f"expected a create-rollback remove frame, got {cap.remove}"
     assert cap.remove[0].branch == "feature/orphan"
     assert cap.remove[0].delete_branch is True
+
+
+async def test_create_failure_rollback_preserves_existing_branch(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Create-rollback of an ``existing_branch`` recreate keeps the branch.
+
+    The deleted-worktree recreate path checks out a branch that predates
+    the request (it may carry unpushed commits). When persistence fails
+    after the worktree was recreated, rollback still removes the
+    directory but must NOT ``git branch -D`` the user's branch.
+    """
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    cap = register_worktree_host()
+    agent = await create_test_agent(client, name="wt-existing-branch-rollback-agent")
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("simulated create_conversation failure")
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "create_conversation", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated create_conversation failure"):
+        await _create_git_session(
+            client,
+            agent["id"],
+            {"branch_name": "feature/kept", "existing_branch": True},
+        )
+
+    assert len(cap.create) == 1, cap.create
+    assert cap.create[0].existing_branch is True
+    assert len(cap.remove) == 1, f"expected a create-rollback remove frame, got {cap.remove}"
+    assert cap.remove[0].branch == "feature/kept"
+    assert cap.remove[0].delete_branch is False, (
+        "rollback of an existing-branch recreate must preserve the user's "
+        "pre-existing branch (unpushed commits would be lost)"
+    )
+
+
+async def test_create_preserves_selected_subdirectory(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """Persist the relocated subdirectory returned by the host as the session workspace."""
+    workspace = f"{_SOURCE_REPO}-worktrees/worktree-1234abcd/packages/app"
+    cap = register_worktree_host(workspace=workspace)
+    agent = await create_test_agent(client, name="subdirectory-agent")
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": f"{_SOURCE_REPO}/packages/app",
+            "git": {"branch_name": "worktree-1234abcd"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert cap.create[0].repo_path == f"{_SOURCE_REPO}/packages/app"
+    assert response.json()["workspace"] == workspace
+    detail = await client.get(f"/v1/sessions/{response.json()['id']}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["workspace"] == workspace
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+
+    assert detail.json()["labels"][WORKTREE_ROOT_LABEL_KEY] == worktree_root_fingerprint(
+        f"{_SOURCE_REPO}-worktrees/worktree-1234abcd"
+    )
+
+
+async def test_create_rejects_forged_worktree_identity(
+    client: httpx.AsyncClient,
+) -> None:
+    """Clients cannot redirect the server-owned cleanup identity."""
+    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+    agent = await create_test_agent(client, name="forged-root-agent")
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "labels": {WORKTREE_ROOT_LABEL_KEY: "forged"}},
+    )
+    assert response.status_code == 400, response.text

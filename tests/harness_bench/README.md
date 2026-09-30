@@ -43,7 +43,12 @@ non-zero exit means at least one `DRIFT` cell was found.
 ### Flags
 
 - `--live` / `--no-live` -- force live probing or the declared-only matrix.
-  `--live` requires resolvable gateway credentials.
+  `--live` requires resolvable gateway credentials, unless every selected
+  harness authenticates its own model (`agy`, cursor, goose, hermes, kimi,
+  kiro, pi and qwen natives), in which case the vendor CLI's own login is
+  enough. Auto-live is still keyed on the gateway, so a bare run on a
+  credential-less machine renders the declared matrix rather than starting
+  vendor CLIs unasked.
 - `--profile NAME` -- optional Databricks profile override; it is not required
   when config or ambient `OPENAI_*` already supplies credentials.
 - `--harness NAME[=MODEL]` -- probe one harness (repeatable), optionally
@@ -108,7 +113,7 @@ A profile's `transport` is a harness-family marker. The resolved driver is:
 | **Policy DENY** | A tool-call policy blocks the call. | P0 |
 | **Policy ALLOW** | A tool call proceeds while an explicit allow policy is attached. | P1 |
 | **Policy ASK** | An ask policy raises an approval elicitation. | P1 |
-| **Model override** | The harness accepts and completes with the requested model. | P0 |
+| **Model override** | The harness accepts and completes with the requested model; `SKIPPED` when the transport never applies it (native-tui). | P0 |
 | **Cost tracking** | A completed turn reports priced cost (`SUPPORTED`) or tokens only (`PARTIAL`). | P1 |
 | **Interrupt** | A running turn stops after interruption. | P0 |
 

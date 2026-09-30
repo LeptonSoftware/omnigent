@@ -126,7 +126,18 @@ class SysScheduledTaskCreateTool(Tool):
                                 "Optional PIN of a connected host to run on, from the "
                                 "current workspace's host list. Omit to run on the owner's "
                                 "online host at fire time; a failed run is recorded if none "
-                                "is online."
+                                "is online. Existing managed sandbox hosts cannot be pinned."
+                            ),
+                        },
+                        "execution_target": {
+                            "type": "string",
+                            "enum": ["connected_host", "managed_sandbox"],
+                            "description": (
+                                "Where each firing runs. 'connected_host' (default) uses a "
+                                "pinned/resolved connected host. 'managed_sandbox' provisions "
+                                "a fresh server-managed sandbox per firing, using the server's "
+                                "sandbox lifecycle settings. Do not set host_id or workspace "
+                                "with it. Requires managed sandboxes configured on the server."
                             ),
                         },
                     },
@@ -180,8 +191,9 @@ class SysScheduledTaskUpdateTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             "Update a scheduled task's mutable fields. Only the fields you pass "
-            "change; omit the rest. Pass state='paused' to stop it firing "
-            "without deleting it, or state='active' to resume."
+            "change; omit the rest. Pass agent_id to switch which agent/harness "
+            "it runs. Pass state='paused' to stop it firing without deleting it, "
+            "or state='active' to resume."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -201,6 +213,16 @@ class SysScheduledTaskUpdateTool(Tool):
                         "name": {"type": "string", "description": "New task name."},
                         "prompt": {"type": "string", "description": "New prompt."},
                         "rrule": {"type": "string", "description": _RRULE_DESC},
+                        "agent_id": {
+                            "type": "string",
+                            "description": (
+                                "Rebind the task to a different agent, switching the "
+                                "harness its future firings run (e.g. Cursor to Pi) — "
+                                "from sys_agent_list. Past runs keep the agent they "
+                                "ran. Model, effort, and permission mode do not carry "
+                                "across a switch: resend any you want set."
+                            ),
+                        },
                         "timezone": {"type": "string", "description": "New IANA timezone."},
                         "model_override": {"type": "string", "description": "New model override."},
                         "reasoning_effort": {
@@ -228,6 +250,15 @@ class SysScheduledTaskUpdateTool(Tool):
                         "host_id": {
                             "type": "string",
                             "description": "New connected host to run on.",
+                        },
+                        "execution_target": {
+                            "type": "string",
+                            "enum": ["connected_host", "managed_sandbox"],
+                            "description": (
+                                "Switch where firings run. 'managed_sandbox' provisions a "
+                                "fresh server-managed sandbox per firing (clears any pinned "
+                                "host; do not also set host_id or workspace)."
+                            ),
                         },
                         "state": {
                             "type": "string",

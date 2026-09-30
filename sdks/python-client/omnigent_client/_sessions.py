@@ -26,7 +26,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from pydantic import TypeAdapter
@@ -34,7 +34,7 @@ from pydantic import TypeAdapter
 from omnigent.server.schemas import ServerStreamEvent
 
 from ._child_status import child_summary_busy
-from ._errors import raise_for_status, require_json_object, response_body
+from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._timeouts import _SSE_TIMEOUT
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
@@ -179,8 +179,9 @@ class Session:
         conversations.
     :param archived: Whether the session is archived. Archived
         sessions are hidden from the default ``list`` listing and
-        returned only when ``include_archived=True``. ``False`` for
-        normal sessions.
+        returned with ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. ``False`` for normal
+        sessions.
     """
 
     id: str
@@ -258,6 +259,11 @@ class SessionListItem:
     :param title: Optional human-readable title.
     :param labels: Session-scoped guardrails labels.
     :param runner_id: Runner currently bound to the session.
+    :param host_id: Host that launched the runner for this session,
+        or ``None`` for sessions without a host binding (e.g. a
+        caller-managed runner). Native resume pickers rely on it to
+        drop rows bound to other hosts, whose runtime state is not
+        reachable from the invoking machine.
     :param reasoning_effort: Per-session reasoning-effort hint.
     :param owner: User ID of the session owner.
     :param external_session_id: Runtime-native session id this
@@ -270,8 +276,11 @@ class SessionListItem:
         running can tell which ones are blocked on them. ``0`` when
         the session has no outstanding prompts.
     :param archived: Whether the session is archived. Returned by
-        ``list`` only when ``include_archived=True``. ``False`` for
-        normal sessions.
+        ``list`` with ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. ``False`` for normal
+        sessions.
+    :param parent_session_id: Parent session for a sub-agent child; ``None``
+        for top-level sessions or when omitted by an older server.
     """
 
     id: str
@@ -282,11 +291,13 @@ class SessionListItem:
     title: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     runner_id: str | None = None
+    host_id: str | None = None
     reasoning_effort: str | None = None
     owner: str | None = None
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
     archived: bool = False
+    parent_session_id: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> SessionListItem:
@@ -307,11 +318,13 @@ class SessionListItem:
             title=raw.get("title"),
             labels=labels_raw if isinstance(labels_raw, dict) else {},
             runner_id=raw.get("runner_id"),
+            host_id=raw.get("host_id"),
             reasoning_effort=raw.get("reasoning_effort"),
             owner=raw.get("owner"),
             external_session_id=raw.get("external_session_id"),
             pending_elicitations_count=raw.get("pending_elicitations_count", 0),
             archived=bool(raw.get("archived", False)),
+            parent_session_id=raw.get("parent_session_id"),
         )
 
 
@@ -370,6 +383,8 @@ class SessionsNamespace:
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
+        host_type: str = "external",
+        sandbox_provider: str | None = None,
     ) -> Session:
         """
         Create a new session from an uploaded agent bundle.
@@ -389,11 +404,18 @@ class SessionsNamespace:
             starts with no labels.
         :param reasoning_effort: Optional per-session reasoning
             effort, e.g. ``"high"``. ``None`` uses the agent default.
-        :param workspace: Optional absolute starting cwd to record on
-            the session, e.g. ``"/Users/corey/projects/myapp"``.
-            CLI-launched sessions populate this with ``os.getcwd()``
-            so the Web UI can show "running locally in <workspace>";
-            sessions with no recorded workspace pass ``None``.
+        :param workspace: Optional starting workspace. For an external
+            host (the default), an absolute cwd to record on the session,
+            e.g. ``"/Users/corey/projects/myapp"`` — CLI-launched sessions
+            populate this with ``os.getcwd()``. For ``host_type="managed"``,
+            a git repository URL (optionally ``#<branch>``) the server
+            clones into the sandbox. ``None`` records no workspace.
+        :param host_type: ``"external"`` (default) uploads the bundle and
+            runs it on a caller-managed runner; ``"managed"`` uploads the
+            bundle and has the server provision a sandbox host to run it.
+        :param sandbox_provider: With ``host_type="managed"``, which
+            configured sandbox provider to provision (e.g. ``"lakebox"``);
+            ``None`` takes the server's first. Ignored for external hosts.
         :returns: The newly created :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx
             status.
@@ -407,6 +429,10 @@ class SessionsNamespace:
             metadata["reasoning_effort"] = reasoning_effort
         if workspace is not None:
             metadata["workspace"] = workspace
+        if host_type != "external":
+            metadata["host_type"] = host_type
+        if sandbox_provider is not None:
+            metadata["sandbox_provider"] = sandbox_provider
         resp = await self._http.post(
             f"{self._base}/v1/sessions",
             data={"metadata": json.dumps(metadata)},
@@ -587,6 +613,8 @@ class SessionsNamespace:
         order: str = "desc",
         sort_by: str = "created_at",
         include_archived: bool = False,
+        visibility: Literal["all", "mine", "shared", "archived"] = "all",
+        kind: Literal["default", "sub_agent", "any"] | None = None,
     ) -> list[SessionListItem]:
         """
         List sessions with cursor-based pagination.
@@ -606,13 +634,31 @@ class SessionsNamespace:
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Column to sort on, ``"created_at"`` or
             ``"updated_at"``.
-        :param include_archived: When ``False`` (default), archived
-            sessions are omitted. When ``True``, archived sessions are
-            returned alongside active ones.
+        :param include_archived: With ``visibility="all"``, include
+            archived sessions alongside active ones when ``True``.
+            Defaults to ``False``. Other visibility modes determine
+            archive filtering themselves.
+        :param visibility: ``"all"`` (default) returns all accessible
+            sessions. ``"mine"`` returns owned active sessions, and
+            ``"shared"`` returns accessible active sessions not owned
+            by the caller. ``"archived"`` returns only archived sessions.
+            Without server authentication, ``"mine"`` and ``"shared"``
+            behave like ``"all"``. Always sent explicitly to the server.
+        :param kind: ``"default"`` returns top-level sessions,
+            ``"sub_agent"`` returns children, and ``"any"`` includes both.
+            ``None`` leaves the server's top-level-only default unchanged.
         :returns: List of :class:`SessionListItem`.
+        :raises StaleCursorError: If ``after``/``before`` names a session
+            that has since been deleted. The walk cannot continue from
+            that cursor — restart it from the first page with no cursor.
         :raises OmnigentError: On non-2xx status.
         """
-        params: dict[str, str | int] = {"limit": limit, "order": order, "sort_by": sort_by}
+        params: dict[str, str | int] = {
+            "limit": limit,
+            "order": order,
+            "sort_by": sort_by,
+            "visibility": visibility,
+        }
         if after is not None:
             params["after"] = after
         if before is not None:
@@ -623,6 +669,8 @@ class SessionsNamespace:
             params["agent_name"] = agent_name
         if include_archived:
             params["include_archived"] = "true"
+        if kind is not None:
+            params["kind"] = kind
         resp = await self._http.get(
             f"{self._base}/v1/sessions",
             params=params,
@@ -773,9 +821,10 @@ class SessionsNamespace:
 
         Calls ``PATCH /v1/sessions/{session_id}`` with
         ``{"archived": ...}``. Archived sessions are hidden from the
-        default :meth:`list` listing and surfaced only with
-        ``include_archived=True``. Owner-only (the web UI stops the
-        session on archive, an owner-gated lifecycle action, so archive
+        default :meth:`list` listing and surfaced with
+        ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. Owner-only (the web
+        UI stops the session on archive, an owner-gated lifecycle action, so archive
         is held to the same gate); note this method only flips the
         archived flag — it does not stop the session.
 
@@ -852,6 +901,9 @@ class SessionsNamespace:
         :param order: Sort order, ``"asc"`` (chronological) or
             ``"desc"``.
         :returns: List of conversation item dicts.
+        :raises StaleCursorError: If ``after`` names an item that has since
+            been deleted. The walk cannot continue from that cursor —
+            restart it from the first page with no cursor.
         :raises OmnigentError: On non-2xx status (404 when the
             session does not exist).
         """
@@ -1213,6 +1265,10 @@ async def _stream_session_events(
         to subscribe to, e.g. ``"conv_abc123"``.
     :yields: :class:`ServerStreamEvent` envelopes parsed from the SSE
         ``data:`` payload.
+    :raises OmnigentError: If the stream open fails with a non-2xx
+        status, including a redirect that was not followed.
+    :raises httpx.TooManyRedirects: If on-origin redirects loop past
+        httpx's limit.
     """
     async with http.stream(
         "GET",
@@ -1222,6 +1278,17 @@ async def _stream_session_events(
         if resp.status_code >= 400:
             await resp.aread()
             raise_for_status(resp.status_code, response_body(resp))
+        elif 300 <= resp.status_code < 400:
+            # OmnigentClient follows redirects, so a 3xx here was not
+            # followable (no Location header, a 304, or a caller-supplied
+            # client with redirects disabled). Parsing its non-SSE body
+            # would yield a silent, error-free, empty stream — fail loud
+            # instead.
+            raise OmnigentError(
+                f"stream open returned a 3xx response (status {resp.status_code}) "
+                "instead of an event stream",
+                resp.status_code,
+            )
 
         async for event in _parse_sse_lines(resp.aiter_lines()):
             yield event

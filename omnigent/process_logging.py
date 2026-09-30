@@ -6,8 +6,10 @@ import atexit
 import contextlib
 import logging
 import os
+import re
 import sys
-from collections.abc import Iterator, Sequence
+import threading
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,12 +23,56 @@ LOG_TO_STDERR_ENV_VAR = "OMNIGENT_LOG_TO_STDERR"
 LOG_FORCE_COLOR_ENV_VAR = "OMNIGENT_LOG_FORCE_COLOR"
 PROCESS_LOG_FILE_ENV_VAR = "OMNIGENT_PROCESS_LOG_FILE"
 LOG_TTY_FD_ENV_VAR = "OMNIGENT_LOG_TTY_FD"
+HARNESS_STDERR_ENABLED_ENV_VAR = "OMNIGENT_HARNESS_STDERR_ENABLED"
 
 
 class ChildLoggingPopenKwargs(TypedDict, total=False):
     """Keyword arguments forwarded to :class:`subprocess.Popen`."""
 
     pass_fds: tuple[int, ...]
+
+
+_log_once_seen: set[str] = set()
+_log_once_lock = threading.Lock()
+
+
+def _mark_once(formatted: str) -> bool:
+    """Return ``True`` the first time *formatted* is seen this process, then remember it."""
+    with _log_once_lock:
+        if formatted in _log_once_seen:
+            return False
+        _log_once_seen.add(formatted)
+        return True
+
+
+def log_once(
+    logger: logging.Logger,
+    level: int,
+    msg: str,
+    *args: object,
+    exc_info: bool = False,
+) -> None:
+    """Log *msg* at *level* the first time this exact line is seen in the process.
+
+    For near-static diagnostics a hot path recomputes and would otherwise re-log
+    on every call -- a harness routing decision resolved on every turn, or a
+    best-effort probe that fails identically on every catalog fetch. The
+    formatted message is the dedup key, so a *changed* line logs again while
+    identical repeats are dropped. Per-process and thread-safe (these callers run
+    under ``asyncio.to_thread``). ``stacklevel=2`` attributes the record to the
+    caller (correct ``func_name`` in the debug-logs table); ``exc_info`` is
+    forwarded so the first occurrence of a failure keeps its traceback.
+    """
+    formatted = msg % args if args else msg
+    if _mark_once(formatted):
+        logger.log(level, formatted, exc_info=exc_info, stacklevel=2)
+
+
+def log_info_once(logger: logging.Logger, msg: str, *args: object) -> None:
+    """INFO convenience wrapper around :func:`log_once`; see it for semantics."""
+    formatted = msg % args if args else msg
+    if _mark_once(formatted):
+        logger.info(formatted, stacklevel=2)
 
 
 class _ProcessLogStreamHandler(logging.StreamHandler[TextIO]):
@@ -59,6 +105,76 @@ _LEVEL_COLORS = {
     logging.ERROR: "\x1b[31m",
     logging.CRITICAL: "\x1b[91m",
 }
+_REDACTED = "[REDACTED]"
+_QUOTED_OR_NONSPACE_VALUE = r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|\S+)'
+_AUTHORIZATION_VALUE = r'(?:(?:"[^"\r\n]*"|\'[^\'\r\n]*\')|(?:bearer\s+)?\S+)'
+_AUTHORIZATION_PATTERN = re.compile(
+    rf"(?i)(\bauthorization\b[\"']?\s*[:=]\s*)({_AUTHORIZATION_VALUE})"
+)
+_NAMED_SECRET_PATTERN = re.compile(
+    # Start once per possible key, avoiding retries within long dotted/hyphenated values.
+    rf"(?i)((?<![\w.-])[\w.-]*(?:token|api(?:[_-]|[ \t]+)?key|secret|password|credential)"
+    rf"\b[\"']?\s*[:=]\s*)({_AUTHORIZATION_VALUE})"
+)
+_WHITESPACE_SECRET_PATTERN = re.compile(
+    # Scan prefixes only from each key's start, as for assignment keys above.
+    # Generic token/secret/credential labels require a prefix to distinguish them from prose.
+    r"(?i)((?<![\w.-])(?:[\w.-]*(?:password|passwd|api(?:[_-]|[ \t]+)?key"
+    r"|(?:access|refresh|auth)(?:[_-]|[ \t]+)token|client(?:[_-]|[ \t]+)secret)"
+    r"|[\w.-]+(?:token|secret|credential))"
+    r"\b[\"']?[ \t]+)"
+    # Preserve clear diagnostic phrases, but still redact quoted or ambiguous single values.
+    r"(?!(?:(?:is|was)[ \t]+(?:missing|invalid|required|expired|not[ \t]+(?:set|found|configured))"
+    r"|has[ \t]+expired|(?:authentication|validation|refresh)[ \t]+failed)\b)"
+    rf"(?![:=])({_AUTHORIZATION_VALUE})"
+)
+_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Keep the broad standalone-bearer behavior: short or punctuation-heavy
+    # credentials are still secrets.
+    re.compile(r"(?i)(\bbearer\s+)\S+"),
+    # Common provider-specific token shapes.
+    re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"\bdapi[A-Za-z0-9]{10,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bAIza[A-Za-z0-9_-]{20,}\b"),
+    # JWTs and long mixed-case opaque values are token-like even without a
+    # nearby label. Requiring lower, upper, and numeric characters avoids
+    # treating UUIDs, hashes, and normal lower-case identifiers as secrets.
+    re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b"),
+    re.compile(
+        r"(?<![A-Za-z0-9_])"
+        r"(?=[A-Za-z0-9_]{32,}(?![A-Za-z0-9_]))"
+        r"(?=[A-Za-z0-9_]*[a-z])"
+        r"(?=[A-Za-z0-9_]*[A-Z])"
+        r"(?=[A-Za-z0-9_]*[0-9])"
+        r"[A-Za-z0-9_]{32,}"
+        r"(?![A-Za-z0-9_])"
+    ),
+)
+
+
+def _replace_named_secret(match: re.Match[str]) -> str:
+    value = match.group(2)
+    if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+        replacement = f"{value[0]}{_REDACTED}{value[0]}"
+    else:
+        replacement = _REDACTED
+    return match.group(1) + replacement
+
+
+def redact_log_text(text: str, *, include_whitespace_credentials: bool = False) -> str:
+    """Redact secrets, optionally including ambiguous whitespace labels in diagnostics."""
+    text = _AUTHORIZATION_PATTERN.sub(_replace_named_secret, text)
+    text = _NAMED_SECRET_PATTERN.sub(_replace_named_secret, text)
+    if include_whitespace_credentials:
+        text = _WHITESPACE_SECRET_PATTERN.sub(_replace_named_secret, text)
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(
+            lambda match: match.group(1) + _REDACTED if match.lastindex else _REDACTED,
+            text,
+        )
+    return text
 
 
 def format_log_level_name(levelno: int, levelname: str, *, use_colors: bool) -> str:
@@ -83,7 +199,7 @@ def _color_field(value: str, color: str, *, use_colors: bool) -> str:
 
 def short_logger_name(name: str) -> str:
     """Return a compact, fixed-column logger source name."""
-    for prefix in ("omnigent.", "omnigent_ui_sdk."):
+    for prefix in ("omnigent.harnesses.", "omnigent.", "omnigent_ui_sdk."):
         if name.startswith(prefix):
             name = name[len(prefix) :]
             break
@@ -155,6 +271,13 @@ class TerminalLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         with log_record_display_fields(record, use_colors=self._use_colors):
             return super().format(record)
+
+
+class RedactingLogFormatter(TerminalLogFormatter):
+    """Format a complete record, then remove token-like strings from it."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_log_text(super().format(record))
 
 
 def data_dir() -> Path:
@@ -244,6 +367,16 @@ def should_log_to_stderr() -> bool:
     return env_truthy(os.environ.get(LOG_TO_STDERR_ENV_VAR))
 
 
+def harness_stderr_capture_enabled() -> bool:
+    """Return whether harness diagnostics may include captured stderr text."""
+    return os.environ.get(HARNESS_STDERR_ENABLED_ENV_VAR, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _process_log_file_from_env() -> Path | None:
     value = os.environ.get(PROCESS_LOG_FILE_ENV_VAR)
     return Path(value).expanduser() if value else None
@@ -268,6 +401,22 @@ def current_process_log_path() -> Path | None:
     return _current_process_log_path or _process_log_file_from_env()
 
 
+def process_log_dir_reference(destination: str) -> str:
+    """Return a user-facing pointer to a process-log *directory*.
+
+    Resolved through :func:`process_log_dir`, so the path tracks
+    ``OMNIGENT_DATA_DIR`` instead of assuming the default tree. Use this
+    rather than :func:`process_log_reference` when the message is about a
+    different process than the caller. The CLI naming where the host daemon
+    logs must point at the host directory, not the CLI's own log file.
+
+    :param destination: Process-log destination, e.g. ``"host"``.
+    :returns: A display path with a trailing separator, e.g.
+        ``"~/.omnigent/logs/host/"``.
+    """
+    return f"{display_log_path(process_log_dir(destination))}/"
+
+
 def process_log_reference(destination: str) -> str:
     """Return a user-facing pointer to this process's log for error messages.
 
@@ -284,7 +433,7 @@ def process_log_reference(destination: str) -> str:
     path = current_process_log_path()
     if path is not None:
         return display_log_path(path)
-    return f"{display_log_path(process_log_dir(destination))}/"
+    return process_log_dir_reference(destination)
 
 
 def _terminal_stream() -> TextIO | None:
@@ -331,7 +480,7 @@ def terminal_stream_handler() -> logging.Handler:
 
 def terminal_log_formatter() -> logging.Formatter:
     """Return the formatter used by mirrored terminal process logs."""
-    return TerminalLogFormatter(use_colors=terminal_supports_color())
+    return RedactingLogFormatter(use_colors=terminal_supports_color())
 
 
 def _unlink_if_empty(path: Path) -> None:
@@ -353,11 +502,14 @@ def configure_process_logging(
     logger_names: Sequence[str] = ("omnigent",),
     root: bool = True,
     force: bool = False,
+    debug_log_send: Callable[[list[dict[str, object]]], None] | None = None,
 ) -> Path:
     """Configure Python logging for one process destination.
 
     The returned file always receives logs. Stderr receives logs only when
-    requested and an interactive terminal stream is available.
+    requested and an interactive terminal stream is available. When provided,
+    ``debug_log_send`` receives prepared debug-log batches on a daemon thread;
+    otherwise the environment-gated ZeroBus sender remains the default.
     """
     global _current_process_log_path
 
@@ -373,7 +525,7 @@ def configure_process_logging(
     path.parent.mkdir(parents=True, exist_ok=True)
     _current_process_log_path = path
 
-    formatter = TerminalLogFormatter(use_colors=False)
+    formatter = RedactingLogFormatter(use_colors=False)
     handlers: list[logging.Handler] = []
 
     file_handler = _ProcessLogFileHandler(path, encoding="utf-8")
@@ -415,15 +567,41 @@ def configure_process_logging(
 
     # Mirror the file handler's reach with the optional debug-log upload sink,
     # so it captures the same records this process writes to disk.
-    from omnigent.debug_logging import attach_debug_log_sink
+    from omnigent.debug_logging import attach_debug_log_sink, attach_sse_file_sink
 
-    sink_targets = (
-        [logging.getLogger()] if root else [logging.getLogger(name) for name in logger_names]
+    sink_targets = _debug_sink_target_loggers(logger_names, root=root)
+    attach_debug_log_sink(
+        sink_targets,
+        source=destination,
+        level=resolved_level,
+        send=debug_log_send,
     )
-    attach_debug_log_sink(sink_targets, source=destination, level=resolved_level)
+    # Opt-in local SSE-event file sink (OMNIGENT_SSE_LOG_TO_FILE), independent of
+    # the debug-log table above; a no-op when the env var is not truthy.
+    attach_sse_file_sink(source=destination, level=resolved_level)
 
     logging.captureWarnings(True)
     return path
+
+
+def _debug_sink_target_loggers(logger_names: Sequence[str], *, root: bool) -> list[logging.Logger]:
+    """Loggers the debug-log sink must attach to, mirroring the file handler.
+
+    The sink has to sit wherever a record is actually handled. A package logger
+    with ``propagate=False`` (e.g. ``omnigent`` under the CLI diagnostics setup)
+    never reaches root, so a root-only sink would miss every record logged under
+    it. This matches the file-handler placement in
+    :func:`configure_process_logging` exactly, so the sink captures the same
+    records the process writes to disk.
+    """
+    targets: list[logging.Logger] = []
+    if root:
+        targets.append(logging.getLogger())
+    for name in logger_names:
+        logger = logging.getLogger(name)
+        if not logger.propagate or not root:
+            targets.append(logger)
+    return targets
 
 
 def _add_handler_once(logger: logging.Logger, handler: logging.Handler) -> None:
