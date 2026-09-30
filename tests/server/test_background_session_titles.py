@@ -728,9 +728,11 @@ async def test_fork_placeholder_is_eligible_for_renaming(db_uri: str) -> None:
     )
 
     assert pending is not None
-    # The divergence turn is the prompt, and the CAS targets the fork placeholder.
+    # The divergence turn is the prompt. The CAS seed is no longer carried on
+    # the pending object — the caller schedules with the persisted title,
+    # which on this branch is the fork placeholder itself.
     assert pending.request.prompt == "now add auth"
-    assert pending.expected_seed_title == "Fork of Clone the repo"
+    assert pending.request.session_id == created.id
 
 
 async def test_real_title_is_never_touched(db_uri: str) -> None:
