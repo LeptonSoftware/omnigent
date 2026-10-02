@@ -25,12 +25,12 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "ga1b2c3d4e5f"
-# Chains off the current alembic head. The branch is rebased onto upstream main,
-# so this revision is a real ancestor here — a single head on the branch *and*
-# on the PR merge (see tests/db/test_migration_connections.py, which
-# guards against a second head). Re-point if main lands a newer migration before
-# this merges.
-down_revision: str | None = "e5d9bc8ac650"
+# Fork: re-parented onto the fork's host-permissions mergepoint (upstream:
+# "e5d9bc8ac650") so the graph stays LINEAR above it. A merge revision here
+# instead would leave two alembic_version rows on every downgrade below it,
+# breaking get_current_revision() and upstream's migration round-trip tests.
+# Prod sits at f2fe7596a89b, so its upgrade path is identical either way.
+down_revision: str | None = "f2fe7596a89b"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
