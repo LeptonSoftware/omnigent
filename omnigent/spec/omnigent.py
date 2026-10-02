@@ -157,6 +157,8 @@ def agent_spec_to_agent_def(spec: AgentSpec) -> AgentDef:
         model=spec.executor.model,
         harness=_raw_harness,
         profile=spec.executor.config.get("profile"),
+        context_files=spec.executor.config.get("context_files"),
+        system_prompt_mode=spec.executor.config.get("system_prompt_mode"),
     )
 
     # ``AgentDef.name`` / ``AgentDef.prompt`` are ``str | None`` — pass
@@ -181,6 +183,7 @@ def agent_spec_to_agent_def(spec: AgentSpec) -> AgentDef:
         tools=_translate_tools_to_omnigent(spec),
         executor=executor_spec,
         os_env=spec.os_env,
+        model_egress=spec.model_egress,
         bundle_dir=bundle_dir,
         skills_filter=spec.skills_filter,
     )
@@ -422,9 +425,7 @@ def _sub_spec_to_agent_tool(sub: AgentSpec) -> AgentTool:
 
     Inverse of :func:`_agent_tool_to_sub_spec`. Reads the sub-spec's
     ``llm.model`` and ``executor.config`` (harness / profile) to
-    reconstruct the omnigent :class:`ExecutorSpec`. Lossy fields
-    (``max_sessions``, ``os_env``, ``pass_history``,
-    ``pass_histories``) are left at omnigent defaults.
+    reconstruct the omnigent :class:`ExecutorSpec`.
 
     :param sub: The nested :class:`AgentSpec` representing a
         sub-agent exposed to the parent as a tool.
@@ -444,10 +445,15 @@ def _sub_spec_to_agent_tool(sub: AgentSpec) -> AgentTool:
         description=sub.description,
         prompt=sub.instructions,
         os_env=sub.os_env,
+        pass_history=sub.pass_history,
+        pass_histories=(list(sub.pass_histories) if sub.pass_histories is not None else None),
+        max_sessions=sub.max_sessions,
         executor=OmniExecutorSpec(
             model=model,
             harness=harness,
             profile=profile,
+            context_files=sub.executor.config.get("context_files"),
+            system_prompt_mode=sub.executor.config.get("system_prompt_mode"),
         ),
     )
 
@@ -816,11 +822,13 @@ def _translate_function_policy_yaml(
     # names at policy-build time; see _omnigent_legacy_shim).
     # The wrapper lives at load time — zero cost in the engine's
     # hot evaluate() loop.
+    from omnigent.spec._omnigent_legacy_shim import BUILD_PATH as _SHIM_BUILD_PATH
+
     shim_args: dict[str, Any] = {"target": callable_path}
     if factory_params:
         shim_args["factory_kwargs"] = factory_params
     out["function"] = {
-        "path": "omnigent.spec._omnigent_legacy_shim.build",
+        "path": _SHIM_BUILD_PATH,
         "arguments": shim_args,
     }
     return out
@@ -1151,6 +1159,7 @@ def agent_def_to_agent_spec(
         guardrails=guardrails,
         mcp_servers=mcp_servers,
         os_env=agent_def.os_env,
+        model_egress=agent_def.model_egress,
         terminals=terminals,
         timers=agent_def.timers,
         spawn=agent_def.spawn,
@@ -1310,11 +1319,6 @@ def _agent_tool_to_sub_spec(
     :class:`AgentSpec` with ``executor.type == "omnigent"`` so the
     :class:`OmnigentExecutor` runs it when spawned.
 
-    Lossy fields (not modeled on Omnigent' AgentSpec yet):
-    ``max_sessions``, ``pass_history``, ``pass_histories``.
-    omnigent' runtime falls back to its defaults for these on
-    the reverse trip.
-
     :param tool_name: The YAML key under which this AgentTool is
         declared on the parent, e.g. ``"claude_worker"``.
     :param tool: The parsed omnigent :class:`AgentTool`.
@@ -1420,6 +1424,9 @@ def _agent_tool_to_sub_spec(
             parent_harness=parent_harness,
         ),
         os_env=sub_os_env,
+        pass_history=tool.pass_history,
+        pass_histories=(list(tool.pass_histories) if tool.pass_histories is not None else None),
+        max_sessions=tool.max_sessions,
         terminals=sub_terminals,
         sub_agents=child_sub_agents,
         local_tools=child_local_tools,
@@ -1748,6 +1755,10 @@ def _translate_executor_from_def(
         "harness": harness,
         "profile": profile,
     }
+    if oa_executor is not None and oa_executor.context_files is not None:
+        config["context_files"] = oa_executor.context_files
+    if oa_executor is not None and oa_executor.system_prompt_mode is not None:
+        config["system_prompt_mode"] = oa_executor.system_prompt_mode
     # These are not fields on the omnigent inner ExecutorSpec, so read them
     # from the raw YAML dict and carry them forward explicitly.
     # The openai-agents harness spawn-env builder reads

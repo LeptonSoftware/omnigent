@@ -154,6 +154,58 @@ def test_update_host_id_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
     assert updated.host_id == _uid("host_xyz")
 
 
+def test_execution_target_managed_sandbox_round_trips(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A managed_sandbox task persists and reads back, and update can switch it."""
+    created = store.create(
+        scheduled_task_id=_uid("st_managed"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        execution_target="managed_sandbox",
+    )
+    assert created.execution_target == "managed_sandbox"
+    assert store.get(_uid("st_managed")).execution_target == "managed_sandbox"
+    # Switch back to connected_host via update.
+    switched = store.update(_uid("st_managed"), execution_target="connected_host")
+    assert switched is not None
+    assert switched.execution_target == "connected_host"
+
+
+def test_update_workspace_explicit_null_clears_it(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """``update(workspace=None)`` clears the workspace; omitting it leaves it.
+
+    Regression for the managed-switch round-trip: clearing a pinned workspace
+    must be possible so switching a task to managed execution (which unpins both
+    host and workspace) doesn't strand a workspace-without-host.
+    """
+    store.create(
+        scheduled_task_id=_uid("st_ws"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        workspace="/repo",
+        host_id=_uid("h"),
+    )
+    # Omitting workspace leaves it unchanged.
+    unchanged = store.update(_uid("st_ws"), name="renamed")
+    assert unchanged is not None and unchanged.workspace == "/repo"
+    # Explicit None clears both host and workspace (the managed-switch shape).
+    cleared = store.update(_uid("st_ws"), host_id=None, workspace=None)
+    assert cleared is not None
+    assert cleared.workspace is None
+    assert cleared.host_id is None
+
+
 def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
     """Updating ``state`` to ``paused`` reads back ``paused``."""
     store.create(
@@ -375,6 +427,64 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
     assert updated.last_run_at == 1700000000
     assert updated.last_run_conversation_id == _uid("conv_x")
     assert updated.updated_at is not None
+
+
+def test_update_rebinds_agent_and_keeps_run_history(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """``update(agent_id=...)`` switches the harness without touching past runs.
+
+    This is what makes an in-place harness switch preferable to recreating the
+    task: the run rows stay attached to the same task id.
+    """
+    store.create(
+        scheduled_task_id=_uid("st_rebind"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        user_id="u",
+        agent_id=_uid("ag_old"),
+        timezone="UTC",
+    )
+    store.create_run(
+        run_id=_uid("sr_old"),
+        scheduled_task_id=_uid("st_rebind"),
+        status="succeeded",
+        scheduled_at=100,
+        conversation_id=_uid("conv_old"),
+        fired_at=101,
+        finished_at=102,
+    )
+
+    updated = store.update(_uid("st_rebind"), agent_id=_uid("ag_new"))
+    assert updated is not None
+    assert updated.agent_id == _uid("ag_new")
+    assert updated.updated_at is not None
+    reread = store.get(_uid("st_rebind"))
+    assert reread is not None and reread.agent_id == _uid("ag_new")
+
+    runs, _ = store.list_runs(_uid("st_rebind"))
+    assert [r.id for r in runs] == [_uid("sr_old")]
+    # The completed run keeps the conversation it actually ran in.
+    assert runs[0].conversation_id == _uid("conv_old")
+
+
+def test_update_omitting_agent_id_leaves_the_binding_unchanged(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """An ordinary edit must never silently retarget the harness."""
+    store.create(
+        scheduled_task_id=_uid("st_keepagent"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        user_id="u",
+        agent_id=_uid("ag_keep"),
+        timezone="UTC",
+    )
+    updated = store.update(_uid("st_keepagent"), name="renamed")
+    assert updated is not None
+    assert updated.agent_id == _uid("ag_keep")
 
 
 def test_update_noop_leaves_updated_at_none(store: SqlAlchemyScheduledTaskStore) -> None:

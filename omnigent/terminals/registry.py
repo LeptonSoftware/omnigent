@@ -39,11 +39,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+from omnigent.inner.os_env import OSEnvironment
 from omnigent.inner.terminal import TerminalInstance, create_terminal_instance
 
 logger = logging.getLogger(__name__)
@@ -101,6 +103,17 @@ class TerminalListEntry:
     instance: TerminalInstance
 
 
+class TerminalExitedDuringLaunch(RuntimeError):
+    """Retain a dead launch's captured evidence after its private server is closed."""
+
+    def __init__(self, instance: TerminalInstance) -> None:
+        self.instance = instance
+        super().__init__(
+            f"terminal {instance.name}:{instance.session_key} exited before it became available "
+            f"(exit status {instance.last_exit_status()})"
+        )
+
+
 class TerminalRegistry:
     """The single registry of per-conversation tmux terminal instances.
 
@@ -142,6 +155,7 @@ class TerminalRegistry:
         # Threading lock — see module docstring for the rationale.
         # Protects both ``_by_conversation`` and ``_instance_locks``.
         self._lock = threading.Lock()
+        self.environment_resolver: Callable[[str, OSEnvSpec], OSEnvironment] | None = None
 
     def conversation_link_for_id(self, conversation_id: str) -> str:
         """
@@ -218,11 +232,27 @@ class TerminalRegistry:
         # registry lock across them would serialize all conversations'
         # terminal spawns globally. Instead we re-check after the
         # spawn completes.
+        parent_environment = None
+        environment_spec = spec.os_env if isinstance(spec.os_env, OSEnvSpec) else parent_os_env
+        if (
+            environment_spec is not None
+            and environment_spec.sandbox is not None
+            and any(p.copy_on_write for p in environment_spec.sandbox.write_path_specs)
+        ):
+            if self.environment_resolver is None:
+                raise RuntimeError("copy_on_write terminals require a session resource registry")
+            parent_environment = self.environment_resolver(
+                conversation_id, parent_os_env or environment_spec
+            )
+        shared_environment_args = (
+            {"parent_environment": parent_environment} if parent_environment else {}
+        )
         created = create_terminal_instance(
             terminal_name,
             session_key,
             spec,
             parent_os_env_spec=parent_os_env,
+            **shared_environment_args,
             cwd_override=cwd_override,
             sandbox_override=sandbox_override,
             conversation_link=self.conversation_link_for_id(conversation_id),
@@ -238,9 +268,7 @@ class TerminalRegistry:
                     session_key,
                     conversation_id,
                 )
-            raise RuntimeError(
-                f"terminal {terminal_name}:{session_key} exited before it became available"
-            )
+            raise TerminalExitedDuringLaunch(created.instance)
 
         with self._lock:
             slot = self._by_conversation.setdefault(conversation_id, {})
@@ -431,6 +459,8 @@ class TerminalRegistry:
         conversation_id: str,
         terminal_name: str,
         session_key: str,
+        *,
+        expected: TerminalInstance | None = None,
     ) -> bool:
         """Close one terminal and remove it from the registry.
 
@@ -442,14 +472,23 @@ class TerminalRegistry:
         :param conversation_id: Owning conversation id.
         :param terminal_name: Terminal spec name.
         :param session_key: Session key.
+        :param expected: When given, close only if this exact instance
+            still occupies the key. A caller that wants to retract the
+            instance IT published must pass it: the key can have been
+            reassigned to a successor in the meantime, and closing by key
+            alone would terminate that successor instead. Compared under
+            the registry lock, so no other writer can swap the instance
+            between the check and the removal.
         :returns: ``True`` if a live instance was closed, ``False``
             if no live instance was found (already-closed or
-            never-launched).
+            never-launched), or if *expected* no longer occupies the key.
         """
         key = (terminal_name, session_key)
         with self._lock:
             slot = self._by_conversation.get(conversation_id)
             if slot is None:
+                return False
+            if expected is not None and slot.get(key) is not expected:
                 return False
             instance = slot.pop(key, None)
             if not slot:

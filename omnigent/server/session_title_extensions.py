@@ -192,6 +192,7 @@ def prepare_session_title(
     coordinator: BackgroundSessionTitleCoordinator | None,
     conversation: Conversation,
     event: SessionEventInput,
+    enabled: bool = True,
 ) -> PendingBackgroundSessionTitle | None:
     """Prepare a title attempt, extending upstream's rules to cover forks.
 
@@ -202,8 +203,13 @@ def prepare_session_title(
     :param coordinator: The title coordinator, or ``None`` when disabled.
     :param conversation: The session being dispatched to.
     :param event: The user event being forwarded.
+    :param enabled: Upstream's per-request user setting (see
+        ``background_session_titles_enabled``). ``False`` disables both the
+        fresh-session path and the fork-placeholder path.
     :returns: A pending attempt, or ``None`` when the session is ineligible.
     """
+    if not enabled:
+        return None
     if conversation.title is None:
         # Guard upstream's path: a whitespace-only message is truthy there, so
         # it would schedule generation on an empty prompt and yield no usable
@@ -211,7 +217,7 @@ def prepare_session_title(
         if not _fork_title_prompt(event).strip():
             return None
         return prepare_background_session_title(
-            coordinator=coordinator, conversation=conversation, event=event
+            coordinator=coordinator, conversation=conversation, event=event, enabled=enabled
         )
     if (
         not isinstance(coordinator, ForkAwareTitleCoordinator)
@@ -234,8 +240,8 @@ def prepare_session_title(
             model_override=conversation.model_override,
             sub_agent_name=conversation.sub_agent_name,
         ),
-        # CAS target: the placeholder itself.
-        expected_seed_title=conversation.title,
+        # CAS target: the caller schedules with the persisted title, which for
+        # this eligibility branch is the placeholder itself.
     )
 
 

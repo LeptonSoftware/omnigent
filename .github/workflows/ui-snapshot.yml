@@ -144,7 +144,7 @@ jobs:
           standalone: true
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: true
 
@@ -164,14 +164,15 @@ jobs:
       # + system deps under $PLAYWRIGHT_BROWSERS_PATH (/ms-playwright), so the
       # uv-synced playwright 1.60.0 finds them with no download.
 
-      - name: Build web SPA
-        # Build BEFORE pytest: Vite's emptyOutDir clobbers the static dir, so
-        # never run it alongside the live server.
+      - name: Build web SPA + Storybook
+        # Build BEFORE pytest: Vite's emptyOutDir clobbers the SPA static dir,
+        # and the component snapshot test reads Storybook's generated index.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
           pnpm install --frozen-lockfile --filter web
           pnpm --filter web run build
+          pnpm --filter web run build:storybook
 
       - name: Compare (PR) or regenerate (dispatch) the visual snapshots
         id: snapshot
