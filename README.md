@@ -378,6 +378,10 @@ To suppress the automatic browser tab, use `omni host --no-open` or set
 --background` and `omni start`. Sign-in may still open a browser; use
 `--non-interactive` in scripts to fail if sign-in is required.
 
+A session can also start itself: the **Automations** page runs an agent on a
+recurring schedule. See the [automations guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/AUTOMATIONS.md)
+for the schedule format, the REST API, and the current limits.
+
 <details>
 <summary>Customize automatic session titles</summary>
 
@@ -515,6 +519,9 @@ and they're in. Signup is invite-only.
 
 - **Share a live session.** Hit **Share** in the web UI and send the link;
   teammates watch your agent work and chat with it in real time.
+- **Share with everyone who can sign in.** Admins can allow public Edit in
+  **Settings > Sharing > Maximum public permission**. Owners then choose
+  **Share > General access > Edit**. The default stays Read.
 - **Leave a shared session.** Done with a session someone shared with you?
   Pick **Leave session** from its sidebar row menu to drop it from your
   sidebar. Nothing is deleted — the owner keeps it and can share it again.

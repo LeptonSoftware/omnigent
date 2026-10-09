@@ -106,8 +106,8 @@ HOST_PERMISSION_LEVEL: dict[str, int] = {
 }
 
 AGENT_KIND: dict[str, int] = {
-    "template": 1,
-    "session": 2,
+    "server": 1,
+    "user": 2,
 }
 
 POLICY_SCOPE: dict[str, int] = {

@@ -1,4 +1,5 @@
 name: Polly AI Review
+run-name: "Polly #${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }} @${{ inputs.expected_head || 'current' }}"
 
 # Spins up a local Omnigent server + runner inside the CI runner, starts a
 # Polly session with the PR diff, waits for the cross-vendor review to
@@ -7,7 +8,7 @@ name: Polly AI Review
 # Draft PRs are skipped (ready_for_review re-fires).
 #
 # Triggers:
-#   - pull_request opened/reopened/ready_for_review (automatic, once per PR)
+#   - pull_request_target opened/reopened/ready_for_review (same-repo PRs)
 #   - `/review` comment on a PR (manual retrigger by write-access users, or
 #     any login in the REVIEW_ALLOWLIST repo variable, a JSON array of strings)
 #   - workflow_dispatch with a PR number (manual retrigger from Actions tab,
@@ -18,7 +19,7 @@ name: Polly AI Review
 # review. `/review force` or the manual force input overrides that.
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, ready_for_review]
   issue_comment:
     types: [created]
@@ -27,6 +28,10 @@ on:
       pr:
         description: PR number to review.
         required: true
+        type: string
+      expected_head:
+        description: Optional commit expected by the requesting Resolve session.
+        required: false
         type: string
       force:
         description: Review even if this PR commit already has a review.
@@ -43,14 +48,11 @@ env:
   PIP_INDEX_URL: https://pypi.org/simple
 
 jobs:
-  # Security precondition gate (security-gate.yml): untrusted PRs wait for
-  # the scan; trusted authors pass through. Only runs on pull_request events.
-  # issue_comment and workflow_dispatch are gated by write-access or the
-  # REVIEW_ALLOWLIST (author_association / login check, plus GitHub's dispatch
-  # auth). Manual runs use the selected workflow commit; the target PR is
-  # fetched only as a diff, so the scan is not applicable.
+  # Automatic runs use trusted base code and exclude forks. Manual runs require
+  # write access or REVIEW_ALLOWLIST membership; forks retain the approval relay.
+  # PR changes are fetched only as a diff, never executed here.
   gate:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/security-gate.yml
 
   trigger:
@@ -99,7 +101,8 @@ jobs:
     if: >-
       !cancelled() && (
         (
-          github.event_name == 'pull_request' &&
+          github.event_name == 'pull_request_target' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
           !github.event.pull_request.draft &&
           needs.gate.result == 'success'
         ) ||
@@ -339,15 +342,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          EXPECTED_HEAD: ${{ inputs.expected_head }}
         run: |
           set -euo pipefail
 
           # Freeze both revisions so the file and review marker describe the same diff.
           gh pr view "$PR_NUMBER" --repo "$REPO" \
-            --json title,body,baseRefName,headRefName,baseRefOid,headRefOid,additions,deletions,changedFiles \
+            --json title,body,baseRefName,headRefName,baseRefOid,headRefOid,additions,deletions,changedFiles,labels \
             > /tmp/pr_meta.json
           base_sha="$(jq -r .baseRefOid /tmp/pr_meta.json)"
           head_sha="$(jq -r .headRefOid /tmp/pr_meta.json)"
+          if [ -n "${EXPECTED_HEAD:-}" ] && [ "$EXPECTED_HEAD" != "$head_sha" ]; then
+            echo "::error::PR moved before review started (expected $EXPECTED_HEAD, found $head_sha); request the new commit."
+            exit 1
+          fi
           gh api "repos/${REPO}/compare/${base_sha}...${head_sha}" \
             -H "Accept: application/vnd.github.v3.diff" \
             > /tmp/pr_diff.txt
@@ -476,12 +484,36 @@ jobs:
           backend, refactor, test, or docs changes with no user-visible effect.
           """ if is_external else ""
 
+          # Nudge, never block, when a PR changes user-facing code that the
+          # verify-omnigent feature map describes.
+          changed_paths = re.findall(
+              r"^diff --git a/(\S+) b/",
+              pathlib.Path("/tmp/pr_diff.txt").read_text(encoding="utf-8", errors="replace"),
+              flags=re.M,
+          )
+          touches_entry_points = any(
+              (path.startswith(("web/src/", "omnigent/harnesses/")) or re.fullmatch(r"omnigent/cli\w*\.py", path))
+              and not re.search(r"\.(test|stories)\.[jt]sx?$", path)
+              for path in changed_paths
+          )
+          feature_map_rule = """
+          **Feature map** — this PR changes user-facing code. Read
+          `feature-map/` from the `main` checkout: each
+          file lists every user entry point for one feature. If the diff adds,
+          removes, or renames an entry point (a button, menu item, route, dialog,
+          CLI command or flag, or a per-harness path) in a feature a file covers,
+          and that file does not reflect the change, add a **Non-blocking note**
+          naming the feature file and the entry point to update. Never blocking.
+          Skip areas listed under "Not yet mapped" in `feature-map/README.md`.
+          """ if touches_entry_points else ""
+
           prompt = f"""Review this pull request and provide structured feedback.
 
           ## PR Metadata
           - **Title:** {meta['title']}
           - **Branch:** {meta['headRefName']} → {meta['baseRefName']}
           - **Diff revisions:** {meta['baseRefOid']}...{meta['headRefOid']}
+          - **Labels:** {', '.join(l['name'] for l in meta.get('labels') or []) or '(none)'}
           - **Stats:** +{meta['additions']} / -{meta['deletions']} across {meta['changedFiles']} file(s)
 
           ## PR Description
@@ -541,7 +573,11 @@ jobs:
           ### Tests
           Include a compact table with columns: Test / case, Behavior protected,
           Layer, Needed?, and Action / rationale. Use exact file paths and test/case
-          names. Account for every added, modified, or removed test; parameterized
+          names in the table. When only one test/support file changed, you may
+          name its exact path in the Tests subsection above the table and use
+          case names alone in the rows; otherwise include the file path in the
+          rows for each changed file.
+          Account for every added, modified, or removed test; parameterized
           cases may share a row only when their purpose and recommendation match.
           Use one of keep, consolidate, move layer, remove, or uncertain in Needed?,
           and explain each one. All five fields are required for each assessment row.
@@ -588,6 +624,20 @@ jobs:
           conditions and exceptions; treat recommendations as contextual guidance,
           not automatic blockers. Cite the relevant section and concrete file/line
           evidence for each finding. Do not flag unchanged historical violations.
+
+          For routing changes, consider `host_id` sharding, including parent-host
+          inheritance and retry affinity. Report verified bugs only under **Blocking issues**
+          using the existing criteria; add no separate section or status note.
+
+          **Client/server compatibility:** clients (web, Android, CLI, host/runner)
+          and servers can run different versions. Treat breaking changes to the
+          contract between them (HTTP routes, WebSocket/host frames, request and
+          response fields, enums, status codes) as broken contracts: removed or
+          renamed endpoints or fields, new required inputs, changed types or
+          semantics, or a client calling a new server API without a fallback for
+          older servers. Additive changes that old peers ignore are fine. Skip this
+          finding only when the PR has the `intentional-api-break` label (applied by
+          a maintainer); the PR description alone does not waive it.
 
           **PR scope:** Review the full diff, including pre-existing changes, against
           one concrete reported problem or requested outcome. Establish that outcome
@@ -675,6 +725,7 @@ jobs:
           - Each sandbox deserves its own extra.
           - Nothing else warrants a new extra — flag any new extras that don't fit one of these three categories as a blocking issue.
           {visual_demo_rule}
+          {feature_map_rule}
           IMPORTANT: Your output will be posted directly as a PR comment. Output
           ONLY the final structured review — no coordination messages, no status
           updates about dispatching sub-agents, no referring to "reviewers", no "waiting for results" narration.
@@ -684,6 +735,14 @@ jobs:
           """
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
+
+      # Resolve reads these runner-generated headers even if review later times out.
+      - name: Record review target
+        if: steps.ctx.outcome == 'success'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
+        run: ':'
 
       - name: Mint App token
         id: app-token
@@ -804,6 +863,7 @@ jobs:
           fi
 
       - name: Post review comment
+        id: publish
         if: steps.polly.outputs.review_text != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
@@ -818,6 +878,7 @@ jobs:
           {
             echo "<!-- polly-review-bot -->"
             echo "<!-- polly-reviewed-sha: ${HEAD_SHA} -->"
+            echo "<!-- polly-review-run:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT} -->"
             echo "## <img src=\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\" alt=\"\" height=\"20\" valign=\"middle\" /> Polly AI Review"
             echo ""
             cat /tmp/polly_review.txt
@@ -830,7 +891,18 @@ jobs:
           # `/review` comment, or maintainer approval) is visible in the thread
           # and notifies watchers — no in-place upsert of a prior comment.
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
+          printf '%s\n' "$HEAD_SHA" > /tmp/polly-completed-sha.txt
           echo "Created new comment"
+
+      - name: Upload Polly completion receipt
+        if: steps.publish.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: polly-completed-${{ steps.pr.outputs.pr_number }}-${{ steps.ctx.outputs.head_sha }}
+          path: /tmp/polly-completed-sha.txt
+          overwrite: true
+          retention-days: 90
+          if-no-files-found: error
 
       # Successful slow runs need the same evidence as failed reviews.
       - name: Prepare Polly diagnostics
