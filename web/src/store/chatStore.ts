@@ -85,10 +85,7 @@ import type {
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { randomUUID } from "@/lib/randomUUID";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
-import {
-  createInitialConversationState,
-  isConversationStateKey,
-} from "./conversationState";
+import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import {
   SSE_STALL_TIMEOUT_MS,
@@ -2987,7 +2984,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       getInteraction.fail();
       throw error;
     }
-
   },
 
   submitApproval: async (elicitationId, action, content, meta, conversationId) => {
@@ -3387,9 +3383,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       pageSet({ loadingMoreHistory: false, hasMoreHistory: false });
     }
   },
-
-
-
 }));
 
 // ── Store-action setter ──────────────────────────────────
@@ -4597,7 +4590,7 @@ async function bindStream(
         historyGeneration: state.historyGeneration + 1,
         // ...and re-derive the render window against this history, rather
         // than inheriting a hidden count that described the old one.
-              // The voided page's stale early-return skips its own flag clear.
+        // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
         sessionStatus: session.status,
         // Mid-turn first open: the snapshot carries the in-flight turn's
@@ -5232,7 +5225,7 @@ async function rehydrateWindowOnReconnect(
       // The window cursor was reset: void any in-flight loadMoreHistory.
       historyGeneration: s.historyGeneration + 1,
       // ...and re-derive the render window against this history.
-        };
+    };
   });
 }
 
