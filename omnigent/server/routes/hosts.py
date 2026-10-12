@@ -78,7 +78,6 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import (
     HOST_LEVEL_READ,
     HOST_LEVEL_USE,
-    Host,
     HostStore,
     host_is_live,
 )

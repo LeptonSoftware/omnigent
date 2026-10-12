@@ -1033,6 +1033,7 @@ class HostStore:
                 .all()
             )
             return [_row_to_grant(row) for row in rows]
+
     def list_current_managed_sandbox_hosts_page(
         self,
         *,

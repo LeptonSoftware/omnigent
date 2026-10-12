@@ -252,7 +252,8 @@ export default defineConfig(({ command }) => ({
       ? []
       : [babel({ presets: [reactCompilerPresetWithoutTests()] })]),
     tailwindcss(),
-  ],  resolve: {
+  ],
+  resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
     },
