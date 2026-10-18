@@ -89,6 +89,7 @@ from omnigent.server.background_session_titles import (
     RunnerBackgroundTitleGenerator,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
+from omnigent.server.health_fast_path import HealthFastPathMiddleware  # fork
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_pool import ServerMcpPool
@@ -4287,6 +4288,8 @@ def create_app(
 
     app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
     app.add_middleware(PublicSharingPolicyMiddleware, max_level=app.state.public_sharing_max_level)
+    # Fork: the bare liveness probe answers ahead of the app middleware stack.
+    app.add_middleware(HealthFastPathMiddleware, base_path=resolved_base_path or "")
     if resolved_base_path:
         # Added last → outermost ASGI layer, so the prefix is stripped before
         # routing and every other middleware sees canonical `/v1/...` paths.
