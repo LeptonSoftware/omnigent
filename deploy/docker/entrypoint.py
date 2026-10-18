@@ -29,6 +29,9 @@ Configuration is via environment variables:
                         Defaults to ``/data/artifacts`` (the volume
                         mount point used by docker-compose).
   HOST, PORT            Bind address. Default ``0.0.0.0:8000``.
+  OMNIGENT_HOST_SHARDED Fork. ``1`` when several replicas sit behind a router
+                        that hashes the slice key (see
+                        ``deploy/lepton/multi_replica``). Default off.
 """
 
 from __future__ import annotations
@@ -350,6 +353,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     them explicitly after config resolution and before store construction.
     """
     from omnigent.server.app import create_app
+    from omnigent.server.instance_role import host_sharded_by_env  # fork
     from omnigent.server.server_config import config_str_list
 
     if resolved_config is None:
@@ -515,6 +519,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         github_store=github_store,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
+        host_sharded=host_sharded_by_env(),  # fork: OMNIGENT_HOST_SHARDED
     )
 
     log_capabilities(sandbox_config, github_config, github_store)

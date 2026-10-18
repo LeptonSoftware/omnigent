@@ -254,6 +254,45 @@ def test_build_app_wires_every_router_gating_store(
         )
 
 
+@pytest.mark.parametrize(("env_value", "expected"), [(None, False), ("1", True), ("0", False)])
+def test_build_app_passes_host_sharded_from_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_value: str | None, expected: bool
+) -> None:
+    """Fork: ``OMNIGENT_HOST_SHARDED=1`` reaches ``create_app(host_sharded=True)``.
+
+    Without it, replicas behind a slice-key router answer 409 "host is
+    offline" for a live host whose tunnel sits on another replica, and the web
+    client never re-addresses.
+    """
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("{}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config_file))
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'entrypoint.db'}")
+    monkeypatch.setenv("ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.delenv("OMNIGENT_ARTIFACT_URI", raising=False)
+    if env_value is None:
+        monkeypatch.delenv("OMNIGENT_HOST_SHARDED", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_HOST_SHARDED", env_value)
+
+    import omnigent.server.app as app_module
+
+    captured: dict[str, object] = {}
+
+    def _capture(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(app_module, "create_app", _capture)
+
+    from deploy.docker.entrypoint import build_app
+
+    build_app()
+
+    assert captured["host_sharded"] is expected
+
+
 # ── routing wiring ────────────────────────────────────────────────────────
 # A Docker deploy must honour its own `routing:` block rather than running on
 # all-default knobs, so the settings that reach RuntimeCaps are the parsed ones.
