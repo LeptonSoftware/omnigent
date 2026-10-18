@@ -90,6 +90,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.health_fast_path import HealthFastPathMiddleware  # fork
+from omnigent.server.instance_role import DISABLE_SCHEDULER_ENV, scheduler_disabled_by_env  # fork
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_pool import ServerMcpPool
@@ -1771,22 +1772,28 @@ def create_app(
             # allowing a paused task to fire. Exposed on app.state for the
             # POST /v1/scheduled-tasks/{id}/run route.
             app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
-            scheduled_task_scheduler = ScheduledTaskScheduler(
-                store=scheduled_task_store,
-                on_fire=on_fire,
-            )
-            app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
-            # Scheduled tasks are a non-critical subsystem: a failure loading the
-            # schedule (e.g. a DB error listing active tasks) must not take
-            # down server boot. Log and continue with the scheduler unstarted.
-            try:
-                await scheduled_task_scheduler.start()
-            except Exception as exc:
-                _logger.exception(
-                    "scheduled task scheduler failed to start; continuing "
-                    "without recurring tasks (%s)",
-                    exc,
+            if scheduler_disabled_by_env():  # fork: shadow instance on a shared DB
+                _logger.warning(
+                    "%s is set: recurring scheduled tasks are not armed on this instance",
+                    DISABLE_SCHEDULER_ENV,
                 )
+            else:
+                scheduled_task_scheduler = ScheduledTaskScheduler(
+                    store=scheduled_task_store,
+                    on_fire=on_fire,
+                )
+                app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
+                # Scheduled tasks are a non-critical subsystem: a failure loading the
+                # schedule (e.g. a DB error listing active tasks) must not take
+                # down server boot. Log and continue with the scheduler unstarted.
+                try:
+                    await scheduled_task_scheduler.start()
+                except Exception as exc:
+                    _logger.exception(
+                        "scheduled task scheduler failed to start; continuing "
+                        "without recurring tasks (%s)",
+                        exc,
+                    )
 
             # Run completion is event-driven (persist_scheduled_run_completion
             # fires from _publish_status the instant a fired conversation's turn
