@@ -58,6 +58,7 @@ from collections.abc import Callable
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
@@ -476,12 +477,16 @@ def create_oauth_token_router(
             if handle_device_code is None:
                 return _oauth_error("unsupported_grant_type")
             try:
-                return handle_device_code(str(form.get("device_code") or ""))
+                return await run_in_threadpool(
+                    handle_device_code, str(form.get("device_code") or "")
+                )
             except OmnigentError:
                 return _oauth_error("invalid_grant")
         if grant_type == "refresh_token":
             try:
-                return _handle_refresh_grant(str(form.get("refresh_token") or ""))
+                return await run_in_threadpool(
+                    _handle_refresh_grant, str(form.get("refresh_token") or "")
+                )
             except OmnigentError:
                 return _oauth_error("invalid_grant")
         if grant_type == "client_credentials":

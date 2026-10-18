@@ -114,6 +114,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
 )
+from omnigent.server.harness_cache import cache_resolved_harness  # fork
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     MANAGED_SANDBOX_LABEL_NAMESPACE,
@@ -1884,6 +1885,7 @@ def _resolve_harness(*args: Any, **kwargs: Any) -> str | None:
     return _facade._resolve_harness(*args, **kwargs)
 
 
+@cache_resolved_harness  # fork: skip the agent-store read on repeat snapshots
 def _resolve_harness_impl(
     conv: Conversation | None,
     *,

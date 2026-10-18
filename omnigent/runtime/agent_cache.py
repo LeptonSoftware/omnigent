@@ -103,6 +103,11 @@ class AgentCache:
             raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
         return path
 
+    def cached_location(self, agent_id: str) -> str | None:
+        """Bundle location of the in-memory spec for *agent_id*, or ``None``."""
+        cached = self._specs.get(agent_id)
+        return cached[0] if cached is not None else None
+
     def load(
         self,
         agent_id: str,

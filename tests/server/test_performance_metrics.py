@@ -659,7 +659,7 @@ async def test_middleware_sets_request_id_header_and_access_log_context(
     monkeypatch.setattr(server_app, "set_request_user_agent_for_access_log", spy_ua)
     monkeypatch.setattr(server_app, "set_request_session_id_for_access_log", spy_sid)
 
-    resp = await client.get("/health")
+    resp = await client.get("/api/version")  # fork: bare /health skips the middleware stack
 
     assert resp.status_code == 200
     assert "x-request-id" in resp.headers
@@ -672,7 +672,7 @@ async def test_middleware_sets_request_id_header_and_access_log_context(
     assert captured_uas[0] is not None  # httpx sends a User-Agent
 
     assert len(captured_sids) == 1
-    assert captured_sids[0] is None  # /health has no session ID
+    assert captured_sids[0] is None  # /api/version has no session ID
 
 
 @pytest.mark.asyncio

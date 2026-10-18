@@ -60,7 +60,7 @@ from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
-from omnigent.server.host_access import host_access_allowed  # fork: shared team hosts
+from omnigent.server.host_access import host_access_allowed_async  # fork: shared team hosts
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import (
@@ -78,7 +78,6 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import (
     HOST_LEVEL_READ,
     HOST_LEVEL_USE,
-    Host,
     HostStore,
     host_is_live,
 )
@@ -761,7 +760,7 @@ def create_hosts_router(
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
         # Fork: shared team hosts — owner OR a grantee at this level.
-        if not host_access_allowed(host, user_id, host_store, HOST_LEVEL_READ):
+        if not await host_access_allowed_async(host, user_id, host_store, HOST_LEVEL_READ):
             raise HTTPException(status_code=403, detail="not your host")
 
         # Status comes from the DB so the answer is consistent across
@@ -804,7 +803,7 @@ def create_hosts_router(
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
         # Fork: shared team hosts — owner OR a grantee at this level.
-        if not host_access_allowed(host, user_id, host_store, HOST_LEVEL_USE):
+        if not await host_access_allowed_async(host, user_id, host_store, HOST_LEVEL_USE):
             raise HTTPException(status_code=403, detail="not your host")
         conn = host_registry.get(host.host_id)
         if conn is None:
@@ -1328,7 +1327,7 @@ def create_hosts_router(
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
         # Fork: shared team hosts — owner OR a grantee at this level.
-        if not host_access_allowed(host, user_id, host_store, HOST_LEVEL_USE):
+        if not await host_access_allowed_async(host, user_id, host_store, HOST_LEVEL_USE):
             raise HTTPException(status_code=403, detail="not your host")
 
         if "\x00" in path:
@@ -1410,7 +1409,7 @@ def create_hosts_router(
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
         # Fork: shared team hosts — owner OR a grantee at this level.
-        if not host_access_allowed(host, user_id, host_store, HOST_LEVEL_USE):
+        if not await host_access_allowed_async(host, user_id, host_store, HOST_LEVEL_USE):
             raise HTTPException(status_code=403, detail="not your host")
 
         path = body.path
@@ -1767,7 +1766,7 @@ def create_hosts_router(
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
         # Fork: shared team hosts — owner OR a grantee at this level.
-        if not host_access_allowed(host, user_id, host_store, HOST_LEVEL_USE):
+        if not await host_access_allowed_async(host, user_id, host_store, HOST_LEVEL_USE):
             raise HTTPException(status_code=403, detail="not your host")
 
         if not path.strip():
