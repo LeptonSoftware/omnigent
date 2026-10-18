@@ -1,9 +1,14 @@
-import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Agent } from "./useAgents";
 import { authenticatedFetch } from "@/lib/identity";
 import { apiErrorFromResponse } from "@/lib/sessionsApi";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
-import { installAgentBundle } from "@/lib/agentsApi";
+import {
+  getAgentConfig,
+  patchAgentConfig,
+  type AgentConfigPatch,
+  installAgentBundle,
+} from "@/lib/agentsApi";
 
 export interface ManagedAgent extends Agent {
   harness: string | null;
@@ -12,6 +17,10 @@ export interface ManagedAgent extends Agent {
   updated_at: number | null;
   builtin: boolean;
   skills: { name: string; description: string }[];
+}
+
+interface ManagedAgentDetail extends ManagedAgent {
+  user_owned?: boolean;
 }
 
 interface AgentPage {
@@ -35,6 +44,20 @@ export function useCustomAgents(scope: "server" | "user", enabled: boolean) {
     },
     getNextPageParam: (page) => (page.has_more ? page.last_id : undefined),
     enabled,
+  });
+}
+
+export function useCustomAgent(id: string | undefined, enabled: boolean) {
+  return useQuery({
+    queryKey: ["settings-agents", "detail", id],
+    queryFn: async ({ signal }): Promise<ManagedAgentDetail | null> => {
+      const res = await authenticatedFetch(`/v1/agents/${encodeURIComponent(id!)}`, { signal });
+      if (res.status === 404) return null;
+      if (!res.ok) throw await apiErrorFromResponse(res);
+      return res.json();
+    },
+    enabled: enabled && id !== undefined,
+    retry: false,
   });
 }
 
@@ -84,4 +107,26 @@ function refreshAgents(client: ReturnType<typeof useQueryClient>) {
   ]) {
     void client.invalidateQueries({ queryKey: [key] });
   }
+}
+
+export function useCustomAgentConfig(id: string) {
+  return useQuery({
+    queryKey: ["settings-agents", "config", id],
+    queryFn: ({ signal }) => getAgentConfig(id, signal),
+    gcTime: 0,
+    retry: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  });
+}
+
+export function usePatchCustomAgent(id: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ etag, patch }: { etag: string; patch: AgentConfigPatch }) =>
+      patchAgentConfig(id, etag, patch),
+    retry: false,
+    gcTime: 0,
+    onSuccess: () => refreshAgents(client),
+  });
 }

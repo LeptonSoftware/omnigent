@@ -5,10 +5,13 @@ from the store and loads its spec. Every session snapshot does it, and agent
 specs almost never change, so the answer is kept for a few seconds.
 
 An entry is dropped early when the agent cache's in-memory spec for that agent
-now comes from a different bundle (an edit goes through ``AgentCache.replace``),
-so an in-process edit shows on the next read. The TTL bounds staleness for
-edits made by another process. Only successful lookups of an existing agent
-are cached; ``None`` answers and errors always re-resolve.
+now comes from a different bundle or is gone. In-process edits do one of the
+two: MCP edits call ``AgentCache.replace``, and the in-place
+``PATCH /v1/agents/{id}`` (``AgentStore.update_configuration``) and reinstalls
+call ``AgentCache.evict``. Either way the edit shows on the next read. The TTL
+bounds staleness for edits made by another process, such as another replica.
+Only successful lookups of an existing agent are cached; ``None`` answers and
+errors always re-resolve.
 """
 
 from __future__ import annotations
