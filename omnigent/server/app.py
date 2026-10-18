@@ -88,6 +88,7 @@ from omnigent.server.auth import (
 from omnigent.server.background_session_titles import (
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.fast_json import install as install_fast_json  # fork
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.health_fast_path import HealthFastPathMiddleware  # fork
 from omnigent.server.instance_role import DISABLE_SCHEDULER_ENV, scheduler_disabled_by_env  # fork
@@ -4295,6 +4296,7 @@ def create_app(
 
     app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
     app.add_middleware(PublicSharingPolicyMiddleware, max_level=app.state.public_sharing_max_level)
+    install_fast_json()  # fork: one-pass pydantic JSON for response_model=None routes
     # Fork: the bare liveness probe answers ahead of the app middleware stack.
     app.add_middleware(HealthFastPathMiddleware, base_path=resolved_base_path or "")
     if resolved_base_path:
