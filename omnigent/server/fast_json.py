@@ -30,6 +30,8 @@ import fastapi.routing
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
+from omnigent.server.server_timing import encode_phase
+
 FAST_JSON_ENV = "OMNIGENT_FAST_JSON"
 
 
@@ -44,11 +46,12 @@ _original_render = JSONResponse.render
 async def _serialize_response(*, field: Any = None, response_content: Any, **kwargs: Any) -> Any:
     # FastAPI's field-less branch calls ``jsonable_encoder(response_content)``
     # with defaults only (by_alias=True, no include/exclude), so this mirrors it.
-    if field is None and isinstance(response_content, BaseModel):
-        return PreEncodedJSON(response_content.model_dump_json(by_alias=True).encode("utf-8"))
-    return await _original_serialize_response(
-        field=field, response_content=response_content, **kwargs
-    )
+    with encode_phase():
+        if field is None and isinstance(response_content, BaseModel):
+            return PreEncodedJSON(response_content.model_dump_json(by_alias=True).encode("utf-8"))
+        return await _original_serialize_response(
+            field=field, response_content=response_content, **kwargs
+        )
 
 
 def _render(self: JSONResponse, content: Any) -> bytes:
