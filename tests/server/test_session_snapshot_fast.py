@@ -30,7 +30,7 @@ __all__ = ["realistic", "realistic_app"]
 # sha256 of upstream ``_get_session_snapshot``'s source. When an upstream sync
 # changes that function, this fails: port the change to
 # ``omnigent/server/session_snapshot_fast.py``, then update the hash.
-UPSTREAM_SNAPSHOT_SHA256 = "43639fdc5c0992617147bff524623142a5d2631a1244947f40a4f7ef1bfa13a2"
+UPSTREAM_SNAPSHOT_SHA256 = "55601ab313c89574a14425976e1a4bfbb2f2a0b566bad5b64cfe9c0f473c1b69"
 
 
 def _no_change(session: RealisticSession) -> None:

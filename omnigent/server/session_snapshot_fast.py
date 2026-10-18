@@ -42,7 +42,7 @@ from omnigent.entities import Conversation, ConversationItem
 from omnigent.errors import OmnigentError
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server import server_timing
+from omnigent.server import server_timing, session_live_state
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._sessions import orchestration as _orch
 from omnigent.server.schemas import SessionResponse
@@ -195,14 +195,17 @@ def _read_agent_lane(
                     if conv.sub_agent_name:
                         sub_spec = _orch._find_spec_by_name(loaded.spec, conv.sub_agent_name)
                         if sub_spec is None:
-                            _orch._logger.warning(
-                                "Sub-agent %r for session %s did not resolve in the parent "
-                                "spec; snapshot reports the parent's identity. Likely a "
-                                "renamed/removed sub-agent or stale session metadata.",
-                                conv.sub_agent_name,
-                                conv.id,
-                                extra={"session_id": conv.id},
-                            )
+                            # A native sub-agent is named by the CLI, never by the spec.
+                            wrapper = conv.labels.get(_orch._CLAUDE_NATIVE_WRAPPER_LABEL_KEY, "")
+                            if not wrapper.endswith("-subagent"):
+                                _orch._logger.warning(
+                                    "Sub-agent %r for session %s did not resolve in the parent "
+                                    "spec; snapshot reports the parent's identity. Likely a "
+                                    "renamed/removed sub-agent or stale session metadata.",
+                                    conv.sub_agent_name,
+                                    conv.id,
+                                    extra={"session_id": conv.id},
+                                )
                         else:
                             resolved_spec = sub_spec
                     if resolved_spec is not None:
@@ -339,7 +342,23 @@ async def get_session_snapshot(
     last_task_error = _orch._last_task_error_from_labels(conv.labels)
     if runner_exit_reports is not None and conv.runner_id is not None:
         exit_error = runner_exit_reports.get(conv.runner_id)
-        if exit_error is not None:
+        runner_ran = (
+            runner_exit_reports.was_connected(conv.runner_id)
+            or session_live_state.last_liveness_stamp(conv.runner_id) is not None
+        )
+        # A cause recorded by a previous runner attempt is stale once a new
+        # runner is bound; surface that runner's exit instead of hiding it.
+        cause_runner = _orch._last_task_error_runner_id_from_labels(conv.labels)
+        stale_cause = (
+            last_task_error is not None
+            and cause_runner is not None
+            and cause_runner != conv.runner_id
+        )
+        if (
+            exit_error is not None
+            and (status != "idle" or not runner_ran)
+            and (status != "failed" or last_task_error is None or stale_cause)
+        ):
             last_task_error = {"code": "runner_failed_to_start", "message": exit_error}
             status = "failed"
     llm_model = agent_reads.llm_model
