@@ -1318,6 +1318,7 @@ def _build_session_response(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     side_chat_sealed: bool = False,
+    resolved_harness: tuple[str | None] | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -1385,6 +1386,9 @@ def _build_session_response(
         ``None`` is treated as ``[]``.
     :param agent_store: Optional store used to resolve the session harness.
     :param agent_cache: Optional cache used to load the session harness spec.
+    :param resolved_harness: The harness already resolved off the event loop,
+        as a 1-tuple (``(None,)`` is a resolved "unknown"). ``None`` resolves
+        it here, which reads the agent store synchronously.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -1398,7 +1402,11 @@ def _build_session_response(
     # usage. Shared by the cost indicator and the per-model breakdown so
     # both read the same numbers.
     display_usage = subtree_usage if subtree_usage is not None else (conv.session_usage or {})
-    harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+    harness = (
+        resolved_harness[0]
+        if resolved_harness is not None
+        else _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+    )
     # Collapse per-user pin keys to the canonical bare key for this viewer, so
     # the snapshot never carries another user's pin key (see _labels_for_viewer).
     labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
@@ -12631,6 +12639,12 @@ async def _get_session_snapshot(
         viewer_id=viewer_id,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        # Fork: the harness lookup reads the agent store; resolve it in a worker.
+        resolved_harness=(
+            await asyncio.to_thread(
+                _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+            ),
+        ),
     )
     response.inference_configured = inference_configured
     response.inference_error = inference_error

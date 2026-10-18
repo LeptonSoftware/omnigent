@@ -21,6 +21,8 @@ It is not a sandbox — the grant is the whole trust decision.
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import HTTPException
 
 from omnigent.db.enum_codecs import encode_host_permission_level
@@ -54,6 +56,29 @@ def host_access_allowed(
         return False
     # Levels are ordered by privilege, so "at least" is a code comparison.
     return encode_host_permission_level(granted) >= encode_host_permission_level(required_level)
+
+
+async def host_access_allowed_async(
+    host: Host,
+    user_id: str | None,
+    host_store: HostStore,
+    required_level: str = HOST_LEVEL_USE,
+) -> bool:
+    """:func:`host_access_allowed` for ``async`` route handlers.
+
+    The owner check needs no store read and answers inline. The grant lookup is
+    a synchronous DB query, so it runs in a worker thread rather than stalling
+    the event loop that every other request shares.
+
+    :param host: The already-loaded host record.
+    :param user_id: Authenticated caller, or ``None`` when auth is disabled.
+    :param host_store: Store used to look up an access grant.
+    :param required_level: ``"read"`` or ``"use"`` (default).
+    :returns: ``True`` when the caller owns the host or holds a sufficient grant.
+    """
+    if user_id is None or host.user_id == user_id:
+        return True
+    return await asyncio.to_thread(host_access_allowed, host, user_id, host_store, required_level)
 
 
 def resolve_host_access(

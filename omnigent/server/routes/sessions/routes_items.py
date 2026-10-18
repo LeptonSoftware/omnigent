@@ -106,7 +106,8 @@ def register_items_routes(
             before=before,
             order=order,
         )
-        data = [m.to_api_dict() for m in page.data]
+        # Fork: a page is up to 1000 model dumps; build them in a worker.
+        data = await asyncio.to_thread(lambda: [m.to_api_dict() for m in page.data])
         return PaginatedList(
             data=data,
             first_id=page.first_id,
