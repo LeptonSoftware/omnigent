@@ -53,6 +53,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import server_timing  # fork
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -204,6 +205,9 @@ from omnigent.server.schemas import (
     SessionProjectSummary,
     SessionResponse,
     UpdateSessionRequest,
+)
+from omnigent.server.session_snapshot_fast import (
+    get_session_snapshot as fast_session_snapshot,  # fork
 )
 from omnigent.server.session_title_extensions import TITLE_AUTO_LABEL  # fork
 from omnigent.stores import AgentStore, ConversationStore
@@ -1324,6 +1328,7 @@ def register_core_routes(
         :raises OmnigentError: 404 if no session exists.
         """
         response.headers["Cache-Control"] = "no-store"
+        timing = server_timing.start("get_session", response, session_id)  # fork
         user_id = _get_user_id(request, auth_provider)
         # Single permission pass: authorize + resolve the display level +
         # fetch the conversation once, then reuse the conversation in the
@@ -1333,7 +1338,8 @@ def register_core_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        return await _get_session_snapshot(
+        timing.mark("auth")  # fork
+        return await fast_session_snapshot(
             conversation_store,
             session_id,
             access.level,
