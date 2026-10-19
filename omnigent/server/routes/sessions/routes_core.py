@@ -1809,6 +1809,148 @@ def register_core_routes(
 
     # ── WS /sessions/updates ────────────────────────────────────
 
+    @dataclasses.dataclass(frozen=True)
+    class _WatchedRowInputs:
+        """The stored inputs of one session-list row, as last read."""
+
+        conv: Conversation
+        grants: list[SessionPermission]
+        child_session_ids: list[str]
+        comments_fingerprint: CommentsFingerprint | None
+        agent_name: str | None
+
+    async def _load_watched_inputs(
+        watched: list[str],
+        user_id: str | None,
+    ) -> tuple[dict[str, _WatchedRowInputs], bool]:
+        """
+        Read the stored inputs of the watched sessions the user can access.
+
+        Ids the user cannot access, that don't exist, or that aren't
+        sessions (no ``agent_id``) are omitted.
+
+        :param watched: Conversation ids, e.g. ``["conv_abc", "conv_def"]``.
+        :param user_id: The authenticated user, or ``None`` when
+            permissions are disabled, e.g. ``"alice@example.com"``.
+        :returns: Inputs per accessible session id in ``watched`` order,
+            and the user's admin flag.
+        """
+        if not watched:
+            return {}, False
+        if permission_store is not None:
+            perms_by_conv = await asyncio.to_thread(permission_store.list_for_sessions, watched)
+            user_is_admin = (
+                await asyncio.to_thread(permission_store.is_admin, user_id)
+                if user_id is not None
+                else False
+            )
+            accessible = [
+                cid
+                for cid in watched
+                if _permission_level_from_grants(
+                    user_id, perms_by_conv.get(cid, []), user_is_admin
+                )
+                is not None
+            ]
+        else:
+            perms_by_conv = {}
+            user_is_admin = False
+            accessible = list(watched)
+        if not accessible:
+            return {}, user_is_admin
+
+        def _load_sessions(ids: list[str]) -> list[Conversation]:
+            """Bulk-load the accessible conversations that are sessions
+            (non-null ``agent_id``) in one batched store call, preserving
+            the caller's id order for deterministic output."""
+            by_id = conversation_store.get_conversations(ids)
+            return [
+                conv
+                for cid in ids
+                if (conv := by_id.get(cid)) is not None and conv.agent_id is not None
+            ]
+
+        convs = await asyncio.to_thread(_load_sessions, accessible)
+        if not convs:
+            return {}, user_is_admin
+        unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
+        conv_ids = [c.id for c in convs]
+        agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
+            asyncio.to_thread(agent_store.get_names, unique_agent_ids),
+            asyncio.to_thread(
+                conversation_store.list_child_conversation_ids_by_parent,
+                conv_ids,
+            ),
+            _comments_fingerprints_for(conv_ids),
+        )
+        inputs = {
+            conv.id: _WatchedRowInputs(
+                conv=conv,
+                grants=perms_by_conv.get(conv.id, []),
+                child_session_ids=child_ids_by_parent[conv.id],
+                comments_fingerprint=comments_fingerprints.get(conv.id),
+                agent_name=agent_names_by_id.get(conv.agent_id) if conv.agent_id else None,
+            )
+            for conv in convs
+        }
+        return inputs, user_is_admin
+
+    async def _build_watched_items(
+        rows: list[_WatchedRowInputs],
+        user_id: str | None,
+        user_is_admin: bool,
+    ) -> list[dict[str, Any]]:
+        """
+        Build list-item payloads from stored inputs plus live in-memory state.
+
+        Pending approvals, status, read state and liveness are read here,
+        every call, so they are never served from a cache of stored rows.
+
+        :param rows: Stored inputs, in output order.
+        :param user_id: The authenticated user, or ``None``.
+        :param user_is_admin: Whether ``user_id`` is an admin.
+        :returns: One JSON-ready dict per row.
+        """
+        if not rows:
+            return []
+        pending_counts = pending_elicitations.counts_for([row.conv.id for row in rows])
+        items = [
+            _build_session_list_item(
+                row.conv,
+                agent_names_by_id=(
+                    {row.conv.agent_id: row.agent_name}
+                    if row.conv.agent_id is not None and row.agent_name is not None
+                    else {}
+                ),
+                grants=row.grants,
+                user_id=user_id,
+                user_is_admin=user_is_admin,
+                permissions_enabled=permission_store is not None,
+                pending_count=pending_counts.get(row.conv.id, 0),
+                child_session_ids=row.child_session_ids,
+                comments_fingerprint=row.comments_fingerprint,
+            )
+            for row in rows
+        ]
+        await _apply_liveness_to_items(items, liveness_lookup)
+        # Full-row dumps (every field, nulls included) — NOT exclude_none. The
+        # stream is a diff source: the client overlays these onto its cached
+        # rows, so a field that cleared to null must arrive as an explicit null
+        # (an absent key would leave the stale value in the cache). The client
+        # converts null → undefined on apply, so a cleared field lands in the
+        # same shape GET /v1/sessions produces (absent), and the
+        # ``permission_level === null`` full-access sentinel in the web sidebar
+        # is never tripped by a streamed null. The GET list endpoint keeps
+        # exclude_none — it replaces whole pages, so it has nothing to clear.
+        #
+        # search_snippet is excluded: it is search-only (populated just by
+        # GET /v1/sessions?search_query=), so this no-query path always has it
+        # None. Dumping it as an explicit null would overwrite a snippet the
+        # search response put in the client cache, making the palette's match
+        # preview flicker away on the next stream tick. Omitting the key leaves
+        # the cached snippet untouched.
+        return [item.model_dump(exclude={"search_snippet"}) for item in items]
+
     async def _fetch_watched_items(
         watched: list[str],
         user_id: str | None,
@@ -1837,87 +1979,8 @@ def register_core_routes(
         :returns: One JSON-ready dict per accessible, existing watched
             session, in no particular order.
         """
-        if not watched:
-            return []
-        if permission_store is not None:
-            perms_by_conv = await asyncio.to_thread(permission_store.list_for_sessions, watched)
-            user_is_admin = (
-                await asyncio.to_thread(permission_store.is_admin, user_id)
-                if user_id is not None
-                else False
-            )
-            accessible = [
-                cid
-                for cid in watched
-                if _permission_level_from_grants(
-                    user_id, perms_by_conv.get(cid, []), user_is_admin
-                )
-                is not None
-            ]
-        else:
-            perms_by_conv = {}
-            user_is_admin = False
-            accessible = list(watched)
-        if not accessible:
-            return []
-
-        def _load_sessions(ids: list[str]) -> list[Conversation]:
-            """Bulk-load the accessible conversations that are sessions
-            (non-null ``agent_id``) in one batched store call, preserving
-            the caller's id order for deterministic output."""
-            by_id = conversation_store.get_conversations(ids)
-            return [
-                conv
-                for cid in ids
-                if (conv := by_id.get(cid)) is not None and conv.agent_id is not None
-            ]
-
-        convs = await asyncio.to_thread(_load_sessions, accessible)
-        if not convs:
-            return []
-        unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
-        conv_ids = [c.id for c in convs]
-        agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
-            asyncio.to_thread(agent_store.get_names, unique_agent_ids),
-            asyncio.to_thread(
-                conversation_store.list_child_conversation_ids_by_parent,
-                conv_ids,
-            ),
-            _comments_fingerprints_for(conv_ids),
-        )
-        pending_counts = pending_elicitations.counts_for(conv_ids)
-        items = [
-            _build_session_list_item(
-                conv,
-                agent_names_by_id=agent_names_by_id,
-                grants=perms_by_conv.get(conv.id, []),
-                user_id=user_id,
-                user_is_admin=user_is_admin,
-                permissions_enabled=permission_store is not None,
-                pending_count=pending_counts.get(conv.id, 0),
-                child_session_ids=child_ids_by_parent[conv.id],
-                comments_fingerprint=comments_fingerprints.get(conv.id),
-            )
-            for conv in convs
-        ]
-        await _apply_liveness_to_items(items, liveness_lookup)
-        # Full-row dumps (every field, nulls included) — NOT exclude_none. The
-        # stream is a diff source: the client overlays these onto its cached
-        # rows, so a field that cleared to null must arrive as an explicit null
-        # (an absent key would leave the stale value in the cache). The client
-        # converts null → undefined on apply, so a cleared field lands in the
-        # same shape GET /v1/sessions produces (absent), and the
-        # ``permission_level === null`` full-access sentinel in the web sidebar
-        # is never tripped by a streamed null. The GET list endpoint keeps
-        # exclude_none — it replaces whole pages, so it has nothing to clear.
-        #
-        # search_snippet is excluded: it is search-only (populated just by
-        # GET /v1/sessions?search_query=), so this no-query path always has it
-        # None. Dumping it as an explicit null would overwrite a snippet the
-        # search response put in the client cache, making the palette's match
-        # preview flicker away on the next stream tick. Omitting the key leaves
-        # the cached snippet untouched.
-        return [item.model_dump(exclude={"search_snippet"}) for item in items]
+        inputs, user_is_admin = await _load_watched_inputs(watched, user_id)
+        return await _build_watched_items(list(inputs.values()), user_id, user_is_admin)
 
     @router.websocket("/sessions/updates")
     async def session_updates(websocket: WebSocket) -> None:
@@ -1976,6 +2039,38 @@ def register_core_routes(
         # reader (snapshot on watch) and the ticker (interval deltas) so
         # they never interleave updates to ``last_sent``.
         emit_lock = asyncio.Lock()
+        # Stored inputs per watched id with the version they were read at, so a
+        # tick re-reads only rows whose stored version moved. ``None`` marks an
+        # id that resolved to no visible session at that version.
+        row_cache: dict[str, tuple[str, _WatchedRowInputs | None]] = {}
+        cached_user_is_admin = False
+
+        async def _current_items() -> list[dict[str, Any]]:
+            """Payloads for the watch-set, re-reading only rows that changed."""
+            nonlocal cached_user_is_admin
+            versions = await asyncio.to_thread(
+                conversation_store.get_session_list_versions, watched, user_id
+            )
+            if versions is None:
+                return await _fetch_watched_items(watched, user_id)
+            stale = [
+                cid
+                for cid in watched
+                if cid in versions and row_cache.get(cid, ("", None))[0] != versions[cid]
+            ]
+            if stale:
+                fresh, cached_user_is_admin = await _load_watched_inputs(stale, user_id)
+                for cid in stale:
+                    row_cache[cid] = (versions[cid], fresh.get(cid))
+            watched_ids = set(watched)
+            for cid in [cid for cid in row_cache if cid not in versions or cid not in watched_ids]:
+                del row_cache[cid]
+            rows = [
+                inputs
+                for cid in watched
+                if (entry := row_cache.get(cid)) is not None and (inputs := entry[1]) is not None
+            ]
+            return await _build_watched_items(rows, user_id, cached_user_is_admin)
 
         async def _send(frame: dict[str, Any]) -> None:
             """
@@ -2001,7 +2096,7 @@ def register_core_routes(
         async def _emit_snapshot() -> None:
             """Send a full snapshot for the current watch-set and reset the
             diff baseline to it."""
-            items = await _fetch_watched_items(watched, user_id)
+            items = await _current_items()
             dumps = {item["id"]: item for item in items}
             last_sent.clear()
             last_sent.update(dumps)
@@ -2013,7 +2108,7 @@ def register_core_routes(
             been idle."""
             nonlocal last_send_monotonic
             if watched:
-                items = await _fetch_watched_items(watched, user_id)
+                items = await _current_items()
                 current = {item["id"]: item for item in items}
                 changed = [dump for cid, dump in current.items() if last_sent.get(cid) != dump]
                 # Removed = a still-watched id that no longer resolves (lost

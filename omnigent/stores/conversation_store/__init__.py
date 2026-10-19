@@ -623,6 +623,30 @@ class ConversationStore(ABC):
         """
         ...
 
+    def get_session_list_versions(
+        self,
+        conversation_ids: list[str],
+        user_id: str | None,
+    ) -> dict[str, str] | None:
+        """
+        Return one opaque version per session for change detection.
+
+        A version changes whenever any stored row that feeds the session's
+        list item changes: the conversation, its metadata, labels, child
+        ids, permission grants, comment fingerprint, agent, and the
+        viewer's user row. Lets the session-updates stream skip re-reading
+        rows that have not changed since its last tick.
+
+        :param conversation_ids: Conversation ids to version,
+            e.g. ``["conv_abc123"]``.
+        :param user_id: The viewer whose admin flag feeds access, or
+            ``None`` when permissions are disabled.
+        :returns: ``{conversation_id: version}`` for ids that resolve to a
+            row, or ``None`` when this store cannot compute versions (the
+            caller then re-reads everything, as without this method).
+        """
+        return None
+
     @abstractmethod
     def list_child_conversation_ids_by_parent(
         self,
