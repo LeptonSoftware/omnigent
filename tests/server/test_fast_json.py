@@ -135,3 +135,39 @@ def test_env_switch_disables_install(monkeypatch: pytest.MonkeyPatch) -> None:
     resp = _get("/model")
     assert resp.content != _sample().model_dump_json(by_alias=True).encode("utf-8")
     assert resp.json() == json.loads(json.dumps(jsonable_encoder(_sample())))
+
+
+def test_guard_fastapi_still_routes_through_module_serialize_response() -> None:
+    """Fails loudly if a FastAPI upgrade stops calling the patched hook.
+
+    ``install`` rebinds ``fastapi.routing.serialize_response``; that only takes
+    effect while the request handler looks the name up as a module global at
+    call time, and while plain routes still render with Starlette's
+    ``JSONResponse``. If either changes, the fast path silently turns off.
+    """
+    import fastapi.routing
+
+    handler_globals = fastapi.routing.get_request_handler.__code__.co_consts
+    inner_codes = [c for c in handler_globals if hasattr(c, "co_names")]
+    assert any("serialize_response" in c.co_names for c in inner_codes), (
+        "fastapi.routing's request handler no longer looks up serialize_response "
+        "as a module global; omnigent.server.fast_json must be re-hooked"
+    )
+    assert FastAPI().router.default_response_class.value is fast_json.JSONResponse
+
+    calls: list[bool] = []
+    assert fast_json.install()
+    try:
+        patched = fastapi.routing.serialize_response
+        assert patched is fast_json._serialize_response
+
+        async def spy(**kwargs: Any) -> Any:
+            calls.append(kwargs.get("field") is None)
+            return await patched(**kwargs)
+
+        fastapi.routing.serialize_response = spy  # type: ignore[assignment]
+        resp = _get("/model")
+    finally:
+        fast_json.uninstall()
+    assert calls == [True], "the handler did not call fastapi.routing.serialize_response"
+    assert resp.content == _sample().model_dump_json(by_alias=True).encode("utf-8")
