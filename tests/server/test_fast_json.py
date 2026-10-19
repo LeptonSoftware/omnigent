@@ -130,6 +130,8 @@ def test_nan_becomes_null_where_the_slow_path_cannot_render(fast: None) -> None:
 
 
 def test_env_switch_disables_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Any app built earlier in this worker process installed the fast path.
+    fast_json.uninstall()
     monkeypatch.setenv(fast_json.FAST_JSON_ENV, "0")
     assert fast_json.install() is False
     resp = _get("/model")

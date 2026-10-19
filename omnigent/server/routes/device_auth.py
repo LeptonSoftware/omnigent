@@ -561,8 +561,16 @@ def create_oauth_token_router(
         )
         if rotated is None:
             # Lost a concurrent rotation race, or the grant aged out between
-            # the check above and here — reject without revoking (this is not
-            # a reuse signal, so the grant must not be killed/oscillate).
+            # the check above and here. Aging out is not a reuse signal, so the
+            # grant must not be killed/oscillate.
+            # fork: a lost race means another request just rotated away this
+            # same token, which is a replay; revoke as the stale branch does.
+            stale = device_grant_store.get_by_prev_refresh_hash(presented_hash)
+            if stale is not None:
+                device_grant_store.revoke(stale.id)
+                _logger.warning(
+                    "oauth/token: concurrent refresh reuse on grant %s — revoked", stale.id
+                )
             return _oauth_error("invalid_grant")
         if rotated.user_id is None:
             return _oauth_error("invalid_grant")

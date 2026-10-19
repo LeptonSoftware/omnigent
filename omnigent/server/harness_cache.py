@@ -11,7 +11,8 @@ two: MCP edits call ``AgentCache.replace``, and the in-place
 call ``AgentCache.evict``. Either way the edit shows on the next read. The TTL
 bounds staleness for edits made by another process, such as another replica.
 Only successful lookups of an existing agent are cached; ``None`` answers and
-errors always re-resolve.
+errors always re-resolve. Deleting an agent does not touch the agent cache, so
+its sessions may report the old harness until the TTL runs out.
 """
 
 from __future__ import annotations
@@ -102,9 +103,13 @@ def cache_resolved_harness(resolve: _F) -> _F:
                 and _spec_location(agent_cache, conv.agent_id) == location
             ):
                 return harness
+        # A spec swap that lands mid-resolve must not pair the old answer with
+        # the new location. A cold resolve loads the spec itself, so an unknown
+        # location beforehand is taken as the one it loaded.
+        before = _spec_location(agent_cache, conv.agent_id)
         harness = resolve(conv, agent_store=agent_store, agent_cache=agent_cache)
-        if harness is not None:
-            location = _spec_location(agent_cache, conv.agent_id)
+        location = _spec_location(agent_cache, conv.agent_id)
+        if harness is not None and before in (None, location):
             with _lock:
                 if len(_entries) >= _MAX_ENTRIES:
                     _entries.clear()
