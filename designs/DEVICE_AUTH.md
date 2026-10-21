@@ -412,6 +412,19 @@ the stored `{token, user_id, expires_at}` record simply lapsed, default
   `OMNIGENT_GRANT_MAX_LIFETIME_DAYS` lets an operator extend it
   deliberately for long-lived unattended hosts. Invalid values fall back
   to the default (never fail open to unbounded).
+- **IdP status check instead of a lifetime** *(fork)* — with
+  `OMNIGENT_IDP_STATUS_PROVIDER=authentik` set (plus
+  `OMNIGENT_AUTHENTIK_URL` / `_API_TOKEN` / `_APP_SLUG`), refresh grants of
+  both kinds stop aging out. Every refresh asks Authentik whether the user
+  (the grant's email) still exists, is active, and passes the app's
+  `check_access`; `check_access` alone passes deactivated users, so
+  `is_active` is required too. A removed user's grant is revoked and the
+  refresh answers `invalid_grant`. An unreachable or erroring IdP lets the
+  refresh through (fail open, logged). ACTIVE answers are cached
+  in-process for 5 minutes. Purge then keeps every live grant and deletes
+  expired device codes and revoked grants. Unset or half-configured, the
+  absolute lifetime above applies unchanged. Code:
+  `omnigent/server/idp_status.py`.
 - **Client-secret interaction** — `OMNIGENT_DEVICE_CLIENT_SECRET` gates
   the endpoints that mint from an ephemeral code (device authorize + the
   `device_code` exchange). Refresh and revoke are NOT gated: the presented
