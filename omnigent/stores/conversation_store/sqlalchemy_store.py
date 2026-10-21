@@ -186,8 +186,10 @@ _SESSION_LIST_VERSIONS_SQL = text(
                   WHERE m.workspace_id = c.workspace_id AND m.id = c.id), ''),
         coalesce((SELECT string_agg(l::text, chr(30) ORDER BY l.key) FROM conversation_labels l
                   WHERE l.workspace_id = c.workspace_id AND l.conversation_id = c.id), ''),
-        coalesce((SELECT string_agg(encode(ch.id, 'hex'), chr(30) ORDER BY ch.id) FROM conversations ch
-                  WHERE ch.workspace_id = c.workspace_id AND ch.parent_conversation_id = c.id), ''),
+        coalesce((SELECT string_agg(encode(ch.id, 'hex'), chr(30) ORDER BY ch.id)
+                  FROM conversations ch
+                  WHERE ch.workspace_id = c.workspace_id
+                    AND ch.parent_conversation_id = c.id), ''),
         coalesce((SELECT string_agg(p::text, chr(30) ORDER BY p.user_id) FROM session_permissions p
                   WHERE p.workspace_id = c.workspace_id AND p.conversation_id = c.id), ''),
         coalesce((SELECT count(*) || chr(30) || coalesce(max(cm.updated_at)::text, '')

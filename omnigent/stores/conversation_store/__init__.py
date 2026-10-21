@@ -645,6 +645,7 @@ class ConversationStore(ABC):
             row, or ``None`` when this store cannot compute versions (the
             caller then re-reads everything, as without this method).
         """
+        del conversation_ids, user_id
         return None
 
     @abstractmethod
