@@ -21,6 +21,13 @@ from tests.server.integration.oidc_fixtures import (
 
 pytestmark = pytest.mark.asyncio
 
+
+@pytest.fixture(autouse=True)
+def _pkce_only_ticket_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These checks cover the PKCE-only flow; legacy login is a separate opt-in."""
+    monkeypatch.setenv("OMNIGENT_OIDC_LEGACY_TICKET_LOGIN", "0")
+
+
 _VICTIM_EMAIL = "victim@example.com"
 
 

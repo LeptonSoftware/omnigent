@@ -30,6 +30,12 @@ from tests.server.integration.oidc_fixtures import (
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.fixture(autouse=True)
+def _pkce_only_ticket_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the PKCE-only flow; legacy tests below opt back in."""
+    monkeypatch.setenv("OMNIGENT_OIDC_LEGACY_TICKET_LOGIN", "0")
+
+
 async def _create_ticket(client: httpx.AsyncClient, base_path: str = "") -> tuple[str, str]:
     verifier, challenge = _pkce_pair()
     response = await client.post(
@@ -630,3 +636,72 @@ async def test_cli_consent_flow_under_base_path(decision: str) -> None:
         upgrade = await client.get(base_path + legacy.json()["login_url"])
         assert upgrade.status_code == 200
         assert "Update Omnigent to sign in" in upgrade.text
+
+
+async def test_legacy_ticket_login_completes_without_pkce(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With legacy login on, an old client's empty request still signs in."""
+    monkeypatch.setenv("OMNIGENT_OIDC_LEGACY_TICKET_LOGIN", "1")
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/grants.db")
+    async with httpx.AsyncClient(
+        transport=_build_app(store), base_url="http://test", follow_redirects=False
+    ) as client:
+        created = await client.post("/auth/cli-login")
+        assert created.status_code == 200
+        ticket = created.json()["ticket"]
+        assert created.json()["login_url"] == f"/auth/login?ticket={ticket}"
+
+        pending = await client.get("/auth/cli-poll", params={"ticket": ticket})
+        assert pending.status_code == 202
+
+        callback = await _complete_callback(client, ticket)
+        assert callback.status_code == 200
+        assert "Login successful" in callback.text
+        assert "alice@example.com" in callback.text
+
+        fulfilled = await client.get("/auth/cli-poll", params={"ticket": ticket})
+        assert fulfilled.status_code == 200
+        body = fulfilled.json()
+        payload = jwt.decode(body["token"], TEST_SIGNING_KEY, algorithms=["HS256"])
+        assert payload["sub"] == "alice@example.com"
+        assert body["refresh_token"]
+        assert fulfilled.headers["cache-control"] == "no-store"
+
+        consumed = await client.get("/auth/cli-poll", params={"ticket": ticket})
+        assert consumed.status_code == 410
+
+
+async def test_legacy_mode_keeps_pkce_tickets_strict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ticket created with a challenge still needs consent and its verifier."""
+    monkeypatch.setenv("OMNIGENT_OIDC_LEGACY_TICKET_LOGIN", "1")
+    async with httpx.AsyncClient(
+        transport=_build_app(), base_url="http://test", follow_redirects=False
+    ) as client:
+        ticket, verifier = await _create_ticket(client)
+        callback = await _complete_callback(client, ticket)
+        assert callback.headers["location"] == f"/auth/cli-consent?ticket={ticket}"
+        no_proof = await client.get("/auth/cli-poll", params={"ticket": ticket})
+        assert no_proof.status_code == 400
+        pending = await client.get(
+            "/auth/cli-poll", params={"ticket": ticket, "code_verifier": verifier}
+        )
+        assert pending.status_code == 202
+
+
+async def test_legacy_ticket_expired_at_callback_is_not_fulfilled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_OIDC_LEGACY_TICKET_LOGIN", "1")
+    async with httpx.AsyncClient(
+        transport=_build_app(), base_url="http://test", follow_redirects=False
+    ) as client:
+        ticket = (await client.post("/auth/cli-login")).json()["ticket"]
+        with patch(
+            "omnigent.server.legacy_ticket_login.time.time", return_value=time.time() + 600
+        ):
+            callback = await _complete_callback(client, ticket)
+        assert "Login successful" not in callback.text
+        poll = await client.get("/auth/cli-poll", params={"ticket": ticket})
+        assert poll.status_code in (202, 410)
+        assert "token" not in poll.json()
