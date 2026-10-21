@@ -175,6 +175,36 @@ _LIST_ITEMS_MAX_ROWS_PER_STATEMENT = 200
 # pathological directory can impose on a delete. Hitting it answers "in use".
 _WORKSPACE_SHARER_SCAN_LIMIT = 32
 
+# One statement versioning a session-list row: every source row is cast to text
+# and hashed in Postgres, so the caller materializes one short string per id.
+# Each part is coalesced so a NULL cannot shift the next part into its place.
+_SESSION_LIST_VERSIONS_SQL = text(
+    """
+    SELECT encode(c.id, 'hex'), md5(concat_ws(chr(31),
+        c::text,
+        coalesce((SELECT m::text FROM omnigent_conversation_metadata m
+                  WHERE m.workspace_id = c.workspace_id AND m.id = c.id), ''),
+        coalesce((SELECT string_agg(l::text, chr(30) ORDER BY l.key) FROM conversation_labels l
+                  WHERE l.workspace_id = c.workspace_id AND l.conversation_id = c.id), ''),
+        coalesce((SELECT string_agg(encode(ch.id, 'hex'), chr(30) ORDER BY ch.id)
+                  FROM conversations ch
+                  WHERE ch.workspace_id = c.workspace_id
+                    AND ch.parent_conversation_id = c.id), ''),
+        coalesce((SELECT string_agg(p::text, chr(30) ORDER BY p.user_id) FROM session_permissions p
+                  WHERE p.workspace_id = c.workspace_id AND p.conversation_id = c.id), ''),
+        coalesce((SELECT count(*) || chr(30) || coalesce(max(cm.updated_at)::text, '')
+                  FROM comments cm
+                  WHERE cm.workspace_id = c.workspace_id AND cm.conversation_id = c.id), ''),
+        coalesce((SELECT a::text FROM agents a
+                  WHERE a.workspace_id = c.workspace_id AND a.id = c.agent_id), ''),
+        coalesce((SELECT u::text FROM users u
+                  WHERE u.workspace_id = c.workspace_id AND u.id = :user_id), '')
+    ))
+    FROM conversations c
+    WHERE c.workspace_id = :ws AND c.id = ANY(:ids)
+    """
+)
+
 
 class _RowCountResult(Protocol):
     rowcount: int
@@ -1409,6 +1439,39 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             for row in rows
         }
+
+    def get_session_list_versions(
+        self,
+        conversation_ids: list[str],
+        user_id: str | None,
+    ) -> dict[str, str] | None:
+        """
+        Hash, in Postgres, every row that feeds each session's list item.
+
+        Whole rows are hashed rather than chosen columns, so a new column
+        can only cause a spurious rebuild, never a missed change. Needs one
+        Postgres database: split-DB or SQLite deployments return ``None``.
+
+        :param conversation_ids: Conversation ids to version,
+            e.g. ``["conv_abc123"]``.
+        :param user_id: The viewer, e.g. ``"alice@example.com"``, or ``None``.
+        :returns: ``{conversation_id: md5 hex}`` for ids with a row, or ``None``.
+        """
+        if self._conv_engine is not self._engine or self._engine.dialect.name != "postgresql":
+            return None
+        if not conversation_ids:
+            return {}
+        with self._session("get_session_list_versions") as session:
+            rows = session.execute(
+                _SESSION_LIST_VERSIONS_SQL,
+                {
+                    "ws": current_workspace_id(),
+                    # Raw SQL bypasses Uuid16: bind the 16-byte ids, read hex back.
+                    "ids": [uuid_to_bytes(cid) for cid in set(conversation_ids)],
+                    "user_id": user_id,
+                },
+            ).all()
+        return {row[0]: row[1] for row in rows}
 
     def list_child_conversation_ids_by_parent(
         self,

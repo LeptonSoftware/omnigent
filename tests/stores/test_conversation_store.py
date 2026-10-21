@@ -8336,3 +8336,70 @@ def test_get_conversation_keeps_distinct_query_names(
         "omnigent.conversation_store.select_conversation_metadata_by_id",
         "omnigent.conversation_store.select_conversation_labels",
     ], names
+
+
+def test_session_list_versions_move_with_every_list_item_source(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+    db_uri: str,
+) -> None:
+    """
+    A session's list version changes when any stored row behind its list
+    item changes, and only then.
+
+    The session-updates stream skips re-reading rows whose version held, so
+    a source this misses would freeze that field in every open sidebar.
+    """
+    from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    if conversation_store._conv_engine.dialect.name != "postgresql":
+        assert conversation_store.get_session_list_versions(["0" * 32], None) is None
+        pytest.skip("versions are computed in Postgres; other dialects re-read every row")
+
+    viewer = "viewer@example.com"
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user(viewer)
+    agent = agent_store.create(
+        agent_id="5d0ab3e1a55b4d6e9c7f00112233aabb", name="alpha", bundle_location="a/1"
+    )
+    conv = conversation_store.create_conversation(agent_id=agent.id)
+    other = conversation_store.create_conversation(agent_id=agent.id)
+
+    def version() -> str:
+        versions = conversation_store.get_session_list_versions([conv.id, other.id], viewer)
+        assert versions is not None
+        return versions[conv.id]
+
+    def other_version() -> str:
+        versions = conversation_store.get_session_list_versions([other.id], viewer)
+        assert versions is not None
+        return versions[other.id]
+
+    seen = {version()}
+    other_before = other_version()
+    assert version() in seen, "unchanged rows must keep their version"
+
+    changes = {
+        "title": lambda: conversation_store.update_conversation(conv.id, title="renamed"),
+        "metadata": lambda: conversation_store.set_session_live_status(conv.id, "running"),
+        "label": lambda: conversation_store.set_labels(conv.id, {"omnigent.pinned": "true"}),
+        "child": lambda: conversation_store.create_conversation(
+            agent_id=agent.id, parent_conversation_id=conv.id
+        ),
+        "grant": lambda: perms.grant(viewer, conv.id, 2),
+        "comment": lambda: SqlAlchemyCommentStore(db_uri).add(
+            conversation_id=conv.id, path="a.py", body="x", start_index=0, end_index=1
+        ),
+        "agent": lambda: agent_store.update(agent.id, bundle_location="a/2"),
+        "viewer admin": lambda: perms.set_admin(viewer, True),
+    }
+    for source, change in changes.items():
+        change()
+        current = version()
+        assert current not in seen, f"a {source} change did not move the version"
+        seen.add(current)
+
+    # The other session shares only the agent and the viewer with ``conv``.
+    assert other_version() != other_before
+    assert conversation_store.get_session_list_versions(["0" * 32], viewer) == {}
