@@ -1,0 +1,72 @@
+# N Omnigent server replicas on ONE box behind a host-sharded NGINX router.
+#
+# Fork-owned. See README.md for the host-CLI prerequisite and rollout steps.
+#
+#   cp env.example .env           # DATABASE_URL, auth, secrets
+#   docker compose up -d
+#
+# Postgres is external (DATABASE_URL); every replica shares it and one /data
+# volume (artifacts, cookie secret, admin roster). Only replica-0 arms the
+# recurring-task scheduler. To add a replica, copy a replica-N block and add
+# its `server` line to upstreams.conf.
+
+name: ${COMPOSE_PROJECT_NAME:-omnigent-mr}
+
+x-replica: &replica
+  image: ${OMNIGENT_IMAGE:?set OMNIGENT_IMAGE}:${OMNIGENT_IMAGE_TAG:?set OMNIGENT_IMAGE_TAG}
+  restart: unless-stopped
+  env_file:
+    - ${OMNIGENT_ENV_FILE:-.env}
+  environment: &replica-env
+    ARTIFACT_DIR: /data/artifacts
+    OMNIGENT_ADMIN_CREDENTIALS_PATH: /data/admin-credentials
+    HOST: 0.0.0.0
+    PORT: "8000"
+    # Wrong-replica host requests answer 400 wrong_replica, not 409 offline.
+    OMNIGENT_HOST_SHARDED: "1"
+    OMNIGENT_DISABLE_SCHEDULER: "1"
+  volumes:
+    - omnigent-data:/data
+  stop_grace_period: 20s
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"
+    interval: 10s
+    timeout: 5s
+    start_period: 120s
+    retries: 3
+
+services:
+  replica-0:
+    <<: *replica
+    environment:
+      <<: *replica-env
+      # The one scheduler owner. Upstream has no scheduler leasing yet, so
+      # every other replica must keep OMNIGENT_DISABLE_SCHEDULER=1.
+      OMNIGENT_DISABLE_SCHEDULER: "0"
+
+  replica-1:
+    <<: *replica
+    # Boot runs migrations; let replica-0 finish them first.
+    depends_on:
+      replica-0:
+        condition: service_healthy
+
+  router:
+    image: ${OMNIGENT_ROUTER_IMAGE:-nginx:1.28.0-alpine}
+    restart: unless-stopped
+    depends_on:
+      - replica-0
+      - replica-1
+    ports:
+      - "${OMNIGENT_ROUTER_BIND:-0.0.0.0}:${OMNIGENT_ROUTER_PORT:-8000}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./upstreams.conf:/etc/nginx/omnigent/upstreams.conf:ro
+
+volumes:
+  omnigent-data:
+    name: ${OMNIGENT_DATA_VOLUME:-omnigent-mr-data}
