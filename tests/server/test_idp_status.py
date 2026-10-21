@@ -38,6 +38,14 @@ _KEY = b"k" * 32
 _DAY = 86400
 _LIFETIME = 30 * _DAY
 _T0 = 1_000_000
+_OIDC = SimpleNamespace(_source="oidc", _oidc_config=SimpleNamespace(provider_type="generic"))
+
+
+def _configure_authentik(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(idp_status.PROVIDER_ENV, "authentik")
+    monkeypatch.setenv(idp_status.AUTHENTIK_URL_ENV, "https://auth.example.com")
+    monkeypatch.setenv(idp_status.AUTHENTIK_TOKEN_ENV, "tok")
+    monkeypatch.delenv(idp_status.AUTHENTIK_APP_SLUG_ENV, raising=False)
 
 
 @dataclass
@@ -197,7 +205,7 @@ def test_removed_answer_drops_a_cached_active() -> None:
 
 def test_unconfigured_means_no_checker(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(idp_status.PROVIDER_ENV, raising=False)
-    assert idp_status.checker_from_env() is None
+    assert idp_status.checker_from_env(_OIDC) is None
 
 
 @pytest.mark.parametrize(
@@ -216,17 +224,58 @@ def test_half_configured_keeps_the_cap(
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
-    assert idp_status.checker_from_env() is None
+    assert idp_status.checker_from_env(_OIDC) is None
 
 
 def test_configured_authentik_is_shared_and_cached(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(idp_status.PROVIDER_ENV, "authentik")
-    monkeypatch.setenv(idp_status.AUTHENTIK_URL_ENV, "https://auth.example.com")
-    monkeypatch.setenv(idp_status.AUTHENTIK_TOKEN_ENV, "tok")
-    monkeypatch.delenv(idp_status.AUTHENTIK_APP_SLUG_ENV, raising=False)
-    checker = idp_status.checker_from_env()
+    _configure_authentik(monkeypatch)
+    checker = idp_status.checker_from_env(_OIDC)
     assert isinstance(checker, CachingStatusChecker)
-    assert idp_status.checker_from_env() is checker
+    assert idp_status.checker_from_env(_OIDC) is checker
+
+
+@pytest.mark.parametrize(
+    "auth_provider",
+    [
+        SimpleNamespace(_source="accounts", _oidc_config=None),
+        SimpleNamespace(_source="header", _oidc_config=None),
+        SimpleNamespace(_source="oidc", _oidc_config=SimpleNamespace(provider_type="github")),
+    ],
+    ids=["accounts", "header", "github-oauth"],
+)
+def test_check_refuses_to_start_outside_an_oidc_idp(
+    auth_provider: object, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _configure_authentik(monkeypatch)
+    with caplog.at_level(logging.ERROR, logger="omnigent.server.idp_status"):
+        assert idp_status.checker_from_env(auth_provider) is None
+    assert any("IdP status check is OFF" in record.getMessage() for record in caplog.records)
+
+
+# ── Fail-open warning rate limit ──────────────────────────────────
+
+
+def test_fail_open_warning_is_logged_at_most_once_a_minute(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    idp = FakeAuthentik(fail_with=503)
+    clock = {"now": 1000.0}
+    checker = AuthentikStatusChecker(
+        "https://auth.example.com",
+        "tok",
+        transport=httpx.MockTransport(idp.handler),
+        clock=lambda: clock["now"],
+    )
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.idp_status"):
+        for _ in range(5):
+            assert checker.check("alice@example.com") is IdpStatus.UNKNOWN
+        clock["now"] += 59
+        assert checker.check("alice@example.com") is IdpStatus.UNKNOWN
+        assert len(caplog.records) == 1
+        clock["now"] += 2
+        assert checker.check("alice@example.com") is IdpStatus.UNKNOWN
+    assert len(caplog.records) == 2
+    assert "5 similar failures suppressed" in caplog.records[1].getMessage()
 
 
 # ── Purge (SQLite and Postgres) ───────────────────────────────────
@@ -329,7 +378,7 @@ def _harness(
     idp = FakeAuthentik()
     idp.add("admin", 1)
     checker = idp.checker() if configured else None
-    monkeypatch.setattr(idp_status, "checker_from_env", lambda: checker)
+    monkeypatch.setattr(idp_status, "checker_from_env", lambda _auth_provider: checker)
     start = float(int(time.time()))
     clock = {"start": start, "now": start}
     monkeypatch.setattr(device_auth, "time", SimpleNamespace(time=lambda: clock["now"]))
@@ -452,3 +501,49 @@ def test_device_flow_grant_follows_the_same_rules(checked_device: Harness) -> No
     assert refused.status_code == 400
     assert refused.json()["error"] == "invalid_grant"
     assert harness.status_after(rotated) == "revoked"
+
+
+def test_accounts_mode_with_authentik_configured_keeps_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Accounts usernames are never looked up as Authentik emails."""
+    from omnigent.server.routes import device_auth
+    from omnigent.server.routes.device_auth import issue_login_grant
+
+    _configure_authentik(monkeypatch)
+
+    def no_network(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected IdP call to {request.url}")
+
+    monkeypatch.setattr(
+        idp_status,
+        "AuthentikStatusChecker",
+        lambda *args, **kwargs: AuthentikStatusChecker(
+            *args, transport=httpx.MockTransport(no_network), **kwargs
+        ),
+    )
+    start = float(int(time.time()))
+    clock = {"now": start}
+    monkeypatch.setattr(device_auth, "time", SimpleNamespace(time=lambda: clock["now"]))
+    monkeypatch.setattr(device_auth, "_PURGE_MIN_INTERVAL_SECONDS", 10**9)
+    # App startup reconfigures logging, so listen on the module logger itself.
+    errors: list[str] = []
+    handler = logging.Handler(logging.ERROR)
+    handler.emit = lambda record: errors.append(record.getMessage())  # type: ignore[method-assign]
+    logging.getLogger("omnigent.server.idp_status").addHandler(handler)
+    try:
+        for client in _build_accounts_app(tmp_path, monkeypatch, device_grant_enabled=True):
+            assert any("check is OFF" in message for message in errors)
+            store = DeviceGrantStore(f"sqlite:///{tmp_path}/test.db")
+            secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
+            token = issue_login_grant(store, user_id="admin", cookie_secret=secret)
+            form = {"grant_type": "refresh_token", "refresh_token": token}
+
+            clock["now"] = start + 29 * _DAY
+            assert client.post("/oauth/token", data=form).status_code == 200
+            clock["now"] = start + 31 * _DAY
+            response = client.post("/oauth/token", data=form)
+            assert response.status_code == 400
+            assert response.json()["error"] == "expired_token"
+    finally:
+        logging.getLogger("omnigent.server.idp_status").removeHandler(handler)

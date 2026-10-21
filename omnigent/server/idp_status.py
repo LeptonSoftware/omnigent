@@ -51,6 +51,7 @@ AUTHENTIK_APP_SLUG_ENV = "OMNIGENT_AUTHENTIK_APP_SLUG"
 _DEFAULT_APP_SLUG = "omnigent"
 _HTTP_TIMEOUT_SECONDS = 3.0
 _ACTIVE_CACHE_SECONDS = 300.0
+_FAIL_OPEN_WARNING_INTERVAL_SECONDS = 60.0
 # Rotation lifetime when the IdP check replaces the cap. Kept within a
 # 32-bit INTEGER so ``now - lifetime`` binds on every backend.
 _UNCAPPED_LIFETIME_SECONDS = 2**31 - 1
@@ -89,6 +90,7 @@ class AuthentikStatusChecker:
         *,
         app_slug: str = _DEFAULT_APP_SLUG,
         transport: httpx.BaseTransport | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._client = httpx.Client(
             base_url=base_url.rstrip("/") + "/api/v3",
@@ -97,6 +99,10 @@ class AuthentikStatusChecker:
             transport=transport,
         )
         self._app_slug = app_slug
+        self._clock = clock
+        self._warning_lock = threading.Lock()
+        self._next_warning_at = 0.0
+        self._suppressed_warnings = 0
 
     def check(self, user_id: str) -> IdpStatus:
         try:
@@ -125,12 +131,25 @@ class AuthentikStatusChecker:
                 user_id,
             )
         except (httpx.HTTPError, _AuthentikUnavailable, KeyError, TypeError, ValueError) as error:
-            _logger.warning(
-                "idp status: Authentik check failed for %s (%s); allowing refresh",
-                user_id,
-                error,
-            )
+            self._warn_fail_open(user_id, error)
         return IdpStatus.UNKNOWN
+
+    def _warn_fail_open(self, user_id: str, error: Exception) -> None:
+        """Log a fail-open refresh at most once a minute, counting the rest."""
+        with self._warning_lock:
+            now = self._clock()
+            if now < self._next_warning_at:
+                self._suppressed_warnings += 1
+                return
+            suppressed, self._suppressed_warnings = self._suppressed_warnings, 0
+            self._next_warning_at = now + _FAIL_OPEN_WARNING_INTERVAL_SECONDS
+        _logger.warning(
+            "idp status: Authentik check failed for %s (%s); allowing refresh "
+            "(%d similar failures suppressed since the last warning)",
+            user_id,
+            error,
+            suppressed,
+        )
 
     def _get_json(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         response = self._client.get(path, params=params)
@@ -186,14 +205,31 @@ class CachingStatusChecker:
         return status
 
 
-def checker_from_env() -> IdpStatusChecker | None:
+def checker_from_env(auth_provider: object) -> IdpStatusChecker | None:
     """Build the configured status check, or ``None`` when none is configured.
 
-    A half-configured provider logs an error and returns ``None``, which
-    keeps the absolute grant lifetime in force rather than lifting it.
+    The check looks a grant's user up by email, which only holds for an
+    OIDC login backed by the IdP. Under any other auth mode (an accounts
+    username, a GitHub login) every user would read as removed and lose
+    their grants, so the check refuses to start there. A refused or
+    half-configured check logs an error and returns ``None``, which keeps
+    the absolute grant lifetime in force rather than lifting it.
+
+    :param auth_provider: The server's active auth provider.
     """
     provider = os.environ.get(PROVIDER_ENV, "").strip().lower()
     if not provider:
+        return None
+    source = getattr(auth_provider, "_source", None)
+    oidc_type = getattr(getattr(auth_provider, "_oidc_config", None), "provider_type", None)
+    if source != "oidc" or oidc_type == "github":
+        _logger.error(
+            "%s is set but the server's auth provider is %r%s, not an OIDC IdP; "
+            "the IdP status check is OFF and grant lifetime stays capped",
+            PROVIDER_ENV,
+            source,
+            " (GitHub OAuth)" if oidc_type == "github" else "",
+        )
         return None
     if provider != "authentik":
         _logger.error(

@@ -408,7 +408,7 @@ def create_oauth_token_router(
     _client_secret_ok = client_secret_ok or _make_client_secret_gate()
     # Resolve grant max lifetime once at mount time (not on every refresh).
     _grant_max_lifetime = _grant_max_lifetime_seconds()
-    _idp_checker = idp_status.checker_from_env()  # fork: replaces the lifetime cap when set
+    _idp_checker = idp_status.checker_from_env(auth_provider)  # fork: replaces the cap
     _rotation_lifetime = idp_status.rotation_lifetime(_grant_max_lifetime, _idp_checker)  # fork
     router = APIRouter()
     # Throttle for the opportunistic grant purge (bounds the table without a
@@ -690,7 +690,7 @@ def create_device_auth_router(
     _client_secret_ok = _make_client_secret_gate()
     # Resolve grant max lifetime once at mount (not on every purge).
     _grant_max_lifetime = _grant_max_lifetime_seconds()
-    _idp_checker = idp_status.checker_from_env()  # fork: replaces the lifetime cap when set
+    _idp_checker = idp_status.checker_from_env(auth_provider)  # fork: replaces the cap
 
     router = APIRouter()
     _rate_limiter = SlidingWindowRateLimiter(
