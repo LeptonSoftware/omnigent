@@ -30,6 +30,7 @@ def token_dir(tmp_path, monkeypatch):
         "omnigent.cli_auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
+    monkeypatch.setattr("omnigent.cli_auth._refused_refresh_digests", set())
     return tmp_path
 
 
@@ -813,6 +814,74 @@ def test_refresh_stored_token_refused_leaves_entry(token_dir, monkeypatch) -> No
     assert refresh_stored_token("http://localhost:6767") is None
     entry = json.loads((token_dir / "auth_tokens.json").read_text())["http://localhost:6767"]
     assert entry["refresh_token"] == "refresh-1"
+
+
+def test_refused_refresh_token_is_not_presented_again(token_dir, monkeypatch) -> None:
+    """After the server refuses a refresh token (invalid_grant), later calls
+    skip the network for that same token; a new login's token is tried.
+
+    A host reconnect loop calls the refresh path on every dial, so without
+    this a dead grant was re-presented every few seconds forever.
+    """
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-dead",
+    )
+    posts: list[str] = []
+
+    def _refuse(url, *, data=None, timeout=None):
+        posts.append(data["refresh_token"])
+        return httpx.Response(
+            400, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx, "post", _refuse)
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert posts == ["refresh-dead"]
+
+    # A fresh `omnigent login` stores a different refresh token: try it.
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-new",
+    )
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert posts == ["refresh-dead", "refresh-new"]
+
+
+def test_transient_refresh_failure_is_retried(token_dir, monkeypatch) -> None:
+    """A 5xx is not a verdict on the token, so the next call asks again."""
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    posts: list[str] = []
+
+    def _bounce(url, *, data=None, timeout=None):
+        posts.append(data["refresh_token"])
+        return httpx.Response(503, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", _bounce)
+    refresh_stored_token("http://localhost:6767")
+    refresh_stored_token("http://localhost:6767")
+    assert posts == ["refresh-1", "refresh-1"]
 
 
 def test_refresh_404_on_loopback_is_quiet(token_dir, monkeypatch, caplog) -> None:

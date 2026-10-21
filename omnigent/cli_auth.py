@@ -22,6 +22,7 @@ See ``designs/OIDC_AUTH.md`` §CLI Login Flow.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import math
@@ -430,6 +431,15 @@ def _token_file_lock() -> Iterator[None]:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
+# Digests of refresh tokens the server definitively refused this process.
+_refused_refresh_digests: set[str] = set()
+
+
+def _refresh_digest(refresh_token: str) -> str:
+    """Return a digest that identifies *refresh_token* without holding it."""
+    return hashlib.sha256(refresh_token.encode()).hexdigest()
+
+
 def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | None:
     """Renew the stored access token from its login-issued refresh grant.
 
@@ -455,6 +465,10 @@ def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | Non
     # credential sources (e.g. the Databricks SDK fallback).
     pre = _load_entry(server_url)
     if pre is None or not isinstance(pre.get("refresh_token"), str) or not pre["refresh_token"]:
+        return None
+    if _refresh_digest(pre["refresh_token"]) in _refused_refresh_digests:
+        # fork: the server already refused this exact refresh token. Asking
+        # again cannot succeed; a new `omnigent login` stores a different one.
         return None
     try:
         with _token_file_lock():
@@ -524,6 +538,11 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
             )
         return None
     if resp.status_code != 200:
+        if resp.status_code in (400, 401):
+            # fork: invalid_grant / expired_token is final for this token.
+            # Remember it so a reconnect loop stops re-presenting it every few
+            # seconds (one daemon sent ~4,600 refused refreshes an hour).
+            _refused_refresh_digests.add(_refresh_digest(refresh_token))
         _logger.warning(
             "Token refresh against %s refused (HTTP %d) — run `omnigent login %s` "
             "to re-authenticate.",

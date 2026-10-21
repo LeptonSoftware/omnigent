@@ -479,6 +479,12 @@ _LOOPBACK_REFUSED_FATAL_ATTEMPTS = 100
 # hint to a "this may not self-heal" prompt. Operator-facing only — the host
 # keeps retrying and never exits.
 _AUTH_REJECT_ESCALATE_ATTEMPTS = 30
+# fork: past that streak, retry auth rejections once a minute instead of every
+# ~3 s. A dead login never heals on its own, and seven such hosts made ~9,000
+# rejected tunnel + refresh calls an hour against prod. A new `omnigent login`
+# rewrites the token file, which ends the wait early (_TOKEN_FILE_POLL_S).
+_AUTH_REJECT_SLOW_RETRY_S = 60.0
+_TOKEN_FILE_POLL_S = 2.0
 
 # Consecutive accepted-then-silent connections (upgrade completed, then the
 # socket died without one inbound frame) before the reconnect loop treats the
@@ -4248,6 +4254,9 @@ class HostProcess:
                             classified_recycle = False
                     recycle = woke or classified_recycle
                     wait_s = _RECONNECT_BASE_S if recycle else backoff
+                    login_dead = self._auth_retry_streak >= _AUTH_REJECT_ESCALATE_ATTEMPTS
+                    if login_dead:
+                        wait_s = max(wait_s, _AUTH_REJECT_SLOW_RETRY_S)
                     _logger.warning(
                         "Host tunnel disconnected: %s. Reconnecting in %.1fs%s",
                         exc,
@@ -4259,8 +4268,7 @@ class HostProcess:
                     # Interruptible backoff: wake early if the lifecycle
                     # monitor loses ownership mid-backoff so the top-of-loop
                     # check breaks instead of reconnecting one more time.
-                    with contextlib.suppress(asyncio.TimeoutError):
-                        await asyncio.wait_for(self._lifecycle_lost.wait(), timeout=wait_s)
+                    await self._wait_before_reconnect(wait_s, watch_login=login_dead)
                     import random
 
                     if recycle:
@@ -4393,6 +4401,42 @@ class HostProcess:
             except subprocess.TimeoutExpired:
                 handle.proc.kill()
         self._runners.clear()
+
+    async def _wait_before_reconnect(self, wait_s: float, *, watch_login: bool) -> None:
+        """Sleep *wait_s* before the next dial, waking early when it is moot.
+
+        Wakes when the lifecycle monitor loses ownership. With
+        *watch_login*, also wakes as soon as the stored-token file changes,
+        so a long auth-rejection wait ends the moment the operator runs
+        ``omnigent login``.
+
+        :param wait_s: Maximum seconds to wait, e.g. ``60.0``.
+        :param watch_login: Poll the token file for a fresh login.
+        """
+        if not watch_login:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._lifecycle_lost.wait(), timeout=wait_s)
+            return
+        from omnigent.cli_auth import _token_file_path
+
+        def _token_file_stamp() -> float | None:
+            try:
+                return _token_file_path().stat().st_mtime
+            except OSError:
+                return None
+
+        start_stamp = _token_file_stamp()
+        deadline = time.monotonic() + wait_s
+        while (remaining := deadline - time.monotonic()) > 0:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    self._lifecycle_lost.wait(), timeout=min(_TOKEN_FILE_POLL_S, remaining)
+                )
+            if self._lifecycle_lost.is_set():
+                return
+            if _token_file_stamp() != start_stamp:
+                _logger.info("Stored login changed; reconnecting now.")
+                return
 
     async def _connect_and_serve(self) -> None:
         """Single connection attempt: connect, hello, serve.

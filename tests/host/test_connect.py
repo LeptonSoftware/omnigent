@@ -9113,3 +9113,61 @@ async def test_host_publishes_stored_workspace_at_startup(
 
     assert host._origin_workspace_id == "1965859176160743"
     assert os.environ[debug_logging.ORIGIN_WORKSPACE_ID_ENV_VAR] == "1965859176160743"
+
+
+async def test_dead_login_streak_retries_slowly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Past the auth-rejection escalation streak, the host waits the slow
+    interval between dials instead of the ~3 s backoff cap.
+
+    Seven hosts with aged-out logins sent ~9,000 rejected tunnel and refresh
+    calls an hour to prod at the fast cadence; a dead login never heals on
+    its own, so probing it once a minute loses nothing.
+    """
+    from omnigent.host.connect import _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._AUTH_REJECT_SLOW_RETRY_S", 42.0)
+    spy = _ConnectSpy(
+        [None]
+        + [_invalid_status(403)] * (_AUTH_REJECT_ESCALATE_ATTEMPTS + 1)
+        + [asyncio.CancelledError()]
+    )
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+    waits: list[tuple[float, bool]] = []
+
+    async def _record_wait(wait_s: float, *, watch_login: bool) -> None:
+        waits.append((wait_s, watch_login))
+
+    monkeypatch.setattr(host, "_wait_before_reconnect", _record_wait)
+
+    await host.run()
+
+    rejected = waits[1:]  # first entry is the accepted-then-dropped tunnel
+    fast = rejected[: _AUTH_REJECT_ESCALATE_ATTEMPTS - 1]
+    slow = rejected[_AUTH_REJECT_ESCALATE_ATTEMPTS - 1 :]
+    assert all(w < 42.0 and not watch for w, watch in fast)
+    assert slow and all(w == 42.0 and watch for w, watch in slow)
+
+
+async def test_wait_before_reconnect_wakes_on_new_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A long dead-login wait ends as soon as the token file changes."""
+    token_file = tmp_path / "auth_tokens.json"
+    token_file.write_text("{}")
+    monkeypatch.setattr("omnigent.cli_auth._token_file_path", lambda: token_file)
+    monkeypatch.setattr("omnigent.host.connect._TOKEN_FILE_POLL_S", 0.05)
+    host = _make_host_process()
+
+    async def _login_later() -> None:
+        await asyncio.sleep(0.2)
+        token_file.write_text('{"fresh": true}')
+        os.utime(token_file, (time.time() + 5, time.time() + 5))
+
+    started = time.monotonic()
+    login = asyncio.create_task(_login_later())
+    await host._wait_before_reconnect(30.0, watch_login=True)
+    await login
+    assert time.monotonic() - started < 5.0
