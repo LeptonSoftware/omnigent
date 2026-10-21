@@ -15,6 +15,7 @@ from sqlalchemy import (
     Select,
     and_,
     asc,
+    column,
     delete,
     desc,
     func,
@@ -24,8 +25,10 @@ from sqlalchemy import (
     or_,
     select,
     text,
+    true,
     tuple_,
     update,
+    values,
 )
 from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.sql.selectable import Subquery
@@ -849,6 +852,61 @@ def _ranked_latest_message_items(conversation_ids: list[str]) -> Subquery:
             SqlConversationItem.type == encode_item_type("message"),
         )
         .subquery()
+    )
+
+
+def _lateral_latest_message_items(
+    conversation_ids: list[str], per_conversation_limit: int
+) -> Select:
+    """
+    Build a latest-message query that reads only the top-N rows per conversation.
+
+    :func:`_ranked_latest_message_items` numbers EVERY message row of every
+    requested conversation before keeping the top N, so its cost grows with
+    conversation length: on Postgres a sidebar over ~50 long sub-agent
+    children read millions of rows (``data`` included) and ran for minutes.
+    A ``LATERAL`` subquery with ``ORDER BY position DESC LIMIT n`` instead
+    walks ``ix_conversation_items_conv_type_position`` for each conversation
+    and stops after N rows (measured on prod: 50 children in 79 ms).
+
+    Postgres-family only — SQLite has no ``LATERAL``.
+
+    :param conversation_ids: Conversation ids to fetch messages for,
+        e.g. ``["conv_child1", "conv_child2"]``.
+    :param per_conversation_limit: Rows kept per conversation, e.g. ``10``.
+    :returns: Select over the projected item columns, ordered by
+        conversation then newest message first.
+    """
+    wanted = values(
+        column("conversation_id", SqlConversationItem.conversation_id.type),
+        name="wanted",
+    ).data([(cid,) for cid in conversation_ids])
+    latest = (
+        select(
+            SqlConversationItem.conversation_id,
+            SqlConversationItem.id,
+            SqlConversationItem.response_id,
+            SqlConversationItem.created_at,
+            SqlConversationItem.status,
+            SqlConversationItem.position,
+            SqlConversationItem.type,
+            SqlConversationItem.data,
+            SqlConversationItem.created_by,
+        )
+        .where(
+            SqlConversationItem.workspace_id == current_workspace_id(),
+            SqlConversationItem.conversation_id == wanted.c.conversation_id,
+            SqlConversationItem.type == encode_item_type("message"),
+        )
+        .order_by(desc(SqlConversationItem.position))
+        .limit(per_conversation_limit)
+        .lateral("latest")
+    )
+    return (
+        select(latest)
+        .select_from(wanted)
+        .join(latest, true())
+        .order_by(latest.c.conversation_id, latest.c.position.desc())
     )
 
 
@@ -2382,8 +2440,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Return newest message items for multiple conversations.
 
-        Uses ``row_number() over (partition by conversation_id order by
-        position desc)`` so the database returns at most
+        On Postgres each conversation is read with a ``LATERAL ... LIMIT``
+        (:func:`_lateral_latest_message_items`); other dialects use
+        ``row_number() over (partition by conversation_id order by
+        position desc)``. Either way the database returns at most
         ``per_conversation_limit`` message rows per conversation. This keeps
         child-session summary rendering to one query instead of an N+1
         ``list_items`` fan-out.
@@ -2401,12 +2461,17 @@ class SqlAlchemyConversationStore(ConversationStore):
             return result
 
         with self._conv_session("list_latest_message_items_for_conversations") as session:
-            ranked = _ranked_latest_message_items(unique_ids)
-            rows = session.execute(
-                select(ranked)
-                .where(ranked.c.row_num <= per_conversation_limit)
-                .order_by(ranked.c.conversation_id, ranked.c.position.desc())
-            ).all()
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            if is_postgresql_family(dialect):
+                stmt = _lateral_latest_message_items(unique_ids, per_conversation_limit)
+            else:
+                ranked = _ranked_latest_message_items(unique_ids)
+                stmt = (
+                    select(ranked)
+                    .where(ranked.c.row_num <= per_conversation_limit)
+                    .order_by(ranked.c.conversation_id, ranked.c.position.desc())
+                )
+            rows = session.execute(stmt).all()
             decoded = self._decode_item_data_batch([row.data for row in rows])
             for row, data_json in zip(rows, decoded, strict=True):
                 result[row.conversation_id].append(_to_item(row, data_json))  # type: ignore[arg-type]
