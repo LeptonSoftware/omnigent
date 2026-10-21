@@ -42,6 +42,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from starlette.datastructures import URL
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+from omnigent.server import legacy_ticket_login
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
 from omnigent.server.auth import (
@@ -594,7 +595,19 @@ def create_auth_router(
         # Check if this callback fulfills a CLI login ticket.
         if ticket_id and ticket_id in _cli_tickets:
             ticket = _cli_tickets[ticket_id]
-            if time.time() - ticket.created_at <= _CLI_TICKET_TTL_SECONDS:
+            # fork: a pre-PKCE ticket completes here, with no consent page.
+            legacy_resp = legacy_ticket_login.fulfill_in_callback(
+                ticket,
+                email=email,
+                session_jwt=session_jwt,
+                ttl_seconds=_CLI_TICKET_TTL_SECONDS,
+                config=config,
+                device_grant_store=device_grant_store,
+                issue_login_grant=issue_login_grant,
+            )
+            if legacy_resp is not None:
+                resp = legacy_resp
+            elif time.time() - ticket.created_at <= _CLI_TICKET_TTL_SECONDS:
                 base_path = getattr(request.app.state, "base_path", "")
                 resp = RedirectResponse(
                     url=f"{base_path}/auth/cli-consent?ticket={quote(str(ticket_id))}",
@@ -737,6 +750,9 @@ def create_auth_router(
                 return JSONResponse(status_code=413, content={"error": "Login request too large"})
             raw_body.extend(chunk)
 
+        if not raw_body and legacy_ticket_login.enabled():  # fork: old clients keep logging in
+            _evict_expired_tickets(_cli_tickets)
+            return legacy_ticket_login.create_ticket(_cli_tickets, _CliTicket)
         if not raw_body:
             # Old clients hide HTTP error bodies but open login_url on 200.
             # Give them an instruction page without creating a login ticket.
@@ -989,6 +1005,10 @@ def create_auth_router(
                 headers=NO_STORE_HEADERS,
             )
 
+        if not ticket.code_challenge:  # fork: pre-PKCE ticket has no verifier to check
+            return legacy_ticket_login.poll_response(
+                _cli_tickets, ticket_id, ticket, expires_in=config.session_ttl_hours * 3600
+            )
         code_verifier = request.headers.get("X-Omnigent-Code-Verifier")
         if code_verifier is None:
             # Retain query transport for API compatibility; clients use the
