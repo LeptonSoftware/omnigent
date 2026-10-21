@@ -426,6 +426,33 @@ def test_list_latest_message_items_for_conversations(
     assert result["5eca720dc2bc6cdc3a99028d7bd0f917"] == []
 
 
+def test_lateral_latest_message_items_reads_top_n_per_conversation() -> None:
+    """On Postgres the preview reads each conversation with ``LATERAL ...
+    LIMIT n`` instead of ranking every message row.
+
+    The window-function form numbered all message rows of every requested
+    child before keeping the top N, so a sidebar over long sub-agent children
+    ran for minutes in prod. Guards that the Postgres statement stays a
+    per-conversation bounded read and keeps the lean projection.
+    """
+    from sqlalchemy.dialects import postgresql
+
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        _lateral_latest_message_items,
+    )
+
+    stmt = _lateral_latest_message_items(
+        ["8af356d908005a65f872c246158c6293", "9bf356d908005a65f872c246158c6294"], 10
+    )
+    sql = str(stmt.compile(dialect=postgresql.dialect())).upper()
+    assert "LATERAL" in sql
+    assert "LIMIT" in sql
+    assert "ROW_NUMBER" not in sql
+    columns = {c.key for c in stmt.selected_columns}
+    assert "search_text" not in columns
+    assert {"conversation_id", "position", "data", "created_by"} <= columns
+
+
 def test_ranked_latest_message_items_omits_search_text(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
