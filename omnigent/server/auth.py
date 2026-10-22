@@ -620,7 +620,7 @@ class UnifiedAuthProvider(AuthProvider):
 
         return mint_session_token(
             user_id,
-            cookie_config.cookie_secret,
+            cookie_config.signing_keys,  # fork
             ttl_seconds,
             self._source,
             account_generation=account_generation(user_id),
@@ -669,12 +669,9 @@ class UnifiedAuthProvider(AuthProvider):
         if self._account_check is None and cached is not None and cached[1] > time.monotonic():
             return cached[0]
 
+        signing_keys = cookie_config.signing_keys  # fork: EdDSA, HS256 until the legacy date
         try:
-            payload = jwt.decode(
-                token,
-                cookie_config.cookie_secret,
-                algorithms=["HS256"],
-            )
+            payload = signing_keys.decode(token)
         except jwt.InvalidTokenError:
             return None
 
@@ -721,7 +718,7 @@ class UnifiedAuthProvider(AuthProvider):
             return user_id
 
         if self._account_check is None:
-            remaining = payload.get("exp", 0) - time.time()
+            remaining = signing_keys.accepted_until(token, payload) - time.time()  # fork
             if remaining > 0:
                 self._cookie_cache[cache_key] = (user_id, time.monotonic() + remaining)
 
@@ -908,6 +905,8 @@ def create_auth_provider() -> AuthProvider:
     :returns: Configured auth provider.
     :raises RuntimeError: On unknown source or invalid config.
     """
+    from omnigent.server.session_signing import with_session_keys
+
     source = resolve_auth_source()
 
     if source not in ("header", "oidc", "accounts"):
@@ -921,6 +920,7 @@ def create_auth_provider() -> AuthProvider:
         from omnigent.server.oidc import OIDCConfig
 
         oidc_config = OIDCConfig.from_env()
+        oidc_config = with_session_keys(oidc_config, oidc_config.base_url)  # fork
     elif source == "accounts":
         # Reaching here means accounts mode was deliberately selected
         # — either OMNIGENT_AUTH_PROVIDER=accounts or the
@@ -930,6 +930,7 @@ def create_auth_provider() -> AuthProvider:
         from omnigent.server.accounts_config import AccountsConfig
 
         accounts_config = AccountsConfig.from_env()
+        accounts_config = with_session_keys(accounts_config, accounts_config.base_url)  # fork
 
     return UnifiedAuthProvider(
         source=source,

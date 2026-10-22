@@ -72,6 +72,11 @@ from omnigent.server.routes._oauth import (
 )
 from omnigent.server.routes._oauth import oauth_error as _oauth_error
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.server.session_signing import (  # fork
+    SessionSigningKeys,
+    as_signing_keys,
+    provider_signing_keys,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -191,7 +196,7 @@ def _mint_refresh_token() -> str:
 
 def mint_delegated_token(
     user_id: str,
-    cookie_secret: bytes,
+    keys: SessionSigningKeys | bytes,
     ttl_seconds: int,
     provider: str,
     *,
@@ -228,7 +233,7 @@ def mint_delegated_token(
     grant only ``grant_id``, a machine client only ``scope``.
 
     :param user_id: The Omnigent identity the token acts as (``sub``).
-    :param cookie_secret: HMAC key for HS256 signing.
+    :param keys: Session signing keys (a bare cookie secret signs HS256).
     :param ttl_seconds: Token lifetime in seconds (kept short — ≤ 1 h).
     :param provider: Identity provider name (informational claim).
     :param grant_id: The grant id, or ``None`` for a client-credentials
@@ -257,7 +262,7 @@ def mint_delegated_token(
         payload["grant_id"] = grant_id
     if scope is not None:
         payload["scope"] = scope
-    return jwt.encode(payload, cookie_secret, algorithm="HS256")
+    return as_signing_keys(keys).encode(payload)  # fork: EdDSA when a key is configured
 
 
 def _require_browser_origin(request: Request) -> None:
@@ -404,6 +409,7 @@ def create_oauth_token_router(
     :returns: APIRouter to mount at the app root.
     """
     cookie_secret, provider_name = _resolve_signing_config(auth_provider)
+    signing_keys = provider_signing_keys(auth_provider)  # fork
     _client_secret_ok = client_secret_ok or _make_client_secret_gate()
     # Resolve grant max lifetime once at mount time (not on every refresh).
     _grant_max_lifetime = _grant_max_lifetime_seconds()
@@ -445,7 +451,7 @@ def create_oauth_token_router(
         scope = None if _is_login_grant(client_id) else DELEGATED_SCOPE
         return mint_delegated_token(
             user_id,
-            cookie_secret,
+            signing_keys,  # fork
             _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
             account_generation=grant.account_generation,
@@ -627,7 +633,7 @@ def create_oauth_token_router(
         if not auth_header.startswith("Bearer "):
             return None
         try:
-            payload = jwt.decode(auth_header[7:], cookie_secret, algorithms=["HS256"])
+            payload = signing_keys.decode(auth_header[7:])  # fork
         except jwt.InvalidTokenError:
             return None
         grant_id = payload.get("grant_id")
@@ -655,6 +661,7 @@ def create_device_auth_router(
     :returns: APIRouter to mount at the app root.
     """
     cookie_secret, provider_name = _resolve_signing_config(auth_provider)
+    signing_keys = provider_signing_keys(auth_provider)  # fork
     if auth_provider._source == "accounts":
         assert auth_provider._accounts_config is not None
         _mode_cfg = auth_provider._accounts_config
@@ -695,7 +702,7 @@ def create_device_auth_router(
             raise OmnigentError("grant authority has been revoked", code=ErrorCode.UNAUTHORIZED)
         return mint_delegated_token(
             user_id,
-            cookie_secret,
+            signing_keys,  # fork
             _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
             account_generation=grant.account_generation,
@@ -820,7 +827,7 @@ def create_device_auth_router(
         if not token:
             return None
         try:
-            payload = jwt.decode(token, cookie_secret, algorithms=["HS256"])
+            payload = signing_keys.decode(token)  # fork
         except jwt.InvalidTokenError:
             return None
         iat = payload.get("iat")

@@ -48,6 +48,7 @@ from urllib.parse import urlparse
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.auth import _RESERVED_USERS
 from omnigent.server.passwords import hash_password
+from omnigent.server.session_signing import SessionSigningKeys  # fork
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +186,7 @@ def _mint_loopback_cli_token(
     admin_username: str,
     *,
     base_url: str,
-    cookie_secret: bytes,
+    cookie_secret: SessionSigningKeys | bytes,  # fork: the provider's signing keys
     session_ttl_hours: int,
     account_generation: str | None = None,
 ) -> bool:
@@ -221,7 +222,7 @@ def _mint_loopback_cli_token(
         now = int(time.time())
         tui_jwt = mint_session_cookie(
             user_id=admin_username,
-            cookie_secret=cookie_secret,
+            keys=cookie_secret,  # fork
             ttl_hours=session_ttl_hours,
             provider="accounts",
             account_generation=account_generation,
@@ -248,7 +249,7 @@ def bootstrap_admin(
     init_admin_password: str | None = None,
     base_url: str | None = None,
     session_ttl_hours: int = 8,
-    cookie_secret: bytes | None = None,
+    cookie_secret: SessionSigningKeys | bytes | None = None,  # fork: signing keys
 ) -> BootstrapResult:
     """Ensure an ``admin`` user exists; create + announce on first boot.
 

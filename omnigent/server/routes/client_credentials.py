@@ -533,7 +533,7 @@ def create_client_credentials_handler(
 
         access_token = mint_delegated_token(
             config.sub,
-            cookie_secret,
+            cookie_config.signing_keys,  # fork
             config.token_ttl_seconds,
             provider_name,
             # No stored grant to revoke, so no claim — this is what tells the
