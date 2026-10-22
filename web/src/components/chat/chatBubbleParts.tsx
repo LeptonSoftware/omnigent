@@ -64,7 +64,7 @@ import {
   keyedAttachments,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { useViewerAuthorId } from "@/hooks/useViewerAuthorId";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
@@ -715,6 +715,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useScopedConversationId();
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
+  const viewerAuthorId = useViewerAuthorId();
   // - input_image: `imagePreview` picks the variant — an uploaded file, an
   //   imported inline data URI, an in-flight upload chip, or a placeholder
   //   for a block carrying neither.
@@ -749,7 +750,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   }
   // Badge OTHER contributors' messages only (never your own).
   const author = bubble.createdBy;
-  const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
+  const showAuthorBadge = shouldShowAuthorBadge(author, viewerAuthorId, isSessionShared);
 
   return (
     <Message

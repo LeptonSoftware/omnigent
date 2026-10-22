@@ -20,6 +20,8 @@ import { CommentsPanel } from "./CommentsPanel";
 // below rely on — under that default every comment is treated as own.
 vi.mock("@/lib/identity", () => ({
   getCurrentAuthorId: vi.fn<() => string | null>(() => null),
+  resolveIdentity: () => Promise.resolve(null),
+  subscribeIdentity: () => () => {},
 }));
 const mockGetCurrentAuthorId = vi.mocked(getCurrentAuthorId);
 

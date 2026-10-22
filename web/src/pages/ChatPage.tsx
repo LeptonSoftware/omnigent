@@ -80,7 +80,7 @@ import {
   isOwnerLevel,
   isSessionSharedWithOthers,
 } from "@/lib/permissionsApi";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { useViewerAuthorId } from "@/hooks/useViewerAuthorId";
 import { toast } from "sonner";
 import { ApiError, createSideChat, retrySession } from "@/lib/sessionsApi";
 import { getProject } from "@/lib/projectsApi";
@@ -749,7 +749,7 @@ export function ChatPage() {
   // already implies a share; the owner needs the grant list (manage-only,
   // which the owner can read) to know they granted access to anyone else.
   // Hooks stay above the early-return guards (rules-of-hooks).
-  const viewerId = getCurrentAuthorId();
+  const viewerId = useViewerAuthorId();
   const { data: directSessionOwner } = useSessionOwner(
     viewerId !== null && activeConv?.owner == null ? (sessionConvId ?? null) : null,
   );
