@@ -884,6 +884,33 @@ def test_transient_refresh_failure_is_retried(token_dir, monkeypatch) -> None:
     assert posts == ["refresh-1", "refresh-1"]
 
 
+def test_proxy_400_does_not_mark_refresh_token_dead(token_dir, monkeypatch) -> None:
+    """A 400/401 without an OAuth error body (e.g. from a proxy) is retried."""
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    posts: list[str] = []
+
+    def _proxy_reject(url, *, data=None, timeout=None):
+        posts.append(data["refresh_token"])
+        return httpx.Response(
+            401, text="<html>Unauthorized</html>", request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx, "post", _proxy_reject)
+    refresh_stored_token("http://localhost:6767")
+    refresh_stored_token("http://localhost:6767")
+    assert posts == ["refresh-1", "refresh-1"]
+
+
 def test_refresh_404_on_loopback_is_quiet(token_dir, monkeypatch, caplog) -> None:
     """A loopback server without /oauth/token is expected and must stay quiet.
 

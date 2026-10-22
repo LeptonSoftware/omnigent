@@ -435,6 +435,22 @@ def _token_file_lock() -> Iterator[None]:
 _refused_refresh_digests: set[str] = set()
 
 
+def _is_final_refusal(resp: httpx.Response) -> bool:
+    """Return whether the server itself rejected the refresh token.
+
+    Only the OAuth ``invalid_grant`` / ``expired_token`` errors say the token
+    is dead. A bare 400/401 from a proxy in front of the server says nothing
+    about it, so the token stays usable for the next attempt.
+    """
+    if resp.status_code not in (400, 401):
+        return False
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("error") in ("invalid_grant", "expired_token")
+
+
 def _refresh_digest(refresh_token: str) -> str:
     """Return a digest that identifies *refresh_token* without holding it."""
     return hashlib.sha256(refresh_token.encode()).hexdigest()
@@ -538,7 +554,7 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
             )
         return None
     if resp.status_code != 200:
-        if resp.status_code in (400, 401):
+        if _is_final_refusal(resp):
             # fork: invalid_grant / expired_token is final for this token.
             # Remember it so a reconnect loop stops re-presenting it every few
             # seconds (one daemon sent ~4,600 refused refreshes an hour).
