@@ -41,6 +41,12 @@ _T0 = 1_000_000
 _OIDC = SimpleNamespace(_source="oidc", _oidc_config=SimpleNamespace(provider_type="generic"))
 
 
+@pytest.fixture(autouse=True)
+def _fresh_shared_checkers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test builds (and probes) its own checker."""
+    monkeypatch.setattr(idp_status, "_shared_checkers", {})
+
+
 def _configure_authentik(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(idp_status.PROVIDER_ENV, "authentik")
     monkeypatch.setenv(idp_status.AUTHENTIK_URL_ENV, "https://auth.example.com")
@@ -57,6 +63,7 @@ class FakeAuthentik:
     fail_with: int | None = None
     raise_error: Exception | None = None
     calls: int = 0
+    app_slug: str = "omnigent"
 
     def add(self, email: str, pk: int, *, active: bool = True, passing: bool = True) -> None:
         self.users[email] = {"pk": pk, "email": email, "is_active": active}
@@ -70,19 +77,28 @@ class FakeAuthentik:
         if self.fail_with is not None:
             return httpx.Response(self.fail_with, json={"detail": "nope"})
         if request.url.path == "/api/v3/core/users/":
-            # Authentik's filter is looser than an exact match; return near
-            # misses too so the checker's own exact comparison is exercised.
-            wanted = request.url.params["email"].lower()
-            results = [user for email, user in self.users.items() if wanted in email.lower()]
-            return httpx.Response(200, json={"results": results})
-        if request.url.path == "/api/v3/core/applications/omnigent/check_access/":
+            # Like Authentik: ``email`` is exact and case-sensitive, ``search``
+            # is a case-insensitive substring match that returns near misses.
+            params = request.url.params
+            if "email" in params:
+                results = [user for email, user in self.users.items() if email == params["email"]]
+            else:
+                wanted = params["search"].lower()
+                results = [user for email, user in self.users.items() if wanted in email.lower()]
+            return httpx.Response(200, json={"results": results, "pagination": {"next": 0}})
+        if request.url.path == f"/api/v3/core/applications/{self.app_slug}/":
+            return httpx.Response(200, json={"slug": self.app_slug})
+        if request.url.path == f"/api/v3/core/applications/{self.app_slug}/check_access/":
             pk = int(request.url.params["for_user"])
             return httpx.Response(200, json={"passing": self.passing[pk], "messages": []})
         return httpx.Response(404, json={})
 
-    def checker(self) -> AuthentikStatusChecker:
+    def checker(self, *, app_slug: str = "omnigent") -> AuthentikStatusChecker:
         return AuthentikStatusChecker(
-            "https://auth.example.com/", "tok", transport=httpx.MockTransport(self.handler)
+            "https://auth.example.com/",
+            "tok",
+            app_slug=app_slug,
+            transport=httpx.MockTransport(self.handler),
         )
 
 
@@ -93,6 +109,23 @@ def test_active_user_with_app_access_is_active() -> None:
     idp = FakeAuthentik()
     idp.add("alice@example.com", 7)
     assert idp.checker().check("Alice@Example.com") is IdpStatus.ACTIVE
+
+
+def test_mixed_case_email_in_authentik_is_active() -> None:
+    """Omnigent lowercases emails; Authentik keeps whatever case it was given."""
+    idp = FakeAuthentik()
+    idp.add("Carol.X@Example.com", 9)
+    assert idp.checker().check("carol.x@example.com") is IdpStatus.ACTIVE
+
+
+def test_wrong_app_slug_at_refresh_is_unknown_and_logged_as_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    idp = FakeAuthentik()
+    idp.add("alice@example.com", 7)
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.idp_status"):
+        assert idp.checker(app_slug="omnignet").check("alice@example.com") is IdpStatus.UNKNOWN
+    assert [record.levelno for record in caplog.records] == [logging.ERROR]
 
 
 def test_deactivated_user_is_removed_even_though_check_access_passes() -> None:
@@ -229,9 +262,45 @@ def test_half_configured_keeps_the_cap(
 
 def test_configured_authentik_is_shared_and_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     _configure_authentik(monkeypatch)
-    checker = idp_status.checker_from_env(_OIDC)
+    transport = httpx.MockTransport(FakeAuthentik().handler)
+    checker = idp_status.checker_from_env(_OIDC, transport=transport)
     assert isinstance(checker, CachingStatusChecker)
-    assert idp_status.checker_from_env(_OIDC) is checker
+    assert idp_status.checker_from_env(_OIDC, transport=transport) is checker
+
+
+@pytest.mark.parametrize(
+    ("idp", "problem"),
+    [
+        (FakeAuthentik(fail_with=401), "rejected the API token"),
+        (FakeAuthentik(fail_with=403), "rejected the API token"),
+        (FakeAuthentik(app_slug="other"), "no application with slug 'omnigent'"),
+    ],
+    ids=["401", "403", "wrong-slug"],
+)
+def test_misconfigured_authentik_keeps_the_cap(
+    idp: FakeAuthentik,
+    problem: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _configure_authentik(monkeypatch)
+    with caplog.at_level(logging.ERROR, logger="omnigent.server.idp_status"):
+        checker = idp_status.checker_from_env(_OIDC, transport=httpx.MockTransport(idp.handler))
+    assert checker is None
+    assert any(
+        problem in record.getMessage() and "check is OFF" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_unreachable_authentik_at_startup_still_enables_the_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An outage at boot is not a misconfiguration; refreshes fail open later."""
+    _configure_authentik(monkeypatch)
+    idp = FakeAuthentik(raise_error=httpx.ConnectError("refused"))
+    checker = idp_status.checker_from_env(_OIDC, transport=httpx.MockTransport(idp.handler))
+    assert isinstance(checker, CachingStatusChecker)
 
 
 @pytest.mark.parametrize(

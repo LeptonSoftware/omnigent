@@ -3,13 +3,16 @@
 When a status check is configured, refresh grants (login and device-flow)
 never age out. Instead every refresh asks the IdP whether the user is still
 allowed in. Removing someone from the IdP revokes their grants on their
-next refresh, so access ends within one access-token lifetime plus the
-cache window.
+next refresh, so a host loses access within one access-token lifetime plus
+the cache window. A browser session minted at login is not tied to the
+grant and lives out its own lifetime.
 
 The check fails open: an IdP that is down, slow, or answers with garbage
 yields ``UNKNOWN`` and the refresh goes ahead, so an IdP outage never logs
-out every host. Without a configured check, the server keeps upstream's
-absolute grant lifetime.
+out every host. A misconfiguration is different: at startup the API token
+and app slug are probed, and if Authentik rejects either the check stays
+off and the server keeps upstream's absolute grant lifetime, as it does
+without a configured check.
 
 Configuration (environment):
 
@@ -52,6 +55,7 @@ _DEFAULT_APP_SLUG = "omnigent"
 _HTTP_TIMEOUT_SECONDS = 3.0
 _ACTIVE_CACHE_SECONDS = 300.0
 _FAIL_OPEN_WARNING_INTERVAL_SECONDS = 60.0
+_MAX_SEARCH_PAGES = 5
 # Rotation lifetime when the IdP check replaces the cap. Kept within a
 # 32-bit INTEGER so ``now - lifetime`` binds on every backend.
 _UNCAPPED_LIFETIME_SECONDS = 2**31 - 1
@@ -104,12 +108,28 @@ class AuthentikStatusChecker:
         self._next_warning_at = 0.0
         self._suppressed_warnings = 0
 
+    def probe(self) -> str | None:
+        """Check the API token and app slug once, at startup.
+
+        :returns: ``None`` when usable or when Authentik could not be reached
+            (an outage is not a misconfiguration), else what is wrong.
+        """
+        try:
+            response = self._client.get(f"/core/applications/{self._app_slug}/")
+        except httpx.HTTPError as error:
+            _logger.warning("idp status: could not reach Authentik at startup (%s)", error)
+            return None
+        if response.status_code in (401, 403):
+            return f"Authentik rejected the API token (HTTP {response.status_code})"
+        if response.status_code == 404:
+            return f"Authentik has no application with slug {self._app_slug!r}"
+        return None
+
     def check(self, user_id: str) -> IdpStatus:
         try:
-            users = self._get_json("/core/users/", {"email": user_id})
             matches = [
                 user
-                for user in users["results"]
+                for user in self._find_users(user_id)
                 if str(user.get("email", "")).casefold() == user_id.casefold()
             ]
             if not matches:
@@ -126,7 +146,8 @@ class AuthentikStatusChecker:
             return IdpStatus.REMOVED
         except _AuthentikAuthError as error:
             _logger.error(
-                "idp status: Authentik rejected our API token (%s); allowing refresh for %s",
+                "idp status: Authentik rejected our API token or app slug (%s); "
+                "allowing refresh for %s",
                 error,
                 user_id,
             )
@@ -151,9 +172,28 @@ class AuthentikStatusChecker:
             suppressed,
         )
 
+    def _find_users(self, email: str) -> list[dict[str, Any]]:
+        """Return users whose fields contain *email*, ignoring case.
+
+        Authentik's ``email`` filter is an exact, case-sensitive match, so a
+        user stored as ``Carol@Example.com`` would read as removed. ``search``
+        is case-insensitive but also matches substrings; the caller compares
+        emails exactly.
+        """
+        results: list[dict[str, Any]] = []
+        params: dict[str, Any] = {"search": email, "page_size": 100, "include_groups": "false"}
+        for page in range(1, _MAX_SEARCH_PAGES + 1):
+            body = self._get_json("/core/users/", {**params, "page": page})
+            results.extend(body["results"])
+            if not body.get("pagination", {}).get("next"):
+                return results
+        raise ValueError(f"more than {_MAX_SEARCH_PAGES} pages of users match {email}")
+
     def _get_json(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         response = self._client.get(path, params=params)
-        if response.status_code in (401, 403):
+        if response.status_code in (401, 403) or (
+            response.status_code == 404 and "/check_access/" in path
+        ):
             raise _AuthentikAuthError(f"HTTP {response.status_code} from {path}")
         if response.status_code != 200:
             raise _AuthentikUnavailable(f"HTTP {response.status_code} from {path}")
@@ -164,7 +204,7 @@ class AuthentikStatusChecker:
 
 
 class _AuthentikAuthError(Exception):
-    """Authentik answered 401/403: our API token is wrong or lacks a scope."""
+    """Our API token is rejected (401/403) or the app slug does not exist."""
 
 
 class _AuthentikUnavailable(Exception):
@@ -205,7 +245,9 @@ class CachingStatusChecker:
         return status
 
 
-def checker_from_env(auth_provider: object) -> IdpStatusChecker | None:
+def checker_from_env(
+    auth_provider: object, *, transport: httpx.BaseTransport | None = None
+) -> IdpStatusChecker | None:
     """Build the configured status check, or ``None`` when none is configured.
 
     The check looks a grant's user up by email, which only holds for an
@@ -216,6 +258,7 @@ def checker_from_env(auth_provider: object) -> IdpStatusChecker | None:
     the absolute grant lifetime in force rather than lifting it.
 
     :param auth_provider: The server's active auth provider.
+    :param transport: Optional httpx transport, for tests.
     """
     provider = os.environ.get(PROVIDER_ENV, "").strip().lower()
     if not provider:
@@ -251,9 +294,22 @@ def checker_from_env(auth_provider: object) -> IdpStatusChecker | None:
     key = (url, token, slug)
     with _shared_lock:
         checker = _shared_checkers.get(key)
-        if checker is None:
-            checker = CachingStatusChecker(AuthentikStatusChecker(url, token, app_slug=slug))
-            _shared_checkers[key] = checker
+        if checker is not None:
+            return checker
+        authentik = AuthentikStatusChecker(url, token, app_slug=slug, transport=transport)
+        problem = authentik.probe()
+        if problem is not None:
+            _logger.error(
+                "%s=authentik: %s; the IdP status check is OFF and grant lifetime stays capped",
+                PROVIDER_ENV,
+                problem,
+            )
+            return None
+        _logger.info(
+            "idp status: Authentik check is ON (app %r); login grants do not expire", slug
+        )
+        checker = CachingStatusChecker(authentik)
+        _shared_checkers[key] = checker
     return checker
 
 
