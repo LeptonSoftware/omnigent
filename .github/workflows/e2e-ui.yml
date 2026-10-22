@@ -152,7 +152,8 @@ jobs:
     # omits the server, runner, harness CLIs, bubblewrap, tmux, and sidecar.
     needs: setup
     if: needs.setup.outputs.matrix != '{"include":[]}'
-    runs-on: ubuntu-latest
+    # Playwright has no Chromium build for ubuntu-26.04 (ubuntu-latest) yet.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -228,7 +229,8 @@ jobs:
     # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
     # `ready_for_review` re-fires when a draft is converted.
     needs: [setup, build-sidecar]
-    runs-on: ubuntu-latest
+    # Playwright has no Chromium build for ubuntu-26.04 (ubuntu-latest) yet.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.

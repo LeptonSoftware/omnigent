@@ -90,8 +90,6 @@ from omnigent.server.background_session_titles import (
 from omnigent.server.fast_json import install as install_fast_json  # fork
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.health_fast_path import HealthFastPathMiddleware  # fork
-from omnigent.server.principal_header import PrincipalHeaderMiddleware  # fork
-from omnigent.server.principal_header import install as install_principal_header  # fork
 from omnigent.server.instance_role import DISABLE_SCHEDULER_ENV, scheduler_disabled_by_env  # fork
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
@@ -106,6 +104,8 @@ from omnigent.server.performance_metrics import (
     set_request_session_id_for_access_log,
     set_request_user_agent_for_access_log,
 )
+from omnigent.server.principal_header import PrincipalHeaderMiddleware  # fork
+from omnigent.server.principal_header import install as install_principal_header  # fork
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router

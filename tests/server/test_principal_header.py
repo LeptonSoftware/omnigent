@@ -18,8 +18,8 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import principal_header
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
-from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -47,9 +47,13 @@ def _app(db_uri: str, tmp_path: Path) -> FastAPI:
 
 
 @pytest_asyncio.fixture
-async def client(runtime_init: None, db_uri: str, tmp_path: Path) -> AsyncIterator[httpx.AsyncClient]:
+async def client(
+    runtime_init: None, db_uri: str, tmp_path: Path
+) -> AsyncIterator[httpx.AsyncClient]:
     app = _app(db_uri, tmp_path)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
         yield c
     await app.state.background_title_coordinator.shutdown()
 
@@ -62,7 +66,9 @@ async def test_authenticated_response_names_the_caller(client: httpx.AsyncClient
 
 
 @pytest.mark.asyncio
-async def test_anonymous_and_health_responses_carry_no_principal(client: httpx.AsyncClient) -> None:
+async def test_anonymous_and_health_responses_carry_no_principal(
+    client: httpx.AsyncClient,
+) -> None:
     unauth = await client.get("/v1/sessions")
     assert unauth.status_code == 401
     assert "x-omnigent-principal" not in unauth.headers
@@ -83,7 +89,9 @@ async def test_env_switch_disables_header(
 ) -> None:
     monkeypatch.setenv(principal_header.PRINCIPAL_HEADER_ENV, "0")
     app = _app(db_uri, tmp_path)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
         resp = await c.get("/v1/sessions", headers={"X-Forwarded-Email": _EMAIL})
     await app.state.background_title_coordinator.shutdown()
     assert resp.status_code == 200
@@ -105,6 +113,8 @@ async def test_inner_scope_copy_still_reports_and_odd_ids_are_sanitised() -> Non
         await inner(dict(scope), receive, send)
 
     app = principal_header.PrincipalHeaderMiddleware(copying_layer)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
-        resp = await c.get("/", headers={"X-Forwarded-Email": "naïve user@x".encode("utf-8")})
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        resp = await c.get("/", headers={"X-Forwarded-Email": "naïve user@x".encode()})
     assert resp.headers["x-omnigent-principal"] == "na??ve?user@x"
