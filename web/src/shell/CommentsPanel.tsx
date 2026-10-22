@@ -3,7 +3,7 @@ import { CheckIcon, Link2Icon, WandSparklesIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useResizableCommentsPanel } from "@/hooks/useResizableCommentsPanel";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { useViewerAuthorId } from "@/hooks/useViewerAuthorId";
 import { cn } from "@/lib/utils";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -100,7 +100,7 @@ export function CommentsPanel({
   // (legacy comments, or single-user/local mode where currentAuthorId is null)
   // stays editable by any editor, matching the server's `created_by is None`
   // fallback.
-  const currentAuthorId = getCurrentAuthorId();
+  const currentAuthorId = useViewerAuthorId();
   const canModify = (c: Comment): boolean =>
     canEdit && (c.created_by == null || c.created_by === currentAuthorId);
   const activeSelectionStart = activeSelection?.start_index;

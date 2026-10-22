@@ -1,24 +1,43 @@
 import type * as IdentityModule from "@/lib/identity";
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { PresenceAvatars } from "./PresenceAvatars";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useChatStore } from "@/store/chatStore";
 
-// Pin the viewer's identity so the self-filter is deterministic. Keep
-// the module's other exports real — chatStore (imported transitively)
-// pulls authenticatedFetch from the same module.
+// The viewer's identity is controllable so a test can model `/v1/me`
+// answering after the first render. Keep the module's other exports real —
+// chatStore (imported transitively) pulls authenticatedFetch from it.
+const identity = vi.hoisted(() => ({
+  authorId: "self@example.com" as string | null,
+  listeners: new Set<() => void>(),
+}));
+
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
-  getCurrentAuthorId: () => "self@example.com",
+  getCurrentAuthorId: () => identity.authorId,
+  resolveIdentity: () => Promise.resolve(identity.authorId),
+  subscribeIdentity: (listener: () => void) => {
+    identity.listeners.add(listener);
+    return () => identity.listeners.delete(listener);
+  },
 }));
 
 afterEach(() => {
   cleanup();
   useChatStore.setState({ viewers: [] });
+  identity.authorId = "self@example.com";
+  identity.listeners.clear();
 });
+
+function settleIdentity(authorId: string): void {
+  identity.authorId = authorId;
+  act(() => {
+    for (const listener of identity.listeners) listener();
+  });
+}
 
 function renderAvatars() {
   return render(
@@ -87,5 +106,35 @@ describe("PresenceAvatars", () => {
     expect(screen.getByTestId("presence-overflow").textContent).toBe("+2");
     expect(screen.getByTestId("presence-avatar-c@example.com")).toBeTruthy();
     expect(screen.queryByTestId("presence-avatar-d@example.com")).toBeNull();
+  });
+
+  it("drops your own circle once identity resolves after the first render", () => {
+    identity.authorId = null;
+    useChatStore.setState({
+      viewers: [
+        { userId: "self@example.com", idle: false },
+        { userId: "bob@example.com", idle: false },
+      ],
+    });
+    renderAvatars();
+    // Before `/v1/me` answers there is no self to filter.
+    expect(screen.getByTestId("presence-avatar-self@example.com")).toBeTruthy();
+
+    settleIdentity("self@example.com");
+    expect(screen.queryByTestId("presence-avatar-self@example.com")).toBeNull();
+
+    // A later presence broadcast re-renders against the resolved identity
+    // too, not one captured on the first render.
+    act(() => {
+      useChatStore.setState({
+        viewers: [
+          { userId: "self@example.com", idle: false },
+          { userId: "bob@example.com", idle: false },
+          { userId: "carol@example.com", idle: false },
+        ],
+      });
+    });
+    expect(screen.queryByTestId("presence-avatar-self@example.com")).toBeNull();
+    expect(screen.getByTestId("presence-avatar-carol@example.com")).toBeTruthy();
   });
 });

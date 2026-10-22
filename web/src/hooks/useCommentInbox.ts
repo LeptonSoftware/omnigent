@@ -17,7 +17,7 @@ import { useQueries } from "@tanstack/react-query";
 import { commentsQueryKey, fetchComments } from "@/hooks/useComments";
 import type { Conversation } from "@/hooks/useConversations";
 import { useSeenCommentIds } from "@/hooks/useSeenComments";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { useViewerAuthorId } from "@/hooks/useViewerAuthorId";
 import {
   collectCommentInboxItems,
   type CommentInboxItem,
@@ -56,6 +56,7 @@ export function useCommentInbox(rows: Conversation[]): CommentInbox {
     })),
   });
   const seenIds = useSeenCommentIds();
+  const viewerAuthorId = useViewerAuthorId();
 
   const sources: CommentInboxSource[] = [];
   commentRows.forEach((row, i) => {
@@ -64,7 +65,7 @@ export function useCommentInbox(rows: Conversation[]): CommentInbox {
   });
 
   return {
-    items: collectCommentInboxItems(sources, seenIds, getCurrentAuthorId()),
+    items: collectCommentInboxItems(sources, seenIds, viewerAuthorId),
     isLoading: queries.some((q) => q.isLoading),
     failedCount: queries.filter((q) => q.isError).length,
     retryFailed: () => {

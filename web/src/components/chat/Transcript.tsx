@@ -11,7 +11,7 @@ import {
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { cn } from "@/lib/utils";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { useViewerAuthorId } from "@/hooks/useViewerAuthorId";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import { isSystemUserContent } from "@/lib/systemMessage";
 import { isTerminalCommandInput } from "@/lib/blocks";
@@ -136,6 +136,7 @@ function TranscriptImpl({
   // finalized prefix by reference. Pending user messages (POSTed but not yet
   // acked) render as trailing user bubbles so the input is visible immediately.
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
+  const viewerAuthorId = useViewerAuthorId();
   const bubbles = useMemo<Bubble[]>(() => {
     const committed = stripGatedSubagentRoutingChips(
       reorderCommittedRequestElicitations(
@@ -150,15 +151,13 @@ function TranscriptImpl({
       subagentRoutingOverride,
     );
     if (pendingUserMessages.length === 0) return committed;
-    return mergePendingBubbles(
-      committed,
-      buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
-    );
+    return mergePendingBubbles(committed, buildPendingBubbles(pendingUserMessages, viewerAuthorId));
   }, [
     blocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    viewerAuthorId,
     subagentRoutingOverride,
     sessionStatus,
   ]);

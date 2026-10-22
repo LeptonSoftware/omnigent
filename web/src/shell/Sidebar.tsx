@@ -1,5 +1,4 @@
 import { filterSessionScope } from "@/lib/sessionVisibility";
-import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
 import { useSidebarWorkingIds } from "@/hooks/useSidebarWorkingIds";
@@ -845,16 +844,15 @@ function SidebarImpl({
   // not render a row until it's loaded. This is window-scoped and transient —
   // against a new server the migration promotes the id to a real server pinned
   // row (which carries its own row) on the same or next load.
+  const viewerId = useViewerId();
   const ownedPinIds = useMemo(
     () =>
       sidebarData.pinsIncludeShared
         ? undefined
         : new Set(
-            filterSessionScope(sidebarData.loadedRows, "mine", getCurrentUserId()).map(
-              (row) => row.id,
-            ),
+            filterSessionScope(sidebarData.loadedRows, "mine", viewerId).map((row) => row.id),
           ),
-    [sidebarData.pinsIncludeShared, sidebarData.loadedRows],
+    [sidebarData.pinsIncludeShared, sidebarData.loadedRows, viewerId],
   );
   const pinnedConversationIds = useMemo(() => {
     const ids = pinnedConversations.map((c) => c.id);
