@@ -92,7 +92,7 @@ def test_mint_session_cookie_produces_valid_jwt() -> None:
     """
     token = mint_session_cookie(
         user_id="alice@example.com",
-        cookie_secret=_TEST_SECRET,
+        keys=_TEST_SECRET,
         ttl_hours=8,
         provider="google",
     )
@@ -113,7 +113,7 @@ def test_mint_session_cookie_rejected_with_wrong_secret() -> None:
     """
     token = mint_session_cookie(
         user_id="alice@example.com",
-        cookie_secret=_TEST_SECRET,
+        keys=_TEST_SECRET,
         ttl_hours=8,
         provider="google",
     )
@@ -132,7 +132,7 @@ def test_mint_session_token_produces_valid_jwt_with_seconds_ttl() -> None:
     """
     token = mint_session_token(
         user_id="alice@example.com",
-        cookie_secret=_TEST_SECRET,
+        keys=_TEST_SECRET,
         ttl_seconds=120,
         provider="accounts",
     )
@@ -152,7 +152,7 @@ def test_mint_session_token_short_ttl_expires() -> None:
     """
     token = mint_session_token(
         user_id="alice@example.com",
-        cookie_secret=_TEST_SECRET,
+        keys=_TEST_SECRET,
         ttl_seconds=-1,
         provider="accounts",
     )
@@ -510,7 +510,7 @@ def test_oidc_source_reads_valid_cookie() -> None:
 
     token = mint_session_cookie(
         user_id="alice@example.com",
-        cookie_secret=_TEST_SECRET,
+        keys=_TEST_SECRET,
         ttl_hours=8,
         provider="google",
     )
@@ -549,7 +549,7 @@ def test_oidc_source_returns_none_for_tampered_cookie() -> None:
     wrong_secret = b"b" * 32
     token = mint_session_cookie(
         user_id="alice@example.com",
-        cookie_secret=wrong_secret,
+        keys=wrong_secret,
         ttl_hours=8,
         provider="google",
     )
@@ -591,7 +591,7 @@ def test_oidc_source_rejects_reserved_sub_claims(reserved: str) -> None:
 
     token = mint_session_cookie(
         user_id=reserved,
-        cookie_secret=_TEST_SECRET,
+        keys=_TEST_SECRET,
         ttl_hours=8,
         provider="google",
     )
@@ -648,7 +648,7 @@ def test_oidc_source_caches_validated_cookie() -> None:
 
     token = mint_session_cookie(
         user_id="alice@example.com",
-        cookie_secret=_TEST_SECRET,
+        keys=_TEST_SECRET,
         ttl_hours=8,
         provider="google",
     )
@@ -676,7 +676,7 @@ def test_oidc_source_accepts_bearer_token() -> None:
 
     token = mint_session_cookie(
         user_id="alice@example.com",
-        cookie_secret=_TEST_SECRET,
+        keys=_TEST_SECRET,
         ttl_hours=8,
         provider="google",
     )
@@ -698,13 +698,13 @@ def test_oidc_source_cookie_takes_precedence_over_bearer() -> None:
 
     cookie_token = mint_session_cookie(
         user_id="cookie-user@example.com",
-        cookie_secret=_TEST_SECRET,
+        keys=_TEST_SECRET,
         ttl_hours=8,
         provider="google",
     )
     bearer_token = mint_session_cookie(
         user_id="bearer-user@example.com",
-        cookie_secret=_TEST_SECRET,
+        keys=_TEST_SECRET,
         ttl_hours=8,
         provider="google",
     )
@@ -727,7 +727,7 @@ def test_oidc_source_rejects_invalid_bearer_token() -> None:
     wrong_secret = b"b" * 32
     token = mint_session_cookie(
         user_id="alice@example.com",
-        cookie_secret=wrong_secret,
+        keys=wrong_secret,
         ttl_hours=8,
         provider="google",
     )
