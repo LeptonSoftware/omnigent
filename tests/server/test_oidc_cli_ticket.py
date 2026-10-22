@@ -705,3 +705,30 @@ async def test_legacy_ticket_expired_at_callback_is_not_fulfilled(
         poll = await client.get("/auth/cli-poll", params={"ticket": ticket})
         assert poll.status_code in (202, 410)
         assert "token" not in poll.json()
+
+
+async def test_legacy_ticket_accepts_only_one_sign_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second sign-in on the same link cannot swap whose session the client gets."""
+    monkeypatch.setenv("OMNIGENT_OIDC_LEGACY_TICKET_LOGIN", "1")
+    async with httpx.AsyncClient(
+        transport=_build_app(), base_url="http://test", follow_redirects=False
+    ) as client:
+        ticket = (await client.post("/auth/cli-login")).json()["ticket"]
+        first = await _complete_callback(client, ticket)
+        assert "Login successful" in first.text
+
+        state_cookie = _mint_state_cookie("state-2", ticket=ticket)
+        mallory = _mock_httpx_client_for_github(
+            emails_json=[{"email": "mallory@example.com", "primary": True, "verified": True}]
+        )
+        with patch("omnigent.server.routes.auth.httpx.AsyncClient", return_value=mallory):
+            second = await client.get(
+                "/auth/callback",
+                params={"code": "auth-code", "state": "state-2"},
+                cookies={"ap_auth_state": state_cookie},
+            )
+        assert second.status_code == 409
+        assert "already used" in second.text
+
+        fulfilled = await client.get("/auth/cli-poll", params={"ticket": ticket})
+        assert fulfilled.json()["user_id"] == "alice@example.com"

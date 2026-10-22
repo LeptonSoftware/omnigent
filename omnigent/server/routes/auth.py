@@ -71,6 +71,9 @@ _AUTH_STATE_COOKIE_SECURE = "__Host-ap_auth_state"
 _AUTH_STATE_COOKIE_PLAIN = "ap_auth_state"
 _AUTH_STATE_TTL_SECONDS = 300  # 5 minutes
 _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
+# fork: how far our clock and the IdP's may disagree. With none, a server one
+# second behind the IdP rejects every id_token ("not yet valid (iat)").
+_IDP_CLOCK_SKEW_SECONDS = 60
 # An upgrade notice, never a key in the login-ticket store.
 _CLI_UPGRADE_TICKET = "upgrade-required"
 _CLI_UPGRADE_MESSAGE = (
@@ -513,7 +516,7 @@ def create_auth_router(
                     "so forced re-authentication (prompt=login) cannot be verified"
                 )
                 return fail(403, "IdP did not confirm re-authentication")
-            if auth_time < reauth_at:
+            if auth_time + _IDP_CLOCK_SKEW_SECONDS < reauth_at:  # fork: skew
                 _logger.warning(
                     "Rejecting reauth login: id_token auth_time %d predates the "
                     "re-authentication demand at %d (IdP reused its session)",
@@ -1524,6 +1527,7 @@ def _validate_id_token(
             algorithms=["RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"],
             audience=config.client_id,
             issuer=config.issuer,
+            leeway=_IDP_CLOCK_SKEW_SECONDS,  # fork
         )
     except jwt.InvalidTokenError as exc:
         _logger.warning("id_token validation failed: %s", exc)
