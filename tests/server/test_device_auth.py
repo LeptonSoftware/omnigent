@@ -24,6 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+from omnigent.server.session_signing import SessionSigningKeys
 
 _KEY = b"k" * 32
 
@@ -60,6 +61,7 @@ def test_router_factory_builds_for_oidc_mode(tmp_path: Path) -> None:
 
     oidc_cfg = SimpleNamespace(
         cookie_secret=_KEY,
+        signing_keys=SessionSigningKeys.hs256(_KEY),
         base_url="https://omni.example.test",
         session_cookie_name="__Host-omni_session",
         provider_type="oidc",
@@ -85,6 +87,7 @@ def test_router_factory_rejects_github_oauth_oidc(tmp_path: Path) -> None:
 
     oidc_cfg = SimpleNamespace(
         cookie_secret=_KEY,
+        signing_keys=SessionSigningKeys.hs256(_KEY),
         base_url="https://omni.example.test",
         session_cookie_name="__Host-omni_session",
         provider_type="github",
@@ -905,7 +908,12 @@ def test_oauth_token_router_oidc_mode(tmp_path: Path) -> None:
         issue_login_grant,
     )
 
-    provider = SimpleNamespace(_source="oidc", _oidc_config=SimpleNamespace(cookie_secret=_KEY))
+    provider = SimpleNamespace(
+        _source="oidc",
+        _oidc_config=SimpleNamespace(
+            cookie_secret=_KEY, signing_keys=SessionSigningKeys.hs256(_KEY)
+        ),
+    )
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
     app = FastAPI()
     app.include_router(create_oauth_token_router(provider, store))  # type: ignore[arg-type]
@@ -986,6 +994,7 @@ def test_app_skips_device_grant_for_github_oidc_without_crashing(
     # a GitHub-typed OIDC provider even when the flag is on.
     oidc_cfg = SimpleNamespace(
         cookie_secret=_KEY,
+        signing_keys=SessionSigningKeys.hs256(_KEY),
         base_url="https://omni.example.test",
         session_cookie_name="__Host-omni_session",
         provider_type="github",
