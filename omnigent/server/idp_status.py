@@ -313,6 +313,7 @@ def checker_from_env(
     return checker
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by server IdP config, not tenants
 _shared_checkers: dict[tuple[str, str, str], IdpStatusChecker] = {}
 _shared_lock = threading.Lock()
 
