@@ -8,13 +8,14 @@ are in the comment above ``CASES``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
 
 import pytest
 
-from omnigent.server import server_timing
+from omnigent.server import server_timing, session_live_state
 from tests.server.get_session_fixtures import (
     OWNER,
     READER,
@@ -31,11 +32,20 @@ __all__ = ["realistic", "realistic_app", "sql_counter"]
 _WEB = "?include_items=false&include_liveness=false"
 
 
+@pytest.fixture(autouse=True)
+def _acl_cache_outlives_the_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the 5 s ACL cache warm on a slow runner, so only the snapshot is counted."""
+    monkeypatch.setenv("OMNIGENT_ACL_RESOLVE_CACHE_TTL_S", "600")
+
+
 async def _measure(session: RealisticSession, counter: SqlCounter, user: str, path: str) -> None:
     headers = {"X-Forwarded-Email": user}
     # The first request warms per-process caches (agent bundle, harness), as
     # on a live server.
     assert (await session.client.get(path, headers=headers)).status_code == 200
+    # Live-state writes (e.g. the pending-prompt count) run on a background
+    # queue; let them land before counting, or a slow one is billed to the request.
+    await asyncio.wrap_future(session_live_state.submit("test_drain", lambda: None))
     counter.reset()
     counter.armed = True
     try:

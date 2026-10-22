@@ -98,6 +98,24 @@ def test_env_resolution_matches_real_env(config, tmp_path, prefix, found):
     )
 
 
+# Rows where uutils ``env`` (Ubuntu 26.04) disagrees with the GNU behavior modeled here.
+_UUTILS_DIVERGENT_ARGS = (
+    ["-iS", "A=1 /usr/bin/printenv"],
+    ["-S", "${UNSET_NAME} A=1 /usr/bin/printenv"],
+    ["-S", "A=1 ${UNSET_NAME}${UNSET_NAME} B=2 /usr/bin/printenv"],
+    ["-C", "link", "-C", "sub", "/bin/pwd"],
+)
+
+
+@functools.cache
+def _real_env_is_uutils() -> bool:
+    """Return whether ``/usr/bin/env`` is the uutils rewrite rather than GNU ``env``."""
+    probe = subprocess.run(
+        ["/usr/bin/env", "--version"], env={}, capture_output=True, text=True, check=False
+    )
+    return "uutils" in probe.stdout
+
+
 @functools.cache
 def _real_env_supports_chdir() -> bool:
     """Return whether ``/usr/bin/env`` accepts ``-C`` and ``--chdir``."""
@@ -148,6 +166,8 @@ def _real_env_supports_long_split_string() -> bool:
 )
 def test_env_wrapper_environment_matches_real_env(args):
     """The modeled wrapper environment equals what the real ``env`` passes on."""
+    if args in _UUTILS_DIVERGENT_ARGS and _real_env_is_uutils():
+        pytest.skip("uutils env differs from the GNU env modeled here")
     if args[0].startswith("--split-string") and not _real_env_supports_long_split_string():
         pytest.skip("/usr/bin/env lacks --split-string")
     if args[0] == "-C" and not _real_env_supports_chdir():
@@ -217,6 +237,8 @@ def test_env_split_string_keeps_a_word_only_for_set_variables():
 )
 def test_env_wrapper_chdir_matches_real_env(tmp_path, args):
     """The modeled ``--chdir`` directory is where the real ``env`` runs the command."""
+    if args in _UUTILS_DIVERGENT_ARGS and _real_env_is_uutils():
+        pytest.skip("uutils env differs from the GNU env modeled here")
     if not _real_env_supports_chdir():
         pytest.skip("/usr/bin/env lacks -C/--chdir")
     (tmp_path / "sub").mkdir()

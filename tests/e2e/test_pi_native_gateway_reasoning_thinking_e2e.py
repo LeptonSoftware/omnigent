@@ -258,6 +258,8 @@ class PiTui:
     def __init__(self, process: Any) -> None:
         self.process = process
         self.screen = pyte.Screen(_SCREEN_COLS, _SCREEN_ROWS)
+        # tmux sends private status queries unsupported by pyte; only render output.
+        self.screen.report_device_status = lambda *_args, **_kwargs: None
         self.stream = pyte.Stream(self.screen)
         self.raw: list[str] = []
 

@@ -50,6 +50,13 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Fetch upstream release tags (fork)
+      if: ${{ inputs.server_version != '' || inputs.runner_version != '' }}
+      shell: bash
+      env:
+        SERVER_VERSION_TAG: ${{ inputs.server_version }}
+        RUNNER_VERSION_TAG: ${{ inputs.runner_version }}
+      run: bash .github/scripts/ci/fetch-upstream-release-tags.sh "$SERVER_VERSION_TAG" "$RUNNER_VERSION_TAG"
     - name: Configure environment
       shell: bash
       run: |

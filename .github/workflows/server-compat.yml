@@ -77,6 +77,8 @@ jobs:
           fetch-depth: 0
           sparse-checkout: .github/scripts/ci
           persist-credentials: false
+      - name: Fetch upstream release tags (fork)
+        run: bash .github/scripts/ci/fetch-upstream-release-tags.sh
       - name: Resolve latest final tag
         id: tag
         shell: bash
@@ -126,7 +128,8 @@ jobs:
   compat-smoke-ui-config-a:
     name: "Compat smoke – UI Config A (new SPA / old server ${{ needs.resolve-latest.outputs.latest_tag }})"
     needs: resolve-latest
-    runs-on: ubuntu-latest
+    # Playwright has no Chromium build for ubuntu-26.04 (ubuntu-latest) yet.
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - name: Checkout
@@ -142,7 +145,8 @@ jobs:
   compat-smoke-ui-config-b:
     name: "Compat smoke – UI Config B (old SPA ${{ needs.resolve-latest.outputs.latest_tag }} / new server)"
     needs: resolve-latest
-    runs-on: ubuntu-latest
+    # Playwright has no Chromium build for ubuntu-26.04 (ubuntu-latest) yet.
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - name: Checkout
@@ -178,6 +182,8 @@ jobs:
           # Full history so `git tag` sees every release tag for the matrix.
           fetch-depth: 0
           persist-credentials: false
+      - name: Fetch upstream release tags (fork)
+        run: bash .github/scripts/ci/fetch-upstream-release-tags.sh
       - name: Compute pairwise matrices
         id: matrix
         env:
@@ -269,6 +275,8 @@ jobs:
           sparse-checkout: .github/scripts/ci
           fetch-depth: 0
           persist-credentials: false
+      - name: Fetch upstream release tags (fork)
+        run: bash .github/scripts/ci/fetch-upstream-release-tags.sh
       - name: Compute UI matrix
         id: matrix
         env:
@@ -279,7 +287,8 @@ jobs:
   backcompat-e2e-ui:
     name: "Backcompat e2e-ui (Config ${{ matrix.config }}: ${{ matrix.config == 'A' && matrix.server || matrix.ui }}, shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})"
     needs: setup-ui
-    runs-on: ubuntu-latest
+    # Playwright has no Chromium build for ubuntu-26.04 (ubuntu-latest) yet.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
       fail-fast: false

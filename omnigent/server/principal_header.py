@@ -27,7 +27,12 @@ _original_get_user_id = UnifiedAuthProvider.get_user_id
 
 def enabled() -> bool:
     """Whether ``OMNIGENT_PRINCIPAL_HEADER`` leaves the header on (default on)."""
-    return os.environ.get(PRINCIPAL_HEADER_ENV, "1").strip().lower() not in {"0", "false", "no", "off"}
+    return os.environ.get(PRINCIPAL_HEADER_ENV, "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 @functools.wraps(_original_get_user_id)
