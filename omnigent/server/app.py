@@ -1559,7 +1559,7 @@ def create_app(
                 init_admin_password=_accounts_cfg.init_admin_password,
                 base_url=_accounts_cfg.base_url,
                 session_ttl_hours=_accounts_cfg.session_ttl_hours,
-                cookie_secret=_accounts_cfg.cookie_secret,
+                cookie_secret=_accounts_cfg.signing_keys,  # fork
             )
 
     from omnigent.runner.routing import RunnerRouter
@@ -2909,6 +2909,10 @@ def create_app(
             e.g. ``{"version": "0.1.0"}``.
         """
         return {"version": _server_version()}
+
+    from omnigent.server.routes.jwks import create_jwks_router  # fork
+
+    app.include_router(create_jwks_router(auth_provider))  # fork
 
     @app.get("/.well-known/omnigent.json")
     async def well_known_manifest() -> dict[str, object]:
