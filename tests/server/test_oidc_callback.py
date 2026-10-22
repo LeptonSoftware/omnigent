@@ -567,6 +567,36 @@ def test_reauth_callback_rejects_stale_auth_time(
     assert resp.cookies.get("ap_session") is None
 
 
+def test_reauth_callback_tolerates_idp_clock_behind(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """An IdP clock a little behind ours still proves a fresh re-auth."""
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": reauth_at - 30}
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 302, resp.text
+
+
+def test_callback_accepts_id_token_from_idp_clock_ahead(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """An IdP clock a little ahead of ours (iat in our future) still logs in."""
+    client, keys = callback_client
+    ahead = int(time.time()) + 30
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "iat": ahead, "exp": ahead + 300}
+    )
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 302, resp.text
+
+
 def test_reauth_callback_rejects_missing_auth_time(
     callback_client: tuple[TestClient, _IdpKeys],
 ) -> None:

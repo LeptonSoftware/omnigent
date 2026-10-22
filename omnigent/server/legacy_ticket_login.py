@@ -79,11 +79,26 @@ def fulfill_in_callback(
 ) -> Response | None:
     """Complete a legacy ticket when the browser's IdP sign-in returns.
 
-    :returns: The "Login successful" page, or ``None`` when *ticket* is not a
-        legacy ticket or has expired, so the caller keeps its own handling.
+    :returns: The "Login successful" page, a refusal when the ticket was
+        already signed in, or ``None`` when *ticket* is not a legacy ticket or
+        has expired, so the caller keeps its own handling.
     """
     if ticket.code_challenge or time.time() - ticket.created_at > ttl_seconds:
         return None
+    if ticket.token is not None:
+        # One sign-in per ticket. A second would swap whose session the
+        # waiting client receives, letting a link holder sign it in as them.
+        _logger.warning("cli-login: refused a second sign-in on a legacy ticket (%s)", email)
+        return HTMLResponse(
+            status_code=409,
+            content=(
+                "<html><body style='font-family:system-ui;text-align:center;padding:60px'>"
+                "<h2>This login link was already used</h2>"
+                "<p>Start a new login from the app or CLI.</p>"
+                "</body></html>"
+            ),
+            headers={"Cache-Control": "no-store"},
+        )
     ticket.token = session_jwt
     ticket.user_id = email
     if device_grant_store is not None:
