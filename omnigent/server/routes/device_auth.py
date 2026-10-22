@@ -65,11 +65,6 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
-from omnigent.server.session_signing import (  # fork
-    SessionSigningKeys,
-    as_signing_keys,
-    provider_signing_keys,
-)
 from omnigent.server.routes._oauth import (
     NO_STORE_HEADERS,
     RATE_LIMITER_MAX_KEYS,
@@ -77,6 +72,11 @@ from omnigent.server.routes._oauth import (
 )
 from omnigent.server.routes._oauth import oauth_error as _oauth_error
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.server.session_signing import (  # fork
+    SessionSigningKeys,
+    as_signing_keys,
+    provider_signing_keys,
+)
 
 _logger = logging.getLogger(__name__)
 

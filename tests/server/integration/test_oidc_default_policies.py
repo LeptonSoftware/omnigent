@@ -68,7 +68,7 @@ def _bearer(user_id: str) -> dict[str, str]:
     """Authorization header carrying an OIDC session JWT for *user_id*."""
     token = mint_session_cookie(
         user_id=user_id,
-        cookie_secret=_TEST_SECRET,
+        keys=_TEST_SECRET,
         ttl_hours=8,
         provider="oidc",
     )

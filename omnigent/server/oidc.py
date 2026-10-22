@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import httpx
-import jwt
 
 from omnigent.server.session_signing import SessionSigningKeys, as_signing_keys
 

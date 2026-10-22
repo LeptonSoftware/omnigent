@@ -89,6 +89,10 @@ class SessionSigningConfigError(RuntimeError):
     """
 
 
+class UnknownSigningKeyError(jwt.InvalidTokenError):
+    """An EdDSA token whose ``kid`` names no current or previous key."""
+
+
 @dataclass(frozen=True)
 class PublicSigningKey:
     """One Ed25519 verification key and its RFC 7638 thumbprint ``kid``."""
@@ -116,9 +120,7 @@ def _b64url(raw: bytes) -> str:
 
 
 def _okp_x(key: Ed25519PublicKey) -> str:
-    return _b64url(
-        key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    )
+    return _b64url(key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw))
 
 
 def jwk_thumbprint(key: Ed25519PublicKey) -> str:
@@ -215,7 +217,7 @@ class SessionSigningKeys:
             kid = header.get("kid")
             key = next((k.key for k in self.verification_keys if k.kid == kid), None)
             if key is None:
-                raise jwt.InvalidKeyError("unknown signing key id")
+                raise UnknownSigningKeyError(f"no published key has kid {kid!r}")
             return jwt.decode(
                 token,
                 key,
@@ -395,7 +397,9 @@ def _parse_legacy_until(raw: str) -> datetime | None:
         return None
     try:
         if len(raw) == 10:
-            return datetime.combine(date.fromisoformat(raw), datetime.min.time(), tzinfo=timezone.utc)
+            return datetime.combine(
+                date.fromisoformat(raw), datetime.min.time(), tzinfo=timezone.utc
+            )
         parsed = datetime.fromisoformat(raw)
     except ValueError:
         raise SessionSigningConfigError(
