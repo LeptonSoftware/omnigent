@@ -27,6 +27,9 @@ implements them separately, so a fix for one harness does not reach the others.
   stay in that thread, and closing it leaves the parent usable.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
+- `idle-reap`: a finished native pane left alone past the idle window closes
+  with its forwarder, helper server and tool relay; the next message brings it
+  back with the conversation. Kimi is exempt; live work and open prompts stay.
 - `subagent-discovery`: Claude children appear under the agent that spawned
   them, including delayed spawns; an unresolved spawn does not keep an idle
   runner re-reading unchanged conversations.
@@ -82,6 +85,13 @@ Probes run only on expansion.
 `/settings/harnesses` or its harness detail pages, or the import review modal
 shown for a newly connected or requested host → See more. The modal auto-opens
 only when the server enables the `import_review` release feature.
+
+**Idle reap:** finish a turn, then leave the session alone past the idle window:
+a web session with its Terminal view open but untouched or its tabs closed, a
+sub-agent an orchestrator dispatched and never reopened, or a CLI-launched
+`omnigent <name>` whose local terminal sits without keystrokes. The Terminal
+view loses the pane; the next message from Chat, the orchestrator, or the CLI
+brings it back with the conversation.
 
 **Interrupted session:** observe startup before the first message, a running
 turn, and Stop separately. For an offline host use the reconnect paths in
@@ -371,6 +381,23 @@ Cross-harness journeys:
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
+- **`idle-reap`:** start the instance with `OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S=60`
+  in the environment of `verify-env start`; the runner log then shows
+  `native pane reaper started (idle_timeout=60.0s`. A host-launched runner also
+  needs `OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S`.
+  Finish one turn in each harness in scope and stop typing in its pane. A pane
+  counts as busy for 120 s after its screen last changed and the reaper scans
+  every 60 s, so expect the reap 3 to 5 minutes later. Record the Terminal view,
+  then check the runner log for `reaping idle native pane for conversation <id>`,
+  that `tool_relay.json` is gone from the session's bridge directory, and that no
+  `codex app-server` or `opencode serve` for the session remains. Send one more
+  message and check the pane returns with the earlier turn. Component tests,
+  plain `uv run --no-sync pytest --reruns 0`: `tests/terminals/test_pane_reaper.py`
+  (busy evidence, re-create during a reap, registry coverage) and
+  `tests/runner/test_comment_relay.py::test_idle_pane_reap_closes_comment_relay`.
+  `tests/server/integration/test_codex_model_change_after_idle_reap.py` covers
+  Codex reap-then-resume through a real server with a scripted app-server, not
+  the Codex CLI; it crashes an xdist worker, so run it with `-p no:xdist`.
 - **`disconnect`, Claude startup (plain `uv run pytest`, no vendor CLI):**
   `tests/harnesses/claude_native/test_claude_native_readiness_exit.py` delivers
   a web message through the public bridge into a real retained dead tmux pane.
@@ -466,6 +493,12 @@ Cross-harness journeys:
   twelve rows above.
 - Approval and permission callbacks come from several harnesses, not only
   Claude. Restricting a gate to one harness breaks the others' approvals.
+- Idle reap: an open Terminal view spares a pane only for 120 s after human
+  input, so leaving it open does not keep the pane. With the default one-hour
+  window an idle top-level runner can exit first and clean everything up,
+  which hides a leak; use the short window. The reaper logs reaps, not spared
+  panes: for one that never goes, check for a screen that keeps changing, a
+  fresh approval marker, and a `running` record the server still agrees with.
 - Needing sign-in and not being installed are different states with different
   prompts. Reproduce on a host with the same credential situation as the reporter.
 - Some harnesses have a sign-in flow of their own when launched outside
