@@ -549,6 +549,36 @@ def test_non_canonical_signature_spellings_are_refused(alg: str) -> None:
             keys.decode(variant)
 
 
+def test_non_canonical_signatures_are_refused_even_by_a_lenient_pyjwt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``PyJWT>=2.8`` is allowed, and releases before 2.15 decode leniently.
+
+    Simulates that decoder, so the canonical check here does not rest on
+    the PyJWT version the lock happens to pin.
+    """
+    from jwt import api_jws
+    from jwt.utils import base64url_decode
+
+    monkeypatch.setattr(
+        api_jws.PyJWS,
+        "_decode_base64url_segment",
+        staticmethod(lambda segment, name: base64url_decode(segment)),
+    )
+    for alg in ("EdDSA", "HS256"):
+        keys = _window_open()
+        token = keys.encode(_claims(), kind=IDENTITY) if alg == "EdDSA" else _hs256(_claims())
+        head, body, sig = token.split(".")
+        bit_flipped = f"{head}.{body}.{sig[:-1]}{_same_bytes_last_char(sig)}"
+        # The lenient decoder alone accepts the second spelling...
+        unverified = jwt.decode(bit_flipped, options={"verify_signature": False})
+        assert unverified["sub"] == "alice@example.com"
+        # ...and the session verifier refuses it and the padded one.
+        for variant in (bit_flipped, f"{token}=="):
+            with pytest.raises(jwt.DecodeError):
+                keys.decode(variant)
+
+
 # ── Audience per token kind ──────────────────────────────────────
 
 
