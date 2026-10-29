@@ -21,7 +21,12 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from omnigent.server.session_signing import SessionSigningKeys, as_signing_keys
+from omnigent.server.session_signing import (  # fork
+    INTERNAL,
+    SessionSigningKeys,
+    TokenKind,
+    as_signing_keys,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -60,6 +65,7 @@ def mint_session_token(
     *,
     account_generation: str | None = None,
     cli_login_ticket: str | None = None,
+    kind: TokenKind = INTERNAL,  # fork: identity mints pass IDENTITY
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -78,6 +84,9 @@ def mint_session_token(
         ``"accounts"``. Stored as an informational claim.
     :param cli_login_ticket: Ticket authenticated by the browser callback,
         never included in runner, refresh, or CLI-issued credentials.
+    :param kind: fork: who may accept the token
+        (:data:`omnigent.server.session_signing.TokenKind`). The default,
+        ``internal``, is Omnigent only; identity logins pass ``identity``.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
@@ -91,7 +100,7 @@ def mint_session_token(
         payload["account_generation"] = account_generation
     if cli_login_ticket is not None:
         payload["cli_login_ticket"] = cli_login_ticket
-    return as_signing_keys(keys).encode(payload)  # fork: EdDSA when a key is configured
+    return as_signing_keys(keys).encode(payload, kind=kind)  # fork: EdDSA when a key is configured
 
 
 def mint_session_cookie(
@@ -102,6 +111,7 @@ def mint_session_cookie(
     *,
     account_generation: str | None = None,
     cli_login_ticket: str | None = None,
+    kind: TokenKind = INTERNAL,  # fork: identity mints pass IDENTITY
 ) -> str:
     """Mint a signed session cookie JWT.
 
@@ -112,6 +122,7 @@ def mint_session_cookie(
     :param provider: Identity provider name, e.g. ``"google"``
         or ``"github"``. Stored as an informational claim.
     :param cli_login_ticket: Ticket authenticated by the browser callback.
+    :param kind: fork: see :func:`mint_session_token`.
     :returns: An HS256-signed JWT string.
     """
     return mint_session_token(
@@ -121,6 +132,7 @@ def mint_session_cookie(
         provider,
         account_generation=account_generation,
         cli_login_ticket=cli_login_ticket,
+        kind=kind,
     )
 
 

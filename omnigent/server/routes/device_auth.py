@@ -73,7 +73,10 @@ from omnigent.server.routes._oauth import (
 from omnigent.server.routes._oauth import oauth_error as _oauth_error
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.session_signing import (  # fork
+    IDENTITY,
+    INTERNAL,
     SessionSigningKeys,
+    TokenKind,
     as_signing_keys,
     provider_signing_keys,
 )
@@ -205,6 +208,7 @@ def mint_delegated_token(
     jti: str,
     scope: str | None = DELEGATED_SCOPE,
     account_generation: str | None = None,
+    kind: TokenKind = INTERNAL,  # fork: only the first-party login grant passes IDENTITY
 ) -> str:
     """Mint a grant-derived or client-credential access token.
 
@@ -245,6 +249,9 @@ def mint_delegated_token(
     :param jti: Unique token id.
     :param scope: Granted scope, or ``None`` for a full-authority
         (login-grant) token. Defaults to :data:`DELEGATED_SCOPE`.
+    :param kind: fork: who may accept the token
+        (:data:`omnigent.server.session_signing.TokenKind`). Defaults to
+        ``internal`` (Omnigent only).
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
@@ -262,7 +269,7 @@ def mint_delegated_token(
         payload["grant_id"] = grant_id
     if scope is not None:
         payload["scope"] = scope
-    return as_signing_keys(keys).encode(payload)  # fork: EdDSA when a key is configured
+    return as_signing_keys(keys).encode(payload, kind=kind)  # fork: EdDSA when a key is configured
 
 
 def _require_browser_origin(request: Request) -> None:
@@ -448,7 +455,8 @@ def create_oauth_token_router(
         # A first-party login grant renews with the SAME authority as the
         # session JWT it replaces (scope=None); a third-party device grant
         # stays restricted to the delegated allowlist.
-        scope = None if _is_login_grant(client_id) else DELEGATED_SCOPE
+        login_grant = _is_login_grant(client_id)
+        scope = None if login_grant else DELEGATED_SCOPE
         return mint_delegated_token(
             user_id,
             signing_keys,  # fork
@@ -459,6 +467,9 @@ def create_oauth_token_router(
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
             scope=scope,
+            # fork: the CLI/host login's refresh is an identity token; a
+            # third-party device grant's is Omnigent-only.
+            kind=IDENTITY if login_grant else INTERNAL,
         )
 
     @router.post("/oauth/token", dependencies=[])
@@ -709,6 +720,7 @@ def create_device_auth_router(
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
+            kind=INTERNAL,  # fork: a third-party device grant (the reserved login id is refused)
         )
 
     # ── Device authorization (public) ─────────────────────────────

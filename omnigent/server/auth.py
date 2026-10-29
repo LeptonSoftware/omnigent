@@ -617,6 +617,7 @@ class UnifiedAuthProvider(AuthProvider):
             return None
         from omnigent.db.account_authority import account_generation
         from omnigent.server.oidc import mint_session_token
+        from omnigent.server.session_signing import INTERNAL  # fork
 
         return mint_session_token(
             user_id,
@@ -624,6 +625,7 @@ class UnifiedAuthProvider(AuthProvider):
             ttl_seconds,
             self._source,
             account_generation=account_generation(user_id),
+            kind=INTERNAL,  # fork: handed to sandboxes; never a Jarvis credential
         )
 
     def _check_cookie(self, request: HTTPConnection) -> str | None:

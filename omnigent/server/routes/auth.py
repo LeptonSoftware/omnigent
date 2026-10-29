@@ -62,6 +62,7 @@ from omnigent.server.routes.device_auth import (
     _generate_user_code,
     issue_login_grant,
 )
+from omnigent.server.session_signing import IDENTITY  # fork
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -590,6 +591,7 @@ def create_auth_router(
         session_jwt = mint_session_cookie(
             user_id=email,
             keys=config.signing_keys,  # fork
+            kind=IDENTITY,  # fork: a sign-in; Jarvis accepts it
             ttl_hours=config.session_ttl_hours,
             provider=config.provider_type,
             cli_login_ticket=authenticated_ticket,
@@ -919,6 +921,7 @@ def create_auth_router(
         ticket.token = mint_session_cookie(
             user_id=user_id,
             keys=config.signing_keys,  # fork
+            kind=IDENTITY,  # fork: a sign-in; Jarvis accepts it
             ttl_hours=config.session_ttl_hours,
             provider=config.provider_type,
         )
@@ -1109,6 +1112,7 @@ def create_auth_router(
             "token": mint_session_cookie(
                 user_id=pending.user_id,
                 keys=config.signing_keys,  # fork
+                kind=IDENTITY,  # fork: a sign-in; Jarvis accepts it
                 ttl_hours=config.session_ttl_hours,
                 provider=config.provider_type,
             ),

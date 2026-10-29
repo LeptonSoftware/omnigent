@@ -26,6 +26,9 @@ from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider, create_auth_provider
 from omnigent.server.oidc import mint_session_cookie, mint_session_token
 from omnigent.server.session_signing import (
+    CLOCK_SKEW_LEEWAY_SECONDS,
+    IDENTITY,
+    INTERNAL,
     JWKS_CACHE_CONTROL,
     MODE_EDDSA,
     PublicSigningKey,
@@ -114,7 +117,7 @@ def _claims(**overrides: object) -> dict[str, object]:
 
 def test_mint_then_verify_round_trips_with_contract_header_and_claims() -> None:
     keys = _eddsa_keys()
-    token = mint_session_token("alice@example.com", keys, 600, "oidc")
+    token = mint_session_token("alice@example.com", keys, 600, "oidc", kind=IDENTITY)
 
     header = jwt.get_unverified_header(token)
     assert header == {"alg": "EdDSA", "kid": keys.current_key.kid}
@@ -129,7 +132,7 @@ def test_mint_then_verify_round_trips_with_contract_header_and_claims() -> None:
 def test_token_verifies_with_only_the_published_jwk() -> None:
     """What Jarvis does: verify with the JWKS entry, no Omnigent code."""
     keys = _eddsa_keys()
-    token = mint_session_cookie("alice@example.com", keys, 8, "oidc")
+    token = mint_session_cookie("alice@example.com", keys, 8, "oidc", kind=IDENTITY)
 
     (jwk,) = keys.jwks()["keys"]
     claims = jwt.decode(
@@ -167,7 +170,7 @@ def test_kid_is_the_rfc7638_thumbprint() -> None:
 
 def test_kid_selects_the_previous_key_after_rotation() -> None:
     old = Ed25519PrivateKey.generate()
-    token = _eddsa_keys(old).encode(_claims())
+    token = _eddsa_keys(old).encode(_claims(), kind=IDENTITY)
 
     rotated = _eddsa_keys(Ed25519PrivateKey.generate(), previous=old)
     assert rotated.decode(token)["sub"] == "alice@example.com"
@@ -220,7 +223,7 @@ def test_missing_issuer_is_refused() -> None:
 def test_expired_token_is_refused() -> None:
     keys = _eddsa_keys()
     past = int(time.time()) - 3600
-    token = keys.encode(_claims(iat=past, exp=past + 60))
+    token = keys.encode(_claims(iat=past, exp=past + 60), kind=IDENTITY)
     with pytest.raises(jwt.ExpiredSignatureError):
         keys.decode(token)
 
@@ -296,7 +299,7 @@ def test_provider_accepts_eddsa_bearer_and_mints_eddsa_runner_tokens() -> None:
     assert jwt.get_unverified_header(runner_token)["alg"] == "EdDSA"
     assert provider.get_user_id(_Request(runner_token)) == "alice"
     assert provider.get_user_id(_Request(_hs256(_claims(sub="alice")))) is None
-    stranger = _eddsa_keys().encode(_claims(sub="alice"))
+    stranger = _eddsa_keys().encode(_claims(sub="alice"), kind=IDENTITY)
     assert provider.get_user_id(_Request(stranger)) is None
 
 
@@ -411,3 +414,267 @@ async def test_jwks_route_is_public_and_cacheable(
     assert resp.status_code == 200
     assert resp.headers["cache-control"] == JWKS_CACHE_CONTROL
     assert resp.json() == keys.jwks()
+
+
+# ── QA hardening: claims, clock skew, canonical signatures ───────
+
+
+def _window_open() -> SessionSigningKeys:
+    """EdDSA keys still inside the HS256 window."""
+    return _eddsa_keys(legacy_until=datetime.now(timezone.utc) + timedelta(days=1))
+
+
+def _hs256_verifiers() -> list[SessionSigningKeys]:
+    """Both ways HS256 is accepted: hs256 mode, and EdDSA mode inside the window."""
+    return [SessionSigningKeys.hs256(_SECRET), _window_open()]
+
+
+@pytest.mark.parametrize("missing", ["exp", "iat", "sub"])
+def test_hs256_token_without_exp_iat_or_sub_is_refused(missing: str) -> None:
+    claims = _claims()
+    del claims[missing]
+    token = _hs256(claims)
+    for keys in _hs256_verifiers():
+        with pytest.raises(jwt.MissingRequiredClaimError):
+            keys.decode(token)
+
+
+def test_hs256_tokens_from_every_pre_eddsa_mint_path_still_verify() -> None:
+    """The shapes 92413b705 minted: session cookie/CLI/runner, and grant/machine tokens."""
+    from omnigent.server.routes.device_auth import mint_delegated_token
+
+    legacy = SessionSigningKeys.hs256(_SECRET)
+    tokens = [
+        mint_session_cookie("alice@example.com", _SECRET, 8, "oidc", account_generation="g1"),
+        mint_session_token("alice@example.com", _SECRET, 300, "accounts"),
+        mint_delegated_token(
+            "alice@example.com",
+            _SECRET,
+            3600,
+            "oidc",
+            grant_id="g",
+            client_id="omnigent-cli",
+            jti="j",
+            scope=None,
+        ),
+        mint_delegated_token(
+            "svc@example.com", _SECRET, 3600, "oidc", grant_id=None, client_id="m", jti="j"
+        ),
+    ]
+    for token in tokens:
+        assert jwt.get_unverified_header(token)["alg"] == "HS256"
+        for keys in [legacy, _window_open()]:
+            assert keys.decode(token)["sub"] in ("alice@example.com", "svc@example.com")
+
+
+def test_oauth_state_jwt_is_not_a_session_token() -> None:
+    """The /auth/login state JWT shares the cookie secret but has no sub or iat."""
+    state = _hs256({"state": "s", "code_verifier": "v", "return_to": "/", "exp": 2**31})
+    for keys in _hs256_verifiers():
+        with pytest.raises(jwt.MissingRequiredClaimError):
+            keys.decode(state)
+
+
+@pytest.mark.parametrize("alg", ["EdDSA", "HS256"])
+def test_iat_and_nbf_tolerate_clock_skew_but_not_beyond_the_leeway(alg: str) -> None:
+    keys = _window_open()
+
+    def mint(**overrides: object) -> str:
+        claims = _claims(**overrides)
+        return keys.encode(claims, kind=IDENTITY) if alg == "EdDSA" else _hs256(claims)
+
+    now = int(time.time())
+    assert keys.decode(mint(iat=now + 3))["sub"] == "alice@example.com"
+    assert keys.decode(mint(nbf=now + 30))["sub"] == "alice@example.com"
+    with pytest.raises(jwt.ImmatureSignatureError):
+        keys.decode(mint(iat=now + CLOCK_SKEW_LEEWAY_SECONDS + 30))
+    with pytest.raises(jwt.ImmatureSignatureError):
+        keys.decode(mint(nbf=now + CLOCK_SKEW_LEEWAY_SECONDS + 30))
+
+
+@pytest.mark.parametrize("alg", ["EdDSA", "HS256"])
+def test_exp_gets_no_leeway(alg: str) -> None:
+    keys = _window_open()
+    now = int(time.time())
+    claims = _claims(iat=now - 600, exp=now - 1)
+    token = keys.encode(claims, kind=IDENTITY) if alg == "EdDSA" else _hs256(claims)
+    with pytest.raises(jwt.ExpiredSignatureError):
+        keys.decode(token)
+
+
+@pytest.mark.parametrize("alg", ["EdDSA", "HS256"])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"exp": str(int(time.time()) + 600)},
+        {"iat": True},
+        {"exp": float("nan")},
+        {"nbf": str(int(time.time()))},
+    ],
+    ids=["exp-string", "iat-bool", "exp-nan", "nbf-string"],
+)
+def test_non_numeric_time_claims_are_refused(alg: str, overrides: dict[str, object]) -> None:
+    keys = _window_open()
+    claims = _claims(**overrides)
+    token = keys.encode(claims, kind=IDENTITY) if alg == "EdDSA" else _hs256(claims)
+    with pytest.raises(jwt.InvalidTokenError):
+        keys.decode(token)
+
+
+_B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def _same_bytes_last_char(signature: str) -> str:
+    """A different final character that base64-decodes to the same bytes."""
+    spare_bits = (len(signature) * 6) % 8
+    index = _B64URL.index(signature[-1])
+    return _B64URL[index ^ ((1 << spare_bits) - 1)]
+
+
+@pytest.mark.parametrize("alg", ["EdDSA", "HS256"])
+def test_non_canonical_signature_spellings_are_refused(alg: str) -> None:
+    keys = _window_open()
+    token = keys.encode(_claims(), kind=IDENTITY) if alg == "EdDSA" else _hs256(_claims())
+    head, body, sig = token.split(".")
+    assert keys.decode(token)["sub"] == "alice@example.com"
+
+    bit_flipped = f"{head}.{body}.{sig[:-1]}{_same_bytes_last_char(sig)}"
+    padded = f"{token}=="
+    # Both spellings carry the very same signature bytes...
+    assert base64.urlsafe_b64decode(bit_flipped.split(".")[2] + "==") == base64.urlsafe_b64decode(
+        sig + "=="
+    )
+    for variant in (bit_flipped, padded, f"{token}=", f"{token}.", f" {token}"):
+        with pytest.raises(jwt.DecodeError):
+            keys.decode(variant)
+
+
+# ── Audience per token kind ──────────────────────────────────────
+
+
+def test_identity_tokens_carry_jarvis_and_internal_tokens_do_not() -> None:
+    keys = _eddsa_keys()
+    identity = keys.decode(keys.encode(_claims(), kind=IDENTITY))
+    internal = keys.decode(keys.encode(_claims(), kind=INTERNAL))
+    assert identity["aud"] == ["omnigent", "jarvis"]
+    assert internal["aud"] == ["omnigent"]
+    (jwk,) = keys.jwks()["keys"]
+    with pytest.raises(jwt.InvalidAudienceError):
+        jwt.decode(
+            keys.encode(_claims(), kind=INTERNAL),
+            _public_from_jwk(jwk),
+            algorithms=["EdDSA"],
+            audience="jarvis",
+            issuer=_ISSUER,
+        )
+
+
+def test_configured_audience_applies_to_identity_tokens_only() -> None:
+    keys = _eddsa_keys(audience=("omnigent", "jarvis", "atlas"))
+    assert keys.decode(keys.encode(_claims(), kind=IDENTITY))["aud"] == [
+        "omnigent",
+        "jarvis",
+        "atlas",
+    ]
+    assert keys.decode(keys.encode(_claims(), kind=INTERNAL))["aud"] == ["omnigent"]
+
+
+def test_managed_runner_token_is_never_a_jarvis_token() -> None:
+    provider = UnifiedAuthProvider(
+        source="accounts", accounts_config=_accounts_config(_eddsa_keys())
+    )
+    runner_token = provider.mint_runner_token("alice", 1800)
+    assert runner_token is not None
+    claims = jwt.decode(runner_token, options={"verify_signature": False})
+    assert claims["aud"] == ["omnigent"]
+    assert "jarvis" not in claims["aud"]
+
+
+def test_machine_client_token_is_omnigent_only() -> None:
+    from omnigent.server.routes.device_auth import DELEGATED_SCOPE, mint_delegated_token
+
+    keys = _eddsa_keys()
+    token = mint_delegated_token(
+        "svc@example.com",
+        keys,
+        600,
+        "oidc",
+        grant_id=None,
+        client_id="m",
+        jti="j",
+        scope=DELEGATED_SCOPE,
+        kind=INTERNAL,
+    )
+    assert keys.decode(token)["aud"] == ["omnigent"]
+
+
+def test_login_grant_refresh_is_identity_and_device_grant_refresh_is_internal(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+    from omnigent.server.routes.device_auth import create_oauth_token_router, issue_login_grant
+
+    keys = _eddsa_keys()
+    provider = SimpleNamespace(
+        _source="oidc",
+        _oidc_config=SimpleNamespace(cookie_secret=_SECRET, signing_keys=keys),
+    )
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+    app = FastAPI()
+    app.include_router(create_oauth_token_router(provider, store))  # type: ignore[arg-type]
+
+    login_refresh = issue_login_grant(store, user_id="alice@example.com", cookie_secret=_SECRET)
+    device_refresh = "device-refresh-token"
+    store.create_redeemed_grant(
+        "slack-grant",
+        user_id="alice@example.com",
+        client_id="slack",
+        refresh_token_hash=hash_secret(device_refresh, _SECRET),
+        created_at=int(time.time()),
+    )
+    with TestClient(app) as client:
+        login = client.post(
+            "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": login_refresh}
+        )
+        device = client.post(
+            "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": device_refresh}
+        )
+    assert login.status_code == 200, login.text
+    assert device.status_code == 200, device.text
+    assert keys.decode(login.json()["access_token"])["aud"] == ["omnigent", "jarvis"]
+    assert keys.decode(device.json()["access_token"])["aud"] == ["omnigent"]
+
+
+def test_every_production_mint_site_names_its_token_kind() -> None:
+    """A new mint call that forgets ``kind=`` would silently pick a default."""
+    import ast
+
+    import omnigent
+
+    minters = {"mint_session_token", "mint_session_cookie", "mint_delegated_token", "encode"}
+    root = Path(omnigent.__file__).parent
+    unnamed: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name not in minters:
+                continue
+            if name == "encode" and not (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Call)
+                and getattr(func.value.func, "id", None) == "as_signing_keys"
+            ):
+                continue
+            if not any(k.arg == "kind" for k in node.keywords):
+                unnamed.append(f"{path.relative_to(root)}:{node.lineno} {name}")
+    assert unnamed == []
+
