@@ -451,6 +451,18 @@ def _is_final_refusal(resp: httpx.Response) -> bool:
     return isinstance(body, dict) and body.get("error") in ("invalid_grant", "expired_token")
 
 
+# fork: forced refreshes (after the server refused a stored login) that
+# failed transiently, keyed by (server, digest of the refused token):
+# (monotonic time before which none is retried, consecutive failures).
+# Every 401 asks for one, so without this a 5xx refresh endpoint would get
+# one POST per request or dial. Definitive refusals are covered by
+# _refused_refresh_digests; a new login changes the refused token's key.
+_forced_refresh_backoff: dict[tuple[str, str], tuple[float, int]] = {}
+FORCED_REFRESH_BACKOFF_BASE_S = 5.0
+FORCED_REFRESH_BACKOFF_CAP_S = 300.0
+_clock = time.monotonic  # patched by tests
+
+
 def _refresh_digest(refresh_token: str) -> str:
     """Return a digest that identifies *refresh_token* without holding it."""
     return hashlib.sha256(refresh_token.encode()).hexdigest()
@@ -498,15 +510,36 @@ def refresh_stored_token(
         # fork: the server already refused this exact refresh token. Asking
         # again cannot succeed; a new `omnigent login` stores a different one.
         return None
+    backoff_key = (normalized, _refresh_digest(rejected_token)) if rejected_token else None
+    if backoff_key is not None:
+        backoff = _forced_refresh_backoff.get(backoff_key)
+        if backoff is not None and _clock() < backoff[0]:
+            # fork: the last forced refresh for this token failed; wait out
+            # its backoff. Another process may have renewed it meanwhile.
+            current = pre.get("token")
+            return load_token(server_url) if current != rejected_token else None
     try:
         with _token_file_lock():
-            return _refresh_locked(server_url, normalized, timeout, rejected_token)
+            renewed = _refresh_locked(server_url, normalized, timeout, rejected_token)
     except OSError as exc:
         # Cannot lock/persist (read-only or full state dir) — a refresh we
         # could not store is worse than none, so decline and let the caller
         # fall through to its other credential sources.
         _logger.debug("Token refresh for %s skipped, state dir unusable: %s", normalized, exc)
-        return None
+        renewed = None
+    if backoff_key is not None:
+        _note_forced_refresh(backoff_key, succeeded=renewed is not None)
+    return renewed
+
+
+def _note_forced_refresh(key: tuple[str, str], *, succeeded: bool) -> None:
+    """fork: clear, or grow, the backoff of a forced refresh."""
+    if succeeded:
+        _forced_refresh_backoff.pop(key, None)
+        return
+    failures = _forced_refresh_backoff.get(key, (0.0, 0))[1] + 1
+    delay = min(FORCED_REFRESH_BACKOFF_BASE_S * 2 ** (failures - 1), FORCED_REFRESH_BACKOFF_CAP_S)
+    _forced_refresh_backoff[key] = (_clock() + delay, failures)
 
 
 def _refresh_locked(
