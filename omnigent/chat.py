@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
@@ -865,6 +865,37 @@ class _DatabricksTokenAuth(httpx.Auth):
         :param request: The outgoing httpx request.
         :yields: The request with auth header set.
         """
+        sent_login = self._authorize(request)
+        response = yield request
+        if self._should_renew(request, response, sent_login):  # fork
+            renewed = self._renew_login(sent_login)
+            if renewed:
+                request.headers["Authorization"] = f"Bearer {renewed}"
+                yield request
+
+    async def async_auth_flow(  # fork: the renewal's refresh POST runs off the loop
+        self, request: httpx.Request
+    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        """Async twin of :meth:`auth_flow`; the refresh runs in a worker thread.
+
+        :param request: The outgoing httpx request.
+        :yields: The request with auth header set.
+        """
+        sent_login = self._authorize(request)
+        response = yield request
+        if self._should_renew(request, response, sent_login):
+            renewed = await asyncio.to_thread(self._renew_login, sent_login)
+            if renewed:
+                request.headers["Authorization"] = f"Bearer {renewed}"
+                yield request
+
+    def _authorize(self, request: httpx.Request) -> str | None:
+        """Set the routing and ``Authorization`` headers on *request*.
+
+        :param request: The outgoing httpx request.
+        :returns: The stored ``omnigent login`` token sent, or ``None`` when
+            the bearer came from elsewhere (env var, Databricks SDK).
+        """
         # Workspace routing (empty when none recorded); independent of the
         # credential branch below. On a host-sharded deployment, also pin the
         # turn/resource/stream traffic for this client's session to the replica
@@ -890,27 +921,43 @@ class _DatabricksTokenAuth(httpx.Auth):
                 oidc_token = load_token(self._server_url)
             if oidc_token:
                 request.headers["Authorization"] = f"Bearer {oidc_token}"
-            else:
-                token = self._sdk_token()
-                if token:
-                    request.headers["Authorization"] = f"Bearer {token}"
-            if oidc_token and self._server_url:
-                # fork: a stored login the server refuses (e.g. an HS256 token
-                # after the EdDSA switch, weeks from its local expiry) is
-                # renewed once through its refresh grant and the request
-                # retried; a refused refresh leaves the 401 as it was.
-                response = yield request
-                # Only an in-memory body can be sent twice; a streamed upload
-                # keeps its 401.
-                if response.status_code == 401 and isinstance(request.stream, httpx.ByteStream):
-                    from omnigent.cli_auth import refresh_stored_token
+                return oidc_token
+            token = self._sdk_token()
+            if token:
+                request.headers["Authorization"] = f"Bearer {token}"
+        return None
 
-                    renewed = refresh_stored_token(self._server_url, rejected_token=oidc_token)
-                    if renewed and renewed != oidc_token:
-                        request.headers["Authorization"] = f"Bearer {renewed}"
-                        yield request
-                return
-        yield request
+    def _should_renew(
+        self, request: httpx.Request, response: httpx.Response, sent_login: str | None
+    ) -> bool:
+        """fork: whether a 401 on a stored login is worth one refresh and retry.
+
+        Only an in-memory body can be sent twice; a streamed upload keeps
+        its 401.
+        """
+        return (
+            sent_login is not None
+            and self._server_url is not None
+            and response.status_code == 401
+            and isinstance(request.stream, httpx.ByteStream)
+        )
+
+    def _renew_login(self, refused: str | None) -> str | None:
+        """fork: renew a stored login the server refused, once.
+
+        e.g. an HS256 login after the EdDSA switch, weeks from its local
+        expiry. :func:`omnigent.cli_auth.refresh_stored_token` backs off
+        after a failed refresh, so a broken refresh endpoint does not cost
+        one POST per request.
+
+        :param refused: The token the server answered 401 to.
+        :returns: A different, renewed token, or ``None``.
+        """
+        from omnigent.cli_auth import refresh_stored_token
+
+        assert self._server_url is not None and refused is not None
+        renewed = refresh_stored_token(self._server_url, rejected_token=refused)
+        return renewed if renewed and renewed != refused else None
 
 
 def _server_headers(

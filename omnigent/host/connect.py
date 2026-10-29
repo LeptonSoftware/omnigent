@@ -1246,8 +1246,10 @@ class HostProcess:
         # Reset by a successful upgrade or non-auth error; bounds fresh-host refresh retries.
         self._auth_retry_streak = 0
         # fork: an auth rejection asked the token factory for one forced
-        # refresh; the next dial goes out promptly with the renewed token.
+        # refresh; the next dial goes out promptly only if it renewed the
+        # bearer last sent on the tunnel.
         self._auth_refresh_requested = False
+        self._last_tunnel_bearer: str | None = None
         # Consecutive connection-refused connect failures; reset by an accepted
         # upgrade or any non-refused error. Fatal past a bounded streak only
         # when the server URL is loopback (the local server is gone).
@@ -1617,9 +1619,12 @@ class HostProcess:
         The token factory otherwise renews only within 90 s of the token's
         local ``expires_at``, so a token the server stopped accepting early
         (an HS256 login after the EdDSA switch, 30 days from expiry) would
-        be re-sent on every reconnect. The factory refreshes once per
-        refused token and never re-forces a token a forced refresh returned,
-        so a server that refuses fresh tokens too costs one refresh.
+        be re-sent on every reconnect. The factory never re-forces a token a
+        forced refresh returned, and :func:`omnigent.cli_auth.refresh_stored_token`
+        backs off a failed refresh (and never re-presents a refused grant),
+        so neither a server refusing fresh tokens nor a broken refresh
+        endpoint is hit once per dial. The reconnect loop redials at once
+        only when the bearer actually changed.
 
         :param status: The refusing HTTP status, e.g. ``401``.
         :returns: ``True`` when the next dial carries a renewed token.
@@ -1632,7 +1637,11 @@ class HostProcess:
         if not _invalidate_auth_token_factory(factory):
             return False
         self._auth_refresh_requested = True
-        _logger.info("Host tunnel refused (HTTP %d); refreshing the stored login once.", status)
+        _logger.log(
+            logging.INFO if self._auth_retry_streak == 1 else logging.DEBUG,
+            "Host tunnel refused (HTTP %d); refreshing the stored login.",
+            status,
+        )
         return True
 
     def _classify_http_status(self, status: int, body: str = "") -> HostConnectError | None:
@@ -4288,10 +4297,12 @@ class HostProcess:
                     if login_dead:
                         wait_s = max(wait_s, _AUTH_REJECT_SLOW_RETRY_S)
                     if self._auth_refresh_requested:
-                        # fork: retry at once with the token the factory renews.
                         self._auth_refresh_requested = False
-                        login_dead = False
-                        wait_s = _RECONNECT_BASE_S
+                        if await self._auth_bearer_renewed():
+                            # fork: redial at once with the renewed token. A
+                            # failed refresh keeps the backoff growing.
+                            login_dead = False
+                            wait_s = _RECONNECT_BASE_S
                     _logger.warning(
                         "Host tunnel disconnected: %s. Reconnecting in %.1fs%s",
                         exc,
@@ -4713,9 +4724,19 @@ class HostProcess:
             headers[MANAGED_HOST_TOKEN_HEADER] = managed_token
             return headers
         token = self._current_auth_token()
+        self._last_tunnel_bearer = token  # fork: see _auth_bearer_renewed
         if token:
             headers["Authorization"] = f"Bearer {token}"
         return headers
+
+    async def _auth_bearer_renewed(self) -> bool:
+        """fork: run the requested forced refresh now; did it change the bearer?
+
+        :returns: ``True`` when the factory now returns a token other than the
+            one the tunnel just sent and had refused.
+        """
+        token = await self._run_host_subprocess_in_thread(self._current_auth_token)
+        return token is not None and token != self._last_tunnel_bearer
 
     def _current_auth_token(self, *, initialize: bool = True) -> str | None:
         """Return a bearer from the host's retained refreshable auth context.
