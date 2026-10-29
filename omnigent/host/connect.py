@@ -1619,12 +1619,11 @@ class HostProcess:
         The token factory otherwise renews only within 90 s of the token's
         local ``expires_at``, so a token the server stopped accepting early
         (an HS256 login after the EdDSA switch, 30 days from expiry) would
-        be re-sent on every reconnect. The factory never re-forces a token a
-        forced refresh returned, and :func:`omnigent.cli_auth.refresh_stored_token`
-        backs off a failed refresh (and never re-presents a refused grant),
-        so neither a server refusing fresh tokens nor a broken refresh
-        endpoint is hit once per dial. The reconnect loop redials at once
-        only when the bearer actually changed.
+        be re-sent on every reconnect. :func:`omnigent.cli_auth.refresh_stored_token`
+        refreshes a refused token at most once per machine and backs off a
+        failed refresh, so neither a server refusing fresh tokens nor a
+        broken refresh endpoint is hit once per dial. The reconnect loop
+        redials at once only when the bearer actually changed.
 
         :param status: The refusing HTTP status, e.g. ``401``.
         :returns: ``True`` when the next dial carries a renewed token.
@@ -4452,9 +4451,9 @@ class HostProcess:
         """Sleep *wait_s* before the next dial, waking early when it is moot.
 
         Wakes when the lifecycle monitor loses ownership. With
-        *watch_login*, also wakes as soon as the stored-token file changes,
-        so a long auth-rejection wait ends the moment the operator runs
-        ``omnigent login``.
+        *watch_login*, also wakes as soon as the stored login changes to one
+        not already refused, so a long auth-rejection wait ends the moment
+        the operator runs ``omnigent login``.
 
         :param wait_s: Maximum seconds to wait, e.g. ``60.0``.
         :param watch_login: Poll the token file for a fresh login.
@@ -4463,15 +4462,19 @@ class HostProcess:
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._lifecycle_lost.wait(), timeout=wait_s)
             return
-        from omnigent.cli_auth import _token_file_path
+        from omnigent.cli_auth import is_refused_login, stored_login_digest
 
-        def _token_file_stamp() -> float | None:
-            try:
-                return _token_file_path().stat().st_mtime
-            except OSError:
-                return None
+        def _new_usable_login() -> bool:
+            # fork: wake for a changed login only, never for a token this
+            # machine already saw refused, or for a rewrite of the same one.
+            digest = stored_login_digest(self._server_url)
+            return (
+                digest is not None
+                and digest != start_digest
+                and not is_refused_login(self._server_url, digest)
+            )
 
-        start_stamp = _token_file_stamp()
+        start_digest = stored_login_digest(self._server_url)
         deadline = time.monotonic() + wait_s
         while (remaining := deadline - time.monotonic()) > 0:
             with contextlib.suppress(asyncio.TimeoutError):
@@ -4480,7 +4483,7 @@ class HostProcess:
                 )
             if self._lifecycle_lost.is_set():
                 return
-            if _token_file_stamp() != start_stamp:
+            if _new_usable_login():
                 _logger.info("Stored login changed; reconnecting now.")
                 return
 

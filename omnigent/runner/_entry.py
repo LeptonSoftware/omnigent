@@ -715,13 +715,11 @@ def _make_auth_token_factory(
     sdk_token_source: _ReusedDatabricksTokenSource | None = None
     # fork: forced refresh after the server refuses a stored-login token
     # (see _invalidate below). ``stored_token`` is the stored-login token
-    # last returned; ``rejected`` the one to renew on the next call;
-    # ``forced`` the result of the last forced refresh, which is never
-    # forced again, so a server that refuses fresh tokens too costs one
-    # refresh, not one per retry.
+    # last returned; ``rejected`` the one to renew on the next call. How
+    # often a refused token may be refreshed is decided machine-wide by
+    # refresh_stored_token, not here.
     stored_token: str | None = None
     rejected: str | None = None
-    forced: str | None = None
 
     def _factory() -> str | None:
         """Return a fresh auth token.
@@ -732,7 +730,7 @@ def _make_auth_token_factory(
         :returns: Bearer token string, or ``None`` if no credentials
             are configured.
         """
-        nonlocal sdk_token_source, stored_token, rejected, forced
+        nonlocal sdk_token_source, stored_token, rejected
         # Check stored OIDC token first.
         if resolved_server_url:
             from omnigent.cli_auth import (
@@ -747,7 +745,7 @@ def _make_auth_token_factory(
                 refused, rejected = rejected, None
                 renewed = refresh_stored_token(resolved_server_url, rejected_token=refused)
                 if renewed and renewed != refused:
-                    stored_token = forced = renewed
+                    stored_token = renewed
                     return renewed
             # Require enough remaining life that the token cannot lapse
             # mid-handshake; a token inside that window falls through to
@@ -788,12 +786,13 @@ def _make_auth_token_factory(
 
         Called through :func:`_invalidate_auth_token_factory` on a 401
         (runner callbacks, host tunnel). Only a stored-login token is
-        renewed, and never the result of a previous forced refresh.
+        renewed; :func:`omnigent.cli_auth.refresh_stored_token` decides
+        whether that costs a POST.
 
-        :returns: ``True`` when the next call will refresh.
+        :returns: ``True`` when the next call will try a refresh.
         """
         nonlocal rejected
-        if stored_token is None or stored_token == forced:
+        if stored_token is None:
             return False
         rejected = stored_token
         return True

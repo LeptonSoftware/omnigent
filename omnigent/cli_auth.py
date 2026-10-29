@@ -27,6 +27,7 @@ import json
 import logging
 import math
 import os
+import random
 import stat
 import tempfile
 import time
@@ -103,7 +104,7 @@ def _safe_log_url(url: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
-def _write_tokens_file(path: Path, data: dict[str, dict[str, str | float]]) -> None:
+def _write_tokens_file(path: Path, data: dict[str, Any]) -> None:
     """Atomically write the auth-tokens file, never exposing it readable.
 
     The previous sequence was ``path.write_text(...)`` followed by ``os.chmod``.
@@ -431,10 +432,6 @@ def _token_file_lock() -> Iterator[None]:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
-# Digests of refresh tokens the server definitively refused this process.
-_refused_refresh_digests: set[str] = set()
-
-
 def _is_final_refusal(resp: httpx.Response) -> bool:
     """Return whether the server itself rejected the refresh token.
 
@@ -451,21 +448,116 @@ def _is_final_refusal(resp: httpx.Response) -> bool:
     return isinstance(body, dict) and body.get("error") in ("invalid_grant", "expired_token")
 
 
-# fork: forced refreshes (after the server refused a stored login) that
-# failed transiently, keyed by (server, digest of the refused token):
-# (monotonic time before which none is retried, consecutive failures).
-# Every 401 asks for one, so without this a 5xx refresh endpoint would get
-# one POST per request or dial. Definitive refusals are covered by
-# _refused_refresh_digests; a new login changes the refused token's key.
-_forced_refresh_backoff: dict[tuple[str, str], tuple[float, int]] = {}
+# fork: machine-wide refresh memory. A sidecar beside auth_tokens.json, read
+# and written only under _token_file_lock, so every process on the machine
+# (host, runners, CLI, harness forwarders) shares one view of each grant:
+# whether the server killed it, its backoff, and which access token its last
+# refresh produced. It holds digests and times only, never a credential.
+REFRESH_STATE_FILE_NAME = "auth_refresh_state.json"
 FORCED_REFRESH_BACKOFF_BASE_S = 5.0
 FORCED_REFRESH_BACKOFF_CAP_S = 300.0
-_clock = time.monotonic  # patched by tests
+# Each backoff step is scaled by a factor in this range, so hosts refused
+# together do not retry together.
+FORCED_REFRESH_JITTER = (0.5, 1.5)
+_REFUSED_ACCESS_MEMORY = 16
+_clock = time.time  # wall clock, shared across processes; patched by tests
+_jitter = random.uniform  # patched by tests
+
+_OUTCOME_OK = "ok"
+_OUTCOME_DEAD = "invalid_grant"
+_OUTCOME_TRANSIENT = "transient"
+_OUTCOME_FRESH_REFUSED = "fresh_token_refused"
 
 
-def _refresh_digest(refresh_token: str) -> str:
-    """Return a digest that identifies *refresh_token* without holding it."""
-    return hashlib.sha256(refresh_token.encode()).hexdigest()
+def _refresh_digest(secret: str) -> str:
+    """Return a digest that identifies *secret* (a token) without holding it."""
+    return hashlib.sha256(secret.encode()).hexdigest()
+
+
+def _refresh_state_path() -> Path:
+    return _token_file_path().with_name(REFRESH_STATE_FILE_NAME)
+
+
+def _load_refresh_state() -> dict[str, Any]:
+    """Read the refresh sidecar; a missing or corrupt file reads as empty."""
+    try:
+        data = json.loads(_refresh_state_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _server_refresh_state(state: dict[str, Any], normalized: str) -> dict[str, Any]:
+    server = state.get(normalized)
+    if not isinstance(server, dict):
+        server = state[normalized] = {}
+    if not isinstance(server.get("grants"), dict):
+        server["grants"] = {}
+    if not isinstance(server.get("refused_access"), list):
+        server["refused_access"] = []
+    return server
+
+
+def _grant_record(server: dict[str, Any], refresh_token: str) -> dict[str, Any]:
+    grants = server["grants"]
+    record = grants.get(_refresh_digest(refresh_token))
+    if not isinstance(record, dict):
+        record = grants[_refresh_digest(refresh_token)] = {}
+    return record
+
+
+def _note_refused_access(server: dict[str, Any], token: str) -> None:
+    digest = _refresh_digest(token)
+    refused = [d for d in server["refused_access"] if d != digest]
+    server["refused_access"] = [*refused, digest][-_REFUSED_ACCESS_MEMORY:]
+
+
+def _back_off(record: dict[str, Any], outcome: str, now: float) -> None:
+    """Record a failed or pointless forced refresh and push the next one out."""
+    failures = int(record.get("failures") or 0) + 1
+    step = min(FORCED_REFRESH_BACKOFF_BASE_S * 2 ** (failures - 1), FORCED_REFRESH_BACKOFF_CAP_S)
+    record.update(
+        outcome=outcome,
+        failures=failures,
+        next_allowed=now + step * _jitter(*FORCED_REFRESH_JITTER),
+    )
+
+
+def _in_backoff(record: dict[str, Any], now: float) -> bool:
+    next_allowed = record.get("next_allowed")
+    if not isinstance(next_allowed, (int, float)):
+        return False
+    # A wall-clock step backwards must not stretch a wait past its cap.
+    longest = FORCED_REFRESH_BACKOFF_CAP_S * FORCED_REFRESH_JITTER[1]
+    return now < next_allowed <= now + longest
+
+
+def is_refused_login(server_url: str, token_digest: str) -> bool:
+    """fork: whether this machine already saw the server refuse that access token.
+
+    :param server_url: The server URL, e.g. ``"http://localhost:6767"``.
+    :param token_digest: :func:`stored_login_digest` of the token.
+    :returns: ``True`` when a caller reported the token as refused.
+    """
+    server = _load_refresh_state().get(_normalize_server_url(server_url))
+    refused = server.get("refused_access") if isinstance(server, dict) else None
+    return isinstance(refused, list) and token_digest in refused
+
+
+def stored_login_digest(server_url: str) -> str | None:
+    """fork: a digest that changes whenever the stored login for *server_url* does.
+
+    :param server_url: The server URL, e.g. ``"http://localhost:6767"``.
+    :returns: The digest of the stored access token (of the whole record for
+        a record without one), or ``None`` when nothing is stored.
+    """
+    entry = _load_entry(server_url)
+    if entry is None:
+        return None
+    token = entry.get("token")
+    if isinstance(token, str):
+        return _refresh_digest(token)
+    return _refresh_digest(json.dumps(entry, sort_keys=True, default=str))
 
 
 def refresh_stored_token(
@@ -490,12 +582,13 @@ def refresh_stored_token(
     :param server_url: The server URL, e.g. ``"http://localhost:6767"``.
     :param timeout: HTTP timeout in seconds.
     :param rejected_token: fork: a token the server just answered 401 to.
-        Normally a token far from its local ``expires_at`` is returned
-        as-is; when it is this one, the refresh goes to the server anyway
-        (the server refusing a token it once issued, e.g. an HS256 login
-        after the signing switch, must not strand the client until the
-        token's 30-day local expiry). A stored token that differs from it
-        was already renewed by another process and is returned.
+        This is the one entry point for every client that saw a refusal.
+        The refresh goes to the server whatever the token's local expiry,
+        at most once per refused token on this machine: a stored token that
+        is newer than the refused one is returned without a POST; a refused
+        token that a refresh itself produced (the server refuses fresh
+        tokens too) or a failed refresh backs off, with jitter, in the
+        shared refresh state.
     :returns: A valid access token, or ``None``.
     """
     normalized = _normalize_server_url(server_url)
@@ -506,72 +599,106 @@ def refresh_stored_token(
     pre = _load_entry(server_url)
     if pre is None or not isinstance(pre.get("refresh_token"), str) or not pre["refresh_token"]:
         return None
-    if _refresh_digest(pre["refresh_token"]) in _refused_refresh_digests:
-        # fork: the server already refused this exact refresh token. Asking
-        # again cannot succeed; a new `omnigent login` stores a different one.
-        return None
-    backoff_key = (normalized, _refresh_digest(rejected_token)) if rejected_token else None
-    if backoff_key is not None:
-        backoff = _forced_refresh_backoff.get(backoff_key)
-        if backoff is not None and _clock() < backoff[0]:
-            # fork: the last forced refresh for this token failed; wait out
-            # its backoff. Another process may have renewed it meanwhile.
-            current = pre.get("token")
-            return load_token(server_url) if current != rejected_token else None
     try:
         with _token_file_lock():
-            renewed = _refresh_locked(server_url, normalized, timeout, rejected_token)
+            state = _load_refresh_state()
+            before = json.dumps(state, sort_keys=True)
+            renewed = _refresh_locked(server_url, normalized, timeout, rejected_token, state)
+            if json.dumps(state, sort_keys=True) != before:
+                _write_tokens_file(_refresh_state_path(), state)
     except OSError as exc:
         # Cannot lock/persist (read-only or full state dir) — a refresh we
         # could not store is worse than none, so decline and let the caller
         # fall through to its other credential sources.
         _logger.debug("Token refresh for %s skipped, state dir unusable: %s", normalized, exc)
-        renewed = None
-    if backoff_key is not None:
-        _note_forced_refresh(backoff_key, succeeded=renewed is not None)
+        return None
     return renewed
 
 
-def _note_forced_refresh(key: tuple[str, str], *, succeeded: bool) -> None:
-    """fork: clear, or grow, the backoff of a forced refresh."""
-    if succeeded:
-        _forced_refresh_backoff.pop(key, None)
-        return
-    failures = _forced_refresh_backoff.get(key, (0.0, 0))[1] + 1
-    delay = min(FORCED_REFRESH_BACKOFF_BASE_S * 2 ** (failures - 1), FORCED_REFRESH_BACKOFF_CAP_S)
-    _forced_refresh_backoff[key] = (_clock() + delay, failures)
-
-
 def _refresh_locked(
-    server_url: str, normalized: str, timeout: float, rejected_token: str | None = None
+    server_url: str,
+    normalized: str,
+    timeout: float,
+    rejected_token: str | None,
+    state: dict[str, Any],
 ) -> str | None:
-    """Perform the refresh exchange; caller holds the token-file lock."""
+    """Decide on, and perform, the refresh; caller holds the token-file lock.
+
+    *state* is the refresh sidecar, updated in place for the caller to save.
+    """
     # Log only the sanitized URL — the raw one may embed credentials, and the
     # refresh token is never logged.
     safe = _safe_log_url(normalized)
     entry = _load_entry(server_url)
     if entry is None:
         return None
+    refresh_token = entry.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        return None
+    server = _server_refresh_state(state, normalized)
+    record = _grant_record(server, refresh_token)
+    if rejected_token is not None:
+        _note_refused_access(server, rejected_token)
+    if record.get("outcome") == _OUTCOME_DEAD:
+        # fork: the server already refused this exact refresh token. Asking
+        # again cannot succeed; a new `omnigent login` stores a different one.
+        return None
+    token = entry.get("token")
+    token_digest = _refresh_digest(token) if isinstance(token, str) else None
+    stored_refused = rejected_token is not None and (
+        token == rejected_token or token_digest in server["refused_access"]
+    )
     # Another process may have refreshed while we waited on the lock. A
     # freshly minted token is far from expiry, so this cleanly separates
     # "someone already renewed" from "this is the same near-expiry token".
     expires_at = entry.get("expires_at", 0)
-    token = entry.get("token")
     if (
         isinstance(token, str)
-        and token != rejected_token  # fork: the server refused this one; renew it
+        and not stored_refused  # fork: the server refused the stored token; renew it
         and isinstance(expires_at, (int, float))
         and expires_at - time.time() > REFRESH_MIN_REMAINING_SECONDS
     ):
         return token
-    if rejected_token is not None and token == rejected_token:
+    now = _clock()
+    if stored_refused:
+        if _in_backoff(record, now):
+            return None
+        if token_digest == record.get("produced") and record.get("outcome") == _OUTCOME_OK:
+            # The server refuses the token its own refresh just issued (an
+            # unsynced replica or key, a proxy): another refresh now would
+            # fare no better. Wait, then allow one more.
+            _logger.warning("Server refused a freshly refreshed login for %s; backing off", safe)
+            _back_off(record, _OUTCOME_FRESH_REFUSED, now)
+            return None
         _logger.info("Server refused the stored login for %s; refreshing it once", safe)
-    refresh_token = entry.get("refresh_token")
-    if not isinstance(refresh_token, str) or not refresh_token:
-        return None
+    record["last_attempt"] = now
+    renewed = _post_refresh(server_url, normalized, safe, timeout, entry, refresh_token, record)
+    if renewed is None and stored_refused and record.get("outcome") != _OUTCOME_DEAD:
+        _back_off(record, _OUTCOME_TRANSIENT, now)
+    elif renewed is not None and not stored_refused:
+        record["failures"] = 0  # a routine renewal, not a recovery from a refusal
+    # Keep only the record of the refresh token now stored (a rotating grant
+    # moves to its new token; an older login's record is moot).
+    current = _load_entry(server_url) or {}
+    current_refresh = current.get("refresh_token")
+    if isinstance(current_refresh, str) and current_refresh:
+        server["grants"] = {_refresh_digest(current_refresh): record}
+    return renewed
 
+
+def _post_refresh(
+    server_url: str,
+    normalized: str,
+    safe: str,
+    timeout: float,
+    entry: dict[str, Any],
+    refresh_token: str,
+    record: dict[str, Any],
+) -> str | None:
+    """POST the refresh grant and store the result; *record* gets the outcome."""
     import httpx
 
+    record["outcome"] = _OUTCOME_TRANSIENT
     try:
         resp = httpx.post(
             f"{normalized}/oauth/token",
@@ -608,7 +735,7 @@ def _refresh_locked(
             # fork: invalid_grant / expired_token is final for this token.
             # Remember it so a reconnect loop stops re-presenting it every few
             # seconds (one daemon sent ~4,600 refused refreshes an hour).
-            _refused_refresh_digests.add(_refresh_digest(refresh_token))
+            record["outcome"] = _OUTCOME_DEAD
         _logger.warning(
             "Token refresh against %s refused (HTTP %d) — run `omnigent login %s` "
             "to re-authenticate.",
@@ -648,6 +775,7 @@ def _refresh_locked(
     )
     # A fresh token means any earlier expiry warning is stale; allow
     # a new one if this credential ever lapses again.
+    record.update(outcome=_OUTCOME_OK, produced=_refresh_digest(access_token))
     _warned_expired_servers.discard(normalized)
     _logger.info("Refreshed login session for %s", safe)
     return access_token
