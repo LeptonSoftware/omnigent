@@ -20,35 +20,65 @@ Settings (environment, like the other auth secrets; never the YAML file):
   PUBLIC PEM, kept in the JWKS and accepted after a rotation.
 - ``OMNIGENT_SESSION_TOKEN_ISSUER`` — ``iss``; defaults to the server's
   public base URL (OIDC redirect URI origin, or the accounts base URL).
-- ``OMNIGENT_SESSION_TOKEN_AUDIENCE`` — comma list for ``aud``; default
-  ``omnigent,jarvis``. Must contain ``omnigent``: this server verifies its
-  own tokens against that audience.
+- ``OMNIGENT_SESSION_TOKEN_AUDIENCE`` — comma list for the ``aud`` of
+  identity tokens; default ``omnigent,jarvis``. Must contain ``omnigent``:
+  this server verifies its own tokens against that audience.
 - ``OMNIGENT_LEGACY_HS256_UNTIL`` — ``YYYY-MM-DD`` (00:00 UTC) or an ISO
   datetime with offset. While ``eddsa`` is on, HS256 tokens signed with the
   cookie secret are accepted strictly before this instant and refused from
-  it on. Unset means refused at once.
+  it on. Unset means refused at once. Set it to at least the deploy date
+  plus the longest token lifetime the old server minted (the CLI login
+  token lives ``OMNIGENT_OIDC_SESSION_TTL_HOURS``, 30 days on prod) plus a
+  margin, so no HS256 token outlives the window it was minted under.
+  Clients that still hold one when the window closes recover by
+  themselves: a 401 makes them refresh once through their refresh grant.
+
+Production must set ``OMNIGENT_SESSION_SIGNING=eddsa`` explicitly. Docker
+compose passes ``""`` for an unset variable, and an empty mode with a
+missing or unreadable key falls back to ``hs256`` with only a log warning;
+an explicit ``eddsa`` refuses to start instead.
+
+Two token kinds (:data:`TokenKind`), chosen explicitly at every mint site:
+``identity`` tokens (browser cookie, CLI and host login, the login grant's
+refresh) carry the configured audience, ``jarvis`` included; ``internal``
+tokens (managed-runner tokens handed to sandboxes, machine client
+credentials, third-party device grants) carry ``aud: ["omnigent"]`` only,
+so no other service accepts them.
 
 ``hs256`` mode mints exactly what the server minted before this change and
-always accepts HS256. It still verifies EdDSA tokens and publishes the
+always accepts HS256, whatever ``OMNIGENT_LEGACY_HS256_UNTIL`` says: it is
+the rollback switch, and a rollback that also expired every HS256 token
+would log everyone out. It still verifies EdDSA tokens and publishes the
 JWKS when a key is configured, so flipping ``eddsa`` back to ``hs256``
 rolls back without logging out anyone who got an EdDSA token. The HS256
 path, this mode, and the ``bytes`` form of :func:`as_signing_keys` go
 away in the follow-up that removes legacy tokens.
+
+Verification, on both algorithms: ``exp``, ``iat`` and ``sub`` are
+required, ``exp``/``iat``/``nbf`` must be JSON numbers, clocks may
+disagree by :data:`CLOCK_SKEW_LEEWAY_SECONDS`, and the signature segment
+must be canonical unpadded base64url (PyJWT alone accepts a padded or
+bit-flipped final character, so one token would have several spellings).
+EdDSA tokens additionally need ``iss`` and ``aud``; HS256 tokens never had
+them.
 """
 
 from __future__ import annotations
 
 import base64
+import binascii
 import dataclasses
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from urllib.parse import urlsplit
 
 import jwt
@@ -78,6 +108,22 @@ MODE_HS256 = "hs256"
 SERVER_AUDIENCE = "omnigent"
 DEFAULT_AUDIENCE: tuple[str, ...] = ("omnigent", "jarvis")
 JWKS_CACHE_CONTROL = "public, max-age=300"
+# Same tolerance #66 gives the IdP's id_token: with none, a verifier one
+# second behind the minting clock refuses a fresh token ("iat" in the future).
+# It applies to iat and nbf only; exp stays exact (see SessionSigningKeys.decode).
+CLOCK_SKEW_LEEWAY_SECONDS = 60
+
+TokenKind = Literal["identity", "internal"]
+"""Who a token is for. ``identity``: a signed-in person (cookie, CLI and host
+login and its refresh); carries the configured audience, ``jarvis`` included.
+``internal``: runner, sandbox, machine and third-party device tokens;
+``aud`` is ``["omnigent"]`` only."""
+IDENTITY: TokenKind = "identity"
+INTERNAL: TokenKind = "internal"
+
+_REQUIRED_CLAIMS = ("exp", "iat", "sub")
+_NUMERIC_CLAIMS = ("exp", "iat", "nbf")
+_B64URL_UNPADDED = re.compile(r"[A-Za-z0-9_-]+")
 
 
 class SessionSigningConfigError(RuntimeError):
@@ -186,14 +232,27 @@ class SessionSigningKeys:
             return False
         return (time.time() if now is None else now) < self.legacy_hs256_until.timestamp()
 
-    def encode(self, claims: dict[str, Any]) -> str:
-        """Sign *claims*. EdDSA mode adds ``iss`` and ``aud`` and a ``kid`` header."""
+    def audience_for(self, kind: TokenKind) -> tuple[str, ...]:
+        """The ``aud`` an EdDSA token of *kind* carries."""
+        if kind == IDENTITY:
+            return self.audience
+        if kind == INTERNAL:
+            return (SERVER_AUDIENCE,)
+        raise ValueError(f"unknown token kind {kind!r}")
+
+    def encode(self, claims: dict[str, Any], *, kind: TokenKind) -> str:
+        """Sign *claims*. EdDSA mode adds ``iss``, the *kind*'s ``aud`` and a ``kid`` header.
+
+        :param kind: :data:`IDENTITY` or :data:`INTERNAL`; no default, so
+            every mint site states who may accept the token.
+        """
+        audience = self.audience_for(kind)
         if self.mode == MODE_HS256:
             return jwt.encode(claims, self.legacy_secret, algorithm="HS256")
         assert self.signing_key is not None and self.issuer is not None
         current = self.current_key
         assert current is not None
-        payload = {**claims, "iss": self.issuer, "aud": list(self.audience)}
+        payload = {**claims, "iss": self.issuer, "aud": list(audience)}
         return jwt.encode(
             payload,
             self.signing_key,
@@ -204,33 +263,56 @@ class SessionSigningKeys:
     def decode(self, token: str) -> dict[str, Any]:
         """Verify *token* and return its claims.
 
-        EdDSA: the ``kid`` must name a published key, and ``iss``, ``aud``
-        (must include ``omnigent``), ``exp``, ``iat`` and ``sub`` are checked.
-        HS256: accepted only while :meth:`accepts_hs256`. Any other ``alg``
-        is refused.
+        Both algorithms: the signature segment must be canonical
+        (:func:`_require_canonical_signature`), ``exp``, ``iat`` and ``sub``
+        must be present, time claims must be numbers
+        (:func:`_require_numeric_times`), and ``iat``/``nbf`` may lie up to
+        :data:`CLOCK_SKEW_LEEWAY_SECONDS` in the future. ``exp`` gets no
+        leeway: a verifier ahead of the minter refusing a token a minute
+        early only makes the client refresh, while a grace period would keep
+        every token alive past the lifetime it was minted with.
+        EdDSA: the ``kid`` must name a published key, and ``iss`` and ``aud``
+        (must include ``omnigent``) are checked too.
+        HS256: accepted only while :meth:`accepts_hs256`; no ``iss``/``aud``,
+        which tokens minted before EdDSA never carried. Any other ``alg`` is
+        refused.
 
         :raises jwt.InvalidTokenError: On any failure.
         """
         header = jwt.get_unverified_header(token)
         alg = header.get("alg")
+        if alg in ("EdDSA", "HS256"):
+            _require_canonical_signature(token)
         if alg == "EdDSA":
             kid = header.get("kid")
             key = next((k.key for k in self.verification_keys if k.kid == kid), None)
             if key is None:
                 raise UnknownSigningKeyError(f"no published key has kid {kid!r}")
-            return jwt.decode(
+            claims = jwt.decode(
                 token,
                 key,
                 algorithms=["EdDSA"],
                 audience=SERVER_AUDIENCE,
                 issuer=self.issuer,
-                options={"require": ["exp", "iat", "sub", "iss", "aud"]},
+                leeway=CLOCK_SKEW_LEEWAY_SECONDS,
+                options={"require": [*_REQUIRED_CLAIMS, "iss", "aud"], "verify_exp": False},
             )
-        if alg == "HS256":
+        elif alg == "HS256":
             if not self.accepts_hs256():
                 raise jwt.InvalidAlgorithmError("HS256 session tokens are no longer accepted")
-            return jwt.decode(token, self.legacy_secret, algorithms=["HS256"])
-        raise jwt.InvalidAlgorithmError(f"unsupported session token alg {alg!r}")
+            claims = jwt.decode(
+                token,
+                self.legacy_secret,
+                algorithms=["HS256"],
+                leeway=CLOCK_SKEW_LEEWAY_SECONDS,
+                options={"require": list(_REQUIRED_CLAIMS), "verify_exp": False},
+            )
+        else:
+            raise jwt.InvalidAlgorithmError(f"unsupported session token alg {alg!r}")
+        _require_numeric_times(claims)
+        if claims["exp"] <= time.time():
+            raise jwt.ExpiredSignatureError("Signature has expired")
+        return claims
 
     def accepted_until(self, token: str, claims: dict[str, Any]) -> float:
         """Epoch second until which an already-verified token stays valid.
@@ -325,6 +407,51 @@ class SessionSigningKeys:
                 MODE_ENV,
             )
         return keys
+
+
+def _require_canonical_signature(token: str) -> None:
+    """Refuse a token whose signature segment is not canonical base64url.
+
+    PyJWT decodes the signature leniently: ``=`` padding is accepted, and a
+    changed final character that only flips the unused low bits decodes to
+    the same bytes. Each of those spellings would verify, so one token would
+    have several valid strings (and several verification-cache entries).
+    Only the exact unpadded encoding of the decoded bytes is accepted.
+
+    :raises jwt.DecodeError: On any non-canonical signature segment.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise jwt.DecodeError("a session token has exactly three segments")
+    signature = parts[2]
+    if not _B64URL_UNPADDED.fullmatch(signature):
+        raise jwt.DecodeError("signature segment is not unpadded base64url")
+    try:
+        raw = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
+    except (binascii.Error, ValueError):
+        raise jwt.DecodeError("signature segment is not base64url") from None
+    if _b64url(raw) != signature:
+        raise jwt.DecodeError("signature segment is not canonical base64url")
+
+
+def _require_numeric_times(claims: dict[str, Any]) -> None:
+    """Refuse time claims that are not finite JSON numbers.
+
+    PyJWT coerces ``"exp": "1893456000"`` with ``int()`` and accepts a
+    boolean ``iat``. A verifier that reads the raw claim (Jarvis, or the
+    cache in :meth:`SessionSigningKeys.accepted_until`) would disagree with
+    it, so only ints and floats pass.
+
+    :raises jwt.InvalidTokenError: On a string, boolean or non-finite value.
+    """
+    for name in _NUMERIC_CLAIMS:
+        if name not in claims:
+            continue
+        value = claims[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise jwt.InvalidTokenError(f"{name} must be a number")
+        if not math.isfinite(value):
+            raise jwt.InvalidTokenError(f"{name} must be finite")
 
 
 def as_signing_keys(keys: SessionSigningKeys | bytes) -> SessionSigningKeys:

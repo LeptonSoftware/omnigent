@@ -46,6 +46,7 @@ from omnigent.server.passwords import (
     needs_rehash,
     verify_password,
 )
+from omnigent.server.session_signing import IDENTITY  # fork
 from omnigent.stores.permission_store import PermissionStore
 
 if TYPE_CHECKING:
@@ -272,6 +273,7 @@ def create_accounts_auth_router(
         session_jwt = mint_session_cookie(
             user_id=user_id,
             keys=config.signing_keys,  # fork
+            kind=IDENTITY,  # fork: a sign-in; Jarvis accepts it
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=generation,
@@ -343,6 +345,7 @@ def create_accounts_auth_router(
         session_jwt = mint_session_cookie(
             user_id=username,
             keys=config.signing_keys,  # fork
+            kind=IDENTITY,  # fork: a sign-in; Jarvis accepts it
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=generation,
@@ -512,6 +515,7 @@ def create_accounts_auth_router(
         session_jwt = mint_session_cookie(
             user_id=username,
             keys=config.signing_keys,  # fork
+            kind=IDENTITY,  # fork: a sign-in; Jarvis accepts it
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=user.account_generation,
@@ -615,6 +619,7 @@ def create_accounts_auth_router(
         session_jwt = mint_session_cookie(
             user_id=username,
             keys=config.signing_keys,  # fork
+            kind=IDENTITY,  # fork: a sign-in; Jarvis accepts it
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=user.account_generation,
@@ -704,6 +709,7 @@ def create_accounts_auth_router(
         session_jwt = mint_session_cookie(
             user_id=token.user_id,
             keys=config.signing_keys,  # fork
+            kind=IDENTITY,  # fork: a sign-in; Jarvis accepts it
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=user.account_generation,

@@ -48,7 +48,10 @@ from urllib.parse import urlparse
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.auth import _RESERVED_USERS
 from omnigent.server.passwords import hash_password
-from omnigent.server.session_signing import SessionSigningKeys  # fork
+from omnigent.server.session_signing import (  # fork
+    IDENTITY,
+    SessionSigningKeys,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +226,7 @@ def _mint_loopback_cli_token(
         tui_jwt = mint_session_cookie(
             user_id=admin_username,
             keys=cookie_secret,  # fork
+            kind=IDENTITY,  # fork: the operator's CLI login
             ttl_hours=session_ttl_hours,
             provider="accounts",
             account_generation=account_generation,
