@@ -675,7 +675,6 @@ async def test_dead_login_wait_ignores_rewrites_and_refused_tokens(
     monkeypatch.setattr("omnigent.host.connect._TOKEN_FILE_POLL_S", 0.02)
     host = _host(_SERVER)
     world.refresh_outages[0] = 1000
-    cli_auth.refresh_stored_token(_SERVER, rejected_token=world.hs256_login)  # now refused
 
     def _store(token: str) -> None:
         cli_auth.store_token(
@@ -695,8 +694,10 @@ async def test_dead_login_wait_ignores_rewrites_and_refused_tokens(
         await task
         return time.monotonic() - started
 
-    # The same token rewritten (another process storing what it already had).
+    # The same token rewritten (another process storing what it already had);
+    # no refusal recorded for it yet, as for a login without refresh material.
     assert await _wait_while(lambda: _store(world.hs256_login)) >= 0.6
+    cli_auth.refresh_stored_token(_SERVER, rejected_token=world.hs256_login)  # now refused
     _store("another-login")
     cli_auth.refresh_stored_token(_SERVER, rejected_token="another-login")  # refused too
     _store(world.hs256_login)
