@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -326,29 +329,29 @@ def test_subcommand_exits_0_when_the_stored_token_is_already_newer(box: _Box) ->
     assert code == 0 and box.endpoint.posts == []
 
 
-def test_subcommand_exits_2_for_a_dead_login(box: _Box) -> None:
+def test_subcommand_exits_10_for_a_dead_login(box: _Box) -> None:
     _store("login")
     box.endpoint.mode = "dead"
     code, out, err = _run("--refused-sha256", _sha("login"), "--json")
-    assert code == 2
+    assert code == 10
     assert json.loads(out)["status"] == "dead"
     assert "omnigent login" in err
 
 
-def test_subcommand_exits_2_with_no_stored_login(box: _Box) -> None:
+def test_subcommand_exits_10_with_no_stored_login(box: _Box) -> None:
     code, _, _ = _run()
-    assert code == 2
+    assert code == 10
 
 
-def test_subcommand_exits_3_with_the_wait_on_stderr(box: _Box) -> None:
+def test_subcommand_exits_11_with_the_wait_on_stderr(box: _Box) -> None:
     _store("login")
     box.endpoint.mode = "503"
     code, out, err = _run("--refused-sha256", _sha("login"), "--json")
-    assert code == 3
+    assert code == 11
     assert json.loads(out) == {"status": "backoff", "retry_after": 5}
     assert err.strip().splitlines()[-1] == "retry_after=5"
     code, _, err = _run("--refused-sha256", _sha("login"))
-    assert code == 3 and err.strip().splitlines()[-1] == "retry_after=5"
+    assert code == 11 and err.strip().splitlines()[-1] == "retry_after=5"
     assert len(box.endpoint.posts) == 1
 
 
@@ -384,3 +387,99 @@ def test_subcommand_is_registered_on_the_omnigent_cli() -> None:
     result = CliRunner().invoke(cli, ["auth", "refresh", "--help"])
     assert result.exit_code == 0
     assert "--refused-sha256" in result.stdout and "retry_after=<seconds>" in result.stdout
+
+
+def test_subcommand_exit_codes_do_not_collide_with_usage_errors(box: _Box) -> None:
+    from omnigent import cli_auth_refresh
+
+    usage = CliRunner().invoke(auth_group, ["refresh"])  # --server missing
+    assert usage.exit_code == 2
+    codes = {cli_auth_refresh.EXIT_DEAD, cli_auth_refresh.EXIT_BACKOFF}
+    assert codes == {10, 11}
+
+
+# ── Round 5: lock file, org id, process hygiene ──────────────────
+
+
+def test_a_read_only_lock_file_does_not_break_login_or_refresh(box: _Box) -> None:
+    """A lock file left 0444 (e.g. by `sudo -E omnigent`) is still lockable."""
+    lock = box.root / "auth_tokens.lock"
+    lock.touch()
+    lock.chmod(0o444)
+    _store("login")
+    cli_auth.clear_token(_SERVER)
+    _store("login")
+    assert cli_auth.refresh_stored_token(_SERVER, rejected_token="login") == "issued-1"
+
+
+def test_an_org_id_write_never_clobbers_a_concurrent_refresh(box: _Box) -> None:
+    _store("login")
+    held = threading.Event()
+    release = threading.Event()
+
+    def _refresh_in_progress() -> None:
+        with cli_auth._token_file_lock():
+            held.set()
+            release.wait(5)
+            _store("renewed")  # the refresh's result, stored under its lock
+
+    holder = threading.Thread(target=_refresh_in_progress)
+    holder.start()
+    held.wait(5)
+    writer = threading.Thread(target=cli_auth.store_databricks_org_id, args=(_SERVER, "42"))
+    writer.start()
+    time.sleep(0.2)  # the writer is now blocked on the lock
+    release.set()
+    holder.join()
+    writer.join()
+    entry = cli_auth._load_entry(_SERVER)
+    assert entry is not None
+    assert (entry["token"], entry.get("org_id")) == ("renewed", "42")
+
+
+def _clean_env(home: Path) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("OMNIGENT_")}
+    env["HOME"] = str(home)
+    return env
+
+
+def _run_omnigent(cwd: Path, home: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run `omnigent` as its console script does: no cwd on sys.path (-P)."""
+    env = _clean_env(home)
+    code = "import sys; from omnigent.cli import main; sys.argv[0] = 'omnigent'; main()"
+    return subprocess.run(
+        [sys.executable, "-P", "-c", code, *args],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def test_auth_refresh_imports_nothing_from_the_cwd_and_writes_no_log(tmp_path: Path) -> None:
+    home, work = tmp_path / "home", tmp_path / "work"
+    home.mkdir()
+    work.mkdir()
+    marker = tmp_path / "planted-module-ran"
+    for name in ("queue", "sniffio", "anyio", "h11", "certifi", "idna"):
+        (work / f"{name}.py").write_text(f"open({str(marker)!r}, 'a').write({name!r})\n")
+    server = "http://127.0.0.1:9"  # nothing listens: the refresh POST fails
+    seed = (
+        "import time; from omnigent import cli_auth; "
+        f"cli_auth.store_token({server!r}, token='t', user_id='u', "
+        "expires_at=time.time() + 3600, refresh_token='r')"
+    )
+    subprocess.run(
+        [sys.executable, "-P", "-c", seed], env=_clean_env(home), check=True, timeout=120
+    )
+    refused = hashlib.sha256(b"t").hexdigest()
+
+    done = _run_omnigent(
+        work, home, "auth", "refresh", "--server", server, "--refused-sha256", refused, "--json"
+    )
+
+    assert json.loads(done.stdout)["status"] == "backoff", done.stderr
+    assert done.returncode == 11
+    assert not marker.exists(), marker.read_text()
+    assert not list(home.glob(".omnigent/logs/cli/*")), "auth refresh wrote a CLI log file"
