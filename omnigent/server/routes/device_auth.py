@@ -169,6 +169,27 @@ def _grant_max_lifetime_seconds() -> int:
 _USER_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 
+# fork: errors that say the grant itself is dead. Anything else raised while
+# refreshing (a retryable CONFLICT, an internal error) must not tell the
+# client to discard a grant that the next attempt could renew.
+_TERMINAL_REFRESH_ERROR_CODES = frozenset(
+    {ErrorCode.UNAUTHORIZED, ErrorCode.FORBIDDEN, ErrorCode.NOT_FOUND, ErrorCode.INVALID_INPUT}
+)
+
+
+def _refresh_error(exc: OmnigentError) -> Response:
+    """fork: map an error raised by a refresh to its OAuth response.
+
+    :param exc: The error, e.g. CONFLICT "target account authority has been revoked".
+    :returns: ``invalid_grant`` (400) for a dead grant, else
+        ``temporarily_unavailable`` (503), which clients retry with backoff.
+    """
+    if exc.code in _TERMINAL_REFRESH_ERROR_CODES:
+        return _oauth_error("invalid_grant")
+    _logger.warning("oauth/token: refresh failed, retryable (%s): %s", exc.code, exc)
+    return _oauth_error("temporarily_unavailable", status_code=503)
+
+
 def _generate_user_code() -> str:
     """Return a short, human-readable ``XXXX-XXXX`` verification code."""
     chars = "".join(secrets.choice(_USER_CODE_ALPHABET) for _ in range(8))
@@ -504,8 +525,8 @@ def create_oauth_token_router(
                 return await run_in_threadpool(
                     _handle_refresh_grant, str(form.get("refresh_token") or "")
                 )
-            except OmnigentError:
-                return _oauth_error("invalid_grant")
+            except OmnigentError as exc:
+                return _refresh_error(exc)
         if grant_type == "client_credentials":
             # RFC 6749 §4.4: the machine client presents its OWN credential,
             # so it authenticates itself rather than passing the device
