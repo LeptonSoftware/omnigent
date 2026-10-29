@@ -275,7 +275,10 @@ def store_databricks_org_id(server_url: str, org_id: str) -> None:
     existing = _load_entry(server_url) or {}
     if existing.get("org_id") == org_id:
         return
-    _store_entry(server_url, {**existing, "org_id": org_id})
+    with _token_file_lock():  # fork: re-read under the lock, or a concurrent refresh is lost
+        existing = _load_entry(server_url) or {}
+        if existing.get("org_id") != org_id:
+            _store_entry(server_url, {**existing, "org_id": org_id})
 
 
 def _load_entry(server_url: str) -> dict[str, str | float] | None:
@@ -435,14 +438,19 @@ def _token_file_lock() -> Iterator[None]:
     except ImportError:
         yield
         return
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+    # fork: flock needs no write access, so open read-only: a lock file left
+    # 0444 (say, by `sudo -E omnigent`) must not break login or refresh.
+    lock_fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
         _lock_holder.depth = 1
         try:
             yield
         finally:
             _lock_holder.depth = 0
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
 
 
 _lock_holder = threading.local()  # fork: this thread's _token_file_lock depth
@@ -472,8 +480,10 @@ def _is_final_refusal(resp: httpx.Response) -> bool:
 REFRESH_STATE_FILE_NAME = "auth_refresh_state.json"
 FORCED_REFRESH_BACKOFF_BASE_S = 5.0
 FORCED_REFRESH_BACKOFF_CAP_S = 300.0
-# A grant the server called dead is asked again this often, so a spurious
-# invalid_grant heals while a really dead grant costs one POST per period.
+# A grant the server called dead is asked again after this, jittered like
+# every wait (so 30-90 min): a spurious invalid_grant heals within 30-90 min,
+# and a really dead grant costs one POST per 30-90 min (two can fall within
+# one hour).
 DEAD_GRANT_RECHECK_S = 3600.0
 # A refusal this soon after a refresh produced the token means the server
 # refuses fresh tokens; a later one (say, after a key rotation) earns a refresh.
@@ -687,7 +697,10 @@ def refresh_login(
       back off, then allow one more refresh;
     - a failed refresh backs off 5 s doubling to 300 s; while it does, a
       still-valid stored token stays usable;
-    - a dead grant is re-checked once per :data:`DEAD_GRANT_RECHECK_S`.
+    - a dead grant is re-checked after :data:`DEAD_GRANT_RECHECK_S` ±50%,
+      i.e. 30-90 min: a spurious ``invalid_grant`` heals within 30-90 min,
+      and a really dead grant costs one POST per 30-90 min (two can fall
+      within one hour).
 
     Every wait is jittered. State errors never escape: they read as no state.
 

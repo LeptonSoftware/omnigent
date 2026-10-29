@@ -20,8 +20,9 @@ from omnigent import cli_auth
 
 EXIT_OK = 0
 EXIT_ERROR = 1
-EXIT_DEAD = 2
-EXIT_BACKOFF = 3
+# Not 2: click and `omnigent` exit 2 on usage errors.
+EXIT_DEAD = 10
+EXIT_BACKOFF = 11
 _EXIT_CODES = {"ok": EXIT_OK, "dead": EXIT_DEAD, "backoff": EXIT_BACKOFF, "error": EXIT_ERROR}
 _SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
 
@@ -36,12 +37,15 @@ def auth_group() -> None:
     epilog=(
         "\b\n"
         "Exit codes:\n"
-        "  0  the stored token is usable (refreshed, or already newer)\n"
-        "  1  any other error\n"
-        "  2  the login is dead: run `omnigent login <url>`\n"
-        "  3  backing off: stderr's last line is `retry_after=<seconds>`\n"
+        "   0  the stored token is usable (refreshed, or already newer)\n"
+        "   1  any other error\n"
+        "   2  usage error (click)\n"
+        "  10  the login is dead: run `omnigent login <url>`\n"
+        "  11  backing off: stderr's last line is `retry_after=<seconds>`\n"
         "\b\n"
-        'With --json, stdout is {"status": "ok|dead|backoff|error", "retry_after": n}.\n'
+        'With --json, stdout is {"status": "ok|dead|backoff|error", "retry_after": n};\n'
+        "the status is authoritative. Nothing is imported from the current\n"
+        "directory, and nothing is logged to a file: logs go to stderr.\n"
         "No token is ever printed: re-read auth_tokens.json after exit 0."
     ),
 )

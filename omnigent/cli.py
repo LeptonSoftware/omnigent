@@ -2257,10 +2257,6 @@ def main() -> None:
     # to pass through. Refuse naked calls before any work happens.
     _enforce_wrapper_guard()
 
-    cwd = os.getcwd()
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
-
     # Legacy-codepage stdio (Windows ANSI, C locale, PYTHONIOENCODING)
     # can't encode the CLI's glyphs; harden the streams before any command
     # renders so the write degrades instead of aborting.
@@ -2275,6 +2271,17 @@ def main() -> None:
         os.environ[LOG_LEVEL_ENV_VAR] = "DEBUG"
     if log_to_stderr:
         os.environ[LOG_TO_STDERR_ENV_VAR] = "1"
+
+    # fork: `omnigent auth` handles the stored refresh token for other
+    # clients. It runs before the cwd joins sys.path (a planted queue.py
+    # would run with the token) and writes no per-spawn CLI log file.
+    if argv[:1] == ["auth"]:
+        cli(args=argv)
+        return
+
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
 
     # Bare ``omnigent`` with no args behaves like ``omnigent start`` on an
     # interactive terminal: bring up the local server / host in the background
