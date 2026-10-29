@@ -456,7 +456,12 @@ def _refresh_digest(refresh_token: str) -> str:
     return hashlib.sha256(refresh_token.encode()).hexdigest()
 
 
-def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | None:
+def refresh_stored_token(
+    server_url: str,
+    *,
+    timeout: float = 10.0,
+    rejected_token: str | None = None,  # fork
+) -> str | None:
     """Renew the stored access token from its login-issued refresh grant.
 
     POSTs ``grant_type=refresh_token`` to the server's ``/oauth/token``,
@@ -472,6 +477,13 @@ def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | Non
 
     :param server_url: The server URL, e.g. ``"http://localhost:6767"``.
     :param timeout: HTTP timeout in seconds.
+    :param rejected_token: fork: a token the server just answered 401 to.
+        Normally a token far from its local ``expires_at`` is returned
+        as-is; when it is this one, the refresh goes to the server anyway
+        (the server refusing a token it once issued, e.g. an HS256 login
+        after the signing switch, must not strand the client until the
+        token's 30-day local expiry). A stored token that differs from it
+        was already renewed by another process and is returned.
     :returns: A valid access token, or ``None``.
     """
     normalized = _normalize_server_url(server_url)
@@ -488,7 +500,7 @@ def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | Non
         return None
     try:
         with _token_file_lock():
-            return _refresh_locked(server_url, normalized, timeout)
+            return _refresh_locked(server_url, normalized, timeout, rejected_token)
     except OSError as exc:
         # Cannot lock/persist (read-only or full state dir) — a refresh we
         # could not store is worse than none, so decline and let the caller
@@ -497,7 +509,9 @@ def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | Non
         return None
 
 
-def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | None:
+def _refresh_locked(
+    server_url: str, normalized: str, timeout: float, rejected_token: str | None = None
+) -> str | None:
     """Perform the refresh exchange; caller holds the token-file lock."""
     # Log only the sanitized URL — the raw one may embed credentials, and the
     # refresh token is never logged.
@@ -512,10 +526,13 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
     token = entry.get("token")
     if (
         isinstance(token, str)
+        and token != rejected_token  # fork: the server refused this one; renew it
         and isinstance(expires_at, (int, float))
         and expires_at - time.time() > REFRESH_MIN_REMAINING_SECONDS
     ):
         return token
+    if rejected_token is not None and token == rejected_token:
+        _logger.info("Server refused the stored login for %s; refreshing it once", safe)
     refresh_token = entry.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
         return None

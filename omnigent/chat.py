@@ -894,6 +894,22 @@ class _DatabricksTokenAuth(httpx.Auth):
                 token = self._sdk_token()
                 if token:
                     request.headers["Authorization"] = f"Bearer {token}"
+            if oidc_token and self._server_url:
+                # fork: a stored login the server refuses (e.g. an HS256 token
+                # after the EdDSA switch, weeks from its local expiry) is
+                # renewed once through its refresh grant and the request
+                # retried; a refused refresh leaves the 401 as it was.
+                response = yield request
+                # Only an in-memory body can be sent twice; a streamed upload
+                # keeps its 401.
+                if response.status_code == 401 and isinstance(request.stream, httpx.ByteStream):
+                    from omnigent.cli_auth import refresh_stored_token
+
+                    renewed = refresh_stored_token(self._server_url, rejected_token=oidc_token)
+                    if renewed and renewed != oidc_token:
+                        request.headers["Authorization"] = f"Bearer {renewed}"
+                        yield request
+                return
         yield request
 
 

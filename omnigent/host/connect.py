@@ -1245,6 +1245,9 @@ class HostProcess:
         self._login_redirect_streak = 0
         # Reset by a successful upgrade or non-auth error; bounds fresh-host refresh retries.
         self._auth_retry_streak = 0
+        # fork: an auth rejection asked the token factory for one forced
+        # refresh; the next dial goes out promptly with the renewed token.
+        self._auth_refresh_requested = False
         # Consecutive connection-refused connect failures; reset by an accepted
         # upgrade or any non-refused error. Fatal past a bounded streak only
         # when the server URL is loopback (the local server is gone).
@@ -1608,6 +1611,30 @@ class HostProcess:
             body = body[:_UPGRADE_BODY_MAX_CHARS] + "…"
         return self._classify_http_status(exc.response.status_code, body)
 
+    def _request_auth_refresh(self, status: int) -> bool:
+        """fork: force one refresh of the stored login after the server refused it.
+
+        The token factory otherwise renews only within 90 s of the token's
+        local ``expires_at``, so a token the server stopped accepting early
+        (an HS256 login after the EdDSA switch, 30 days from expiry) would
+        be re-sent on every reconnect. The factory refreshes once per
+        refused token and never re-forces a token a forced refresh returned,
+        so a server that refuses fresh tokens too costs one refresh.
+
+        :param status: The refusing HTTP status, e.g. ``401``.
+        :returns: ``True`` when the next dial carries a renewed token.
+        """
+        factory = self._auth_token_factory
+        if factory is None:
+            return False
+        from omnigent.runner._entry import _invalidate_auth_token_factory
+
+        if not _invalidate_auth_token_factory(factory):
+            return False
+        self._auth_refresh_requested = True
+        _logger.info("Host tunnel refused (HTTP %d); refreshing the stored login once.", status)
+        return True
+
     def _classify_http_status(self, status: int, body: str = "") -> HostConnectError | None:
         """Map a rejected-upgrade HTTP status to a fatal error, or ``None``.
 
@@ -1631,6 +1658,9 @@ class HostProcess:
         if status in (401, 403):
             # Fresh hosts can race OAuth refresh; connected hosts preserve active sessions.
             self._auth_retry_streak += 1
+            # fork: the tunnel refuses a bad bearer before accept(), which
+            # reaches us as 403, so both statuses count as a refused token.
+            self._request_auth_refresh(status)
             cause = f"Connection refused (HTTP {status}): the host tunnel was rejected."
             should_retry = self._ever_connected or (
                 self._auth_retry_streak < _MAX_CONSECUTIVE_AUTH_ERRORS
@@ -4257,6 +4287,11 @@ class HostProcess:
                     login_dead = self._auth_retry_streak >= _AUTH_REJECT_ESCALATE_ATTEMPTS
                     if login_dead:
                         wait_s = max(wait_s, _AUTH_REJECT_SLOW_RETRY_S)
+                    if self._auth_refresh_requested:
+                        # fork: retry at once with the token the factory renews.
+                        self._auth_refresh_requested = False
+                        login_dead = False
+                        wait_s = _RECONNECT_BASE_S
                     _logger.warning(
                         "Host tunnel disconnected: %s. Reconnecting in %.1fs%s",
                         exc,

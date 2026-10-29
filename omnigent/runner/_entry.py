@@ -713,6 +713,15 @@ def _make_auth_token_factory(
             refused_binding_token = binding_token
 
     sdk_token_source: _ReusedDatabricksTokenSource | None = None
+    # fork: forced refresh after the server refuses a stored-login token
+    # (see _invalidate below). ``stored_token`` is the stored-login token
+    # last returned; ``rejected`` the one to renew on the next call;
+    # ``forced`` the result of the last forced refresh, which is never
+    # forced again, so a server that refuses fresh tokens too costs one
+    # refresh, not one per retry.
+    stored_token: str | None = None
+    rejected: str | None = None
+    forced: str | None = None
 
     def _factory() -> str | None:
         """Return a fresh auth token.
@@ -723,7 +732,7 @@ def _make_auth_token_factory(
         :returns: Bearer token string, or ``None`` if no credentials
             are configured.
         """
-        nonlocal sdk_token_source
+        nonlocal sdk_token_source, stored_token, rejected, forced
         # Check stored OIDC token first.
         if resolved_server_url:
             from omnigent.cli_auth import (
@@ -732,6 +741,14 @@ def _make_auth_token_factory(
                 refresh_stored_token,
             )
 
+            if rejected is not None:
+                # fork: the server refused the stored token; renew it once
+                # through the refresh grant whatever its local expires_at.
+                refused, rejected = rejected, None
+                renewed = refresh_stored_token(resolved_server_url, rejected_token=refused)
+                if renewed and renewed != refused:
+                    stored_token = forced = renewed
+                    return renewed
             # Require enough remaining life that the token cannot lapse
             # mid-handshake; a token inside that window falls through to
             # the renewal path below rather than being used and rejected.
@@ -740,6 +757,7 @@ def _make_auth_token_factory(
                 min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS,
             )
             if oidc_token:
+                stored_token = oidc_token  # fork
                 return oidc_token
             # Expired or near-lapse: renew from the login-issued refresh
             # grant when one exists. This is what keeps an unattended host
@@ -747,13 +765,16 @@ def _make_auth_token_factory(
             # through this factory on every reconnect.
             refreshed = refresh_stored_token(resolved_server_url)
             if refreshed:
+                stored_token = refreshed  # fork
                 return refreshed
             # Nothing to renew with: a near-expiry token that has NOT
             # actually lapsed still authenticates, so prefer it over
             # falling through to no credential at all.
             still_valid = load_token(resolved_server_url)
             if still_valid:
+                stored_token = still_valid  # fork
                 return still_valid
+        stored_token = None  # fork: the SDK token below is not a stored login
         if sdk_token_source is None:
             # Optional SDK imports must not prevent delegated/OIDC recovery or
             # bypass the managed-mint fallback when the executor cannot load.
@@ -761,6 +782,23 @@ def _make_auth_token_factory(
 
             sdk_token_source = _ReusedDatabricksTokenSource(resolved_server_url)
         return sdk_token_source.current_token()
+
+    def _invalidate() -> bool:
+        """fork: the server refused the last token; force one refresh.
+
+        Called through :func:`_invalidate_auth_token_factory` on a 401
+        (runner callbacks, host tunnel). Only a stored-login token is
+        renewed, and never the result of a previous forced refresh.
+
+        :returns: ``True`` when the next call will refresh.
+        """
+        nonlocal rejected
+        if stored_token is None or stored_token == forced:
+            return False
+        rejected = stored_token
+        return True
+
+    _factory.invalidate = _invalidate  # type: ignore[attr-defined]  # fork
 
     # Probe once to check if a user credential is available.
     try:
