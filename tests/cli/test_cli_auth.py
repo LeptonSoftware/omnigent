@@ -30,7 +30,6 @@ def token_dir(tmp_path, monkeypatch):
         "omnigent.cli_auth._token_file_path",
         lambda: tmp_path / "auth_tokens.json",
     )
-    monkeypatch.setattr("omnigent.cli_auth._refused_refresh_digests", set())
     return tmp_path
 
 

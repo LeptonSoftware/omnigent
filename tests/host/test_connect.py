@@ -9154,7 +9154,9 @@ async def test_dead_login_streak_retries_slowly(monkeypatch: pytest.MonkeyPatch)
 async def test_wait_before_reconnect_wakes_on_new_login(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A long dead-login wait ends as soon as the token file changes."""
+    """A long dead-login wait ends as soon as a new login is stored."""
+    from omnigent.cli_auth import store_token
+
     token_file = tmp_path / "auth_tokens.json"
     token_file.write_text("{}")
     monkeypatch.setattr("omnigent.cli_auth._token_file_path", lambda: token_file)
@@ -9163,8 +9165,9 @@ async def test_wait_before_reconnect_wakes_on_new_login(
 
     async def _login_later() -> None:
         await asyncio.sleep(0.2)
-        token_file.write_text('{"fresh": true}')
-        os.utime(token_file, (time.time() + 5, time.time() + 5))
+        store_token(
+            "http://localhost:8000", token="fresh", user_id="u", expires_at=time.time() + 60
+        )
 
     started = time.monotonic()
     login = asyncio.create_task(_login_later())

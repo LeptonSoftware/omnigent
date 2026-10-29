@@ -946,9 +946,10 @@ class _DatabricksTokenAuth(httpx.Auth):
         """fork: renew a stored login the server refused, once.
 
         e.g. an HS256 login after the EdDSA switch, weeks from its local
-        expiry. :func:`omnigent.cli_auth.refresh_stored_token` backs off
-        after a failed refresh, so a broken refresh endpoint does not cost
-        one POST per request.
+        expiry. :func:`omnigent.cli_auth.refresh_stored_token` refreshes a
+        refused token at most once per machine and backs off, so neither a
+        server refusing fresh tokens nor a broken refresh endpoint costs one
+        POST per request.
 
         :param refused: The token the server answered 401 to.
         :returns: A different, renewed token, or ``None``.

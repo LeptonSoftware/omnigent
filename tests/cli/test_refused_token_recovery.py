@@ -74,8 +74,7 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_World]:
     monkeypatch.delenv("OMNIGENT_LEGACY_HS256_UNTIL", raising=False)  # HS256 refused
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
     monkeypatch.setattr(cli_auth, "_token_file_path", lambda: tmp_path / "auth_tokens.json")
-    monkeypatch.setattr(cli_auth, "_refused_refresh_digests", set())
-    monkeypatch.setattr(cli_auth, "_forced_refresh_backoff", {})
+    monkeypatch.setattr(cli_auth, "_jitter", lambda low, high: 1.0)  # exact backoff steps
 
     app = _build_accounts_app(tmp_path, monkeypatch, device_grant_enabled=False)
     client = next(app)
@@ -317,7 +316,7 @@ def test_runner_callback_refused_with_a_month_left_refreshes_once(world: _World)
 
 
 class _Clock:
-    """Monotonic time for cli_auth's refresh backoff, advanced by host waits."""
+    """The clock of cli_auth's refresh backoff, advanced by host waits."""
 
     def __init__(self) -> None:
         self.now = 1000.0
@@ -541,3 +540,167 @@ def test_a_renewal_by_another_process_is_used_during_the_backoff(
     )
     assert cli_auth.refresh_stored_token(_SERVER, rejected_token=world.hs256_login) == renewed
     assert len(world.refresh_posts) == 1
+
+
+# ── One refresh per refused token, machine-wide ──────────────────
+
+
+def _grant_state(world: _World) -> dict[str, object]:
+    server = cli_auth._load_refresh_state()[_SERVER]
+    record = server["grants"][cli_auth._refresh_digest(world.refresh_token)]
+    assert isinstance(record, dict)
+    return record
+
+
+def _refuse_everything(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(401, json={"detail": "nope"})
+
+
+def test_cli_against_a_server_refusing_fresh_tokens_refreshes_once(world: _World) -> None:
+    """An old replica, an unsynced key or a proxy 401s even the renewed token."""
+    from omnigent.chat import _DatabricksTokenAuth
+
+    with httpx.Client(
+        transport=httpx.MockTransport(_refuse_everything),
+        base_url=_SERVER,
+        auth=_DatabricksTokenAuth(server_url=_SERVER),
+    ) as cli:
+        for _ in range(20):
+            assert cli.get("/v1/hosts").status_code == 401
+    assert len(world.refresh_posts) == 1
+    assert _grant_state(world)["outcome"] == "fresh_token_refused"
+
+
+def test_two_processes_share_one_refresh_of_a_refused_token(world: _World) -> None:
+    """Two factories (host + runner) never re-force each other's renewal."""
+    from omnigent.runner._entry import _invalidate_auth_token_factory, _make_auth_token_factory
+
+    host = _make_auth_token_factory(server_url=_SERVER)
+    runner = _make_auth_token_factory(server_url=_SERVER)
+    assert host is not None and runner is not None
+    for _ in range(10):
+        for factory in (host, runner):
+            factory()  # the server refuses whatever this sends
+            if _invalidate_auth_token_factory(factory):
+                factory()
+    assert len(world.refresh_posts) == 1
+
+
+def test_concurrent_refusals_against_a_failing_endpoint_post_once(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    world.refresh_outages[0] = 1000
+    slow_post = httpx.post
+
+    def _slow(url: str, **kwargs: object) -> httpx.Response:
+        time.sleep(0.2)  # every other caller queues on the lock meanwhile
+        return slow_post(url, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(httpx, "post", _slow)
+    start = threading.Barrier(8)
+
+    def _refused() -> None:
+        start.wait()
+        cli_auth.refresh_stored_token(_SERVER, rejected_token=world.hs256_login)
+
+    threads = [threading.Thread(target=_refused) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(world.refresh_posts) == 1
+    assert _grant_state(world)["failures"] == 1
+
+
+def test_backoff_steps_are_jittered(world: _World, monkeypatch: pytest.MonkeyPatch) -> None:
+    import random
+
+    clock = _Clock()
+    monkeypatch.setattr(cli_auth, "_clock", clock)
+    monkeypatch.setattr(cli_auth, "_jitter", random.Random(3238).uniform)
+    world.refresh_outages[0] = 1000
+    ratios: list[float] = []
+    for step in range(8):
+        cli_auth.refresh_stored_token(_SERVER, rejected_token=world.hs256_login)
+        delay = float(_grant_state(world)["next_allowed"]) - clock.now  # type: ignore[arg-type]
+        nominal = min(
+            cli_auth.FORCED_REFRESH_BACKOFF_BASE_S * 2**step, cli_auth.FORCED_REFRESH_BACKOFF_CAP_S
+        )
+        ratios.append(delay / nominal)
+        clock.now += delay
+    assert len(world.refresh_posts) == 8
+    assert all(0.5 <= r <= 1.5 for r in ratios)
+    assert len({round(r, 6) for r in ratios}) == len(ratios)  # no two hosts in lockstep
+
+
+def test_a_retryable_conflict_while_refreshing_is_retried(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CONFLICT is not a dead grant: the client backs off, then renews."""
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    real_authorize = DeviceGrantStore.authorize_access
+    conflicts = [1]
+
+    def _authorize(self: DeviceGrantStore, grant_id: str) -> object:
+        if conflicts[0]:
+            conflicts[0] -= 1
+            raise OmnigentError(
+                "target account authority has been revoked", code=ErrorCode.CONFLICT
+            )
+        return real_authorize(self, grant_id)
+
+    monkeypatch.setattr(DeviceGrantStore, "authorize_access", _authorize)
+    clock = _Clock()
+    monkeypatch.setattr(cli_auth, "_clock", clock)
+    refreshed = world.client.post(
+        "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": world.refresh_token}
+    )
+    assert refreshed.status_code == 503
+    assert refreshed.json() == {"error": "temporarily_unavailable"}
+    conflicts[0] = 1
+    assert cli_auth.refresh_stored_token(_SERVER, rejected_token=world.hs256_login) is None
+    assert _grant_state(world)["outcome"] == "transient"
+    clock.now += cli_auth.FORCED_REFRESH_BACKOFF_CAP_S * 2
+    renewed = cli_auth.refresh_stored_token(_SERVER, rejected_token=world.hs256_login)
+    assert renewed is not None and _alg(renewed) == "EdDSA"
+
+
+async def test_dead_login_wait_ignores_rewrites_and_refused_tokens(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a login this machine has not seen refused ends the slow wait."""
+    monkeypatch.setattr("omnigent.host.connect._TOKEN_FILE_POLL_S", 0.02)
+    host = _host(_SERVER)
+    world.refresh_outages[0] = 1000
+    cli_auth.refresh_stored_token(_SERVER, rejected_token=world.hs256_login)  # now refused
+
+    def _store(token: str) -> None:
+        cli_auth.store_token(
+            _SERVER,
+            token=token,
+            user_id="admin",
+            expires_at=time.time() + _MONTH_S,
+            refresh_token=world.refresh_token,
+        )
+
+    async def _wait_while(change: object) -> float:
+        started = time.monotonic()
+        task = asyncio.create_task(host._wait_before_reconnect(0.6, watch_login=True))
+        await asyncio.sleep(0.1)
+        assert callable(change)
+        change()
+        await task
+        return time.monotonic() - started
+
+    # The same token rewritten (another process storing what it already had).
+    assert await _wait_while(lambda: _store(world.hs256_login)) >= 0.6
+    _store("another-login")
+    cli_auth.refresh_stored_token(_SERVER, rejected_token="another-login")  # refused too
+    _store(world.hs256_login)
+    # A switch to a token this machine already saw refused.
+    assert await _wait_while(lambda: _store("another-login")) >= 0.6
+    # A new `omnigent login`.
+    assert await _wait_while(lambda: _store("a-new-login")) < 0.5
