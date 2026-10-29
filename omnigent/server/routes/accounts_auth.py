@@ -603,7 +603,7 @@ def create_accounts_auth_router(
             _mint_loopback_cli_token(
                 username,
                 base_url=config.base_url,
-                cookie_secret=config.cookie_secret,
+                cookie_secret=config.signing_keys,  # fork: EdDSA when a key is configured
                 session_ttl_hours=config.session_ttl_hours,
                 account_generation=user.account_generation,
             )
