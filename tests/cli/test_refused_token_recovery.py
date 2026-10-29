@@ -1,0 +1,283 @@
+"""A host and a CLI recover from a stored login the server stopped accepting.
+
+fork (VIN-3238 QA): clients renewed their token only within 90 s of its
+local ``expires_at``. A CLI login lives ``session_ttl_hours`` (30 days on
+prod), so when the HS256 window closed every host and CLI holding an HS256
+login would have been refused for up to a month despite holding a valid
+refresh grant. A refusal now forces exactly one refresh and a retry.
+
+The server here is a real accounts-mode app signing EdDSA with the HS256
+window closed. The stored login is a correctly formed HS256 token for the
+real admin, valid for 30 days, with a real login-grant refresh token.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import time
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+import httpx
+import jwt
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from fastapi.testclient import TestClient
+
+from omnigent import cli_auth
+from omnigent.host.connect import HostConnectError
+from omnigent.server.accounts_store import SqlAlchemyAccountStore
+from omnigent.server.device_grant_store import DeviceGrantStore
+from omnigent.server.oidc import mint_session_cookie
+from omnigent.server.routes.device_auth import issue_login_grant
+from tests.host.test_connect import _ConnectSpy, _host, _invalid_status
+from tests.server.test_device_auth import _build_accounts_app
+
+_SERVER = "http://localhost:8000"
+_MONTH_S = 30 * 24 * 3600
+
+
+@dataclass
+class _World:
+    client: TestClient
+    hs256_login: str
+    refresh_token: str
+    refresh_posts: list[str]
+
+
+@pytest.fixture
+def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_World]:
+    key = Ed25519PrivateKey.generate()
+    key_file = tmp_path / "signing.pem"
+    key_file.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    monkeypatch.setenv("OMNIGENT_SESSION_SIGNING", "eddsa")
+    monkeypatch.setenv("OMNIGENT_SESSION_SIGNING_KEY_FILE", str(key_file))
+    monkeypatch.delenv("OMNIGENT_LEGACY_HS256_UNTIL", raising=False)  # HS256 refused
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(cli_auth, "_token_file_path", lambda: tmp_path / "auth_tokens.json")
+    monkeypatch.setattr(cli_auth, "_refused_refresh_digests", set())
+
+    app = _build_accounts_app(tmp_path, monkeypatch, device_grant_enabled=False)
+    client = next(app)
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
+    admin = SqlAlchemyAccountStore(db_url).get_user("admin")
+    assert admin is not None
+    # What the pre-EdDSA server handed `omnigent login`: HS256, 30 days.
+    hs256_login = mint_session_cookie(
+        "admin", secret, 720, "accounts", account_generation=admin.account_generation
+    )
+    refresh_token = issue_login_grant(
+        DeviceGrantStore(db_url), user_id="admin", cookie_secret=secret
+    )
+    cli_auth.store_token(
+        _SERVER,
+        token=hs256_login,
+        user_id="admin",
+        expires_at=time.time() + _MONTH_S,
+        refresh_token=refresh_token,
+    )
+    refresh_posts: list[str] = []
+
+    def _post_to_server(
+        url: str, *, data: dict[str, str] | None = None, timeout: float | None = None
+    ) -> httpx.Response:
+        assert url == f"{_SERVER}/oauth/token"
+        refresh_posts.append((data or {}).get("refresh_token", ""))
+        return client.post("/oauth/token", data=data)
+
+    monkeypatch.setattr(httpx, "post", _post_to_server)
+    assert client.get("/v1/hosts", headers=_bearer(hs256_login)).status_code == 401
+    yield _World(client, hs256_login, refresh_token, refresh_posts)
+    next(app, None)  # leave the TestClient context
+
+
+def _bearer(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _alg(token: str) -> str:
+    return str(jwt.get_unverified_header(token)["alg"])
+
+
+def _stored_token() -> str:
+    entry = cli_auth._load_entry(_SERVER)
+    assert entry is not None
+    return str(entry["token"])
+
+
+# ── CLI / API calls (OmnigentClient's httpx auth) ────────────────
+
+
+def _cli_client(world: _World) -> httpx.Client:
+    from omnigent.chat import _DatabricksTokenAuth
+
+    return httpx.Client(
+        transport=world.client._transport,
+        base_url=_SERVER,
+        auth=_DatabricksTokenAuth(server_url=_SERVER),
+    )
+
+
+def test_cli_call_refused_with_a_month_left_refreshes_once_and_succeeds(world: _World) -> None:
+    with _cli_client(world) as cli:
+        resp = cli.get("/v1/hosts")
+        assert resp.status_code == 200, resp.text
+        assert world.refresh_posts == [world.refresh_token]
+        renewed = _stored_token()
+        assert _alg(renewed) == "EdDSA"
+        assert resp.request.headers["Authorization"] == f"Bearer {renewed}"
+
+        # The renewed token is used from now on: no further refreshes.
+        assert cli.get("/v1/hosts").status_code == 200
+        assert world.refresh_posts == [world.refresh_token]
+
+
+def test_cli_refused_refresh_keeps_the_401_and_asks_only_once(world: _World) -> None:
+    world.client.post("/oauth/revoke", data={"refresh_token": world.refresh_token})
+    with _cli_client(world) as cli:
+        assert cli.get("/v1/hosts").status_code == 401
+        assert cli.get("/v1/hosts").status_code == 401
+    assert world.refresh_posts == [world.refresh_token]  # invalid_grant is final
+    assert _stored_token() == world.hs256_login
+
+
+def test_cli_retries_once_when_the_renewed_token_is_refused_too(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No loop: one refresh and one retry per refused request."""
+    import omnigent.chat as chat_mod
+
+    sent: list[str] = []
+
+    def _always_401(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers["Authorization"])
+        return httpx.Response(401, json={"detail": "nope"})
+
+    auth = chat_mod._DatabricksTokenAuth(server_url=_SERVER)
+    with httpx.Client(
+        transport=httpx.MockTransport(_always_401), base_url=_SERVER, auth=auth
+    ) as cli:
+        assert cli.get("/v1/hosts").status_code == 401
+    assert len(world.refresh_posts) == 1
+    assert len(sent) == 2 and sent[0] != sent[1]
+
+
+# ── Host tunnel ──────────────────────────────────────────────────
+
+
+def _tunnel_bearers(spy: _ConnectSpy) -> list[str]:
+    bearers: list[str] = []
+    for call in spy.calls:
+        headers = call["additional_headers"]
+        assert isinstance(headers, dict)
+        bearers.append(str(headers.get("Authorization", "")))
+    return bearers
+
+
+async def _run_host(
+    monkeypatch: pytest.MonkeyPatch, script: Sequence[BaseException | int | None]
+) -> tuple[_ConnectSpy, list[float]]:
+    import websockets.asyncio.client as ws_client
+
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
+    spy = _ConnectSpy(list(script))
+    real_connect = ws_client.connect
+    host = _host(_SERVER)
+    tunnel_url = host._tunnel_url()
+
+    def _connect(url: str, **kwargs: object) -> object:
+        # Only this host's tunnel is scripted; tasks other tests left on the
+        # worker keep the real client.
+        if url == tunnel_url and "additional_headers" in kwargs:
+            return spy(url, **kwargs)
+        return real_connect(url, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ws_client, "connect", _connect)
+    waits: list[float] = []
+
+    async def _record_wait(wait_s: float, *, watch_login: bool) -> None:
+        waits.append(wait_s)
+
+    monkeypatch.setattr(host, "_wait_before_reconnect", _record_wait)
+    # A never-connected host gives up after a few refusals, as before.
+    with contextlib.suppress(HostConnectError):
+        await host.run()
+    return spy, waits
+
+
+async def test_host_refused_with_a_month_left_refreshes_once_and_reconnects(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The tunnel closes before accept() for a bad bearer, which reaches the
+    # host as HTTP 403; then the renewed token is accepted.
+    spy, waits = await _run_host(
+        monkeypatch, [_invalid_status(403), None, asyncio.CancelledError()]
+    )
+
+    first, second = _tunnel_bearers(spy)[:2]
+    assert first == f"Bearer {world.hs256_login}"
+    renewed = _stored_token()
+    assert _alg(renewed) == "EdDSA"
+    assert second == f"Bearer {renewed}"
+    assert world.refresh_posts == [world.refresh_token]
+    # The renewed token goes out at once, not after the backoff.
+    assert waits[0] == 0.0
+    # And the server really accepts it.
+    assert world.client.get("/v1/hosts", headers=_bearer(renewed)).status_code == 200
+
+
+async def test_host_forces_one_refresh_not_one_per_retry(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server that refuses the renewed token too costs one refresh."""
+    spy, _ = await _run_host(monkeypatch, [_invalid_status(401)] * 4 + [asyncio.CancelledError()])
+
+    bearers = _tunnel_bearers(spy)
+    assert len(bearers) >= 3
+    renewed = _stored_token()
+    assert bearers[0] == f"Bearer {world.hs256_login}"
+    assert set(bearers[1:]) == {f"Bearer {renewed}"}
+    assert world.refresh_posts == [world.refresh_token]
+
+
+async def test_host_refused_refresh_keeps_todays_behaviour(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.client.post("/oauth/revoke", data={"refresh_token": world.refresh_token})
+    spy, _ = await _run_host(monkeypatch, [_invalid_status(403)] * 3 + [asyncio.CancelledError()])
+
+    bearers = _tunnel_bearers(spy)
+    assert len(bearers) >= 3
+    assert set(bearers) == {f"Bearer {world.hs256_login}"}
+    assert world.refresh_posts == [world.refresh_token]
+
+
+# ── Runner callbacks (same factory, existing on-401 retry) ───────
+
+
+def test_runner_callback_refused_with_a_month_left_refreshes_once(world: _World) -> None:
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    factory = _make_auth_token_factory(server_url=_SERVER)
+    assert factory is not None
+    with httpx.Client(
+        transport=world.client._transport,
+        base_url=_SERVER,
+        auth=_RunnerDatabricksAuth(factory, server_url=_SERVER),
+    ) as runner:
+        assert runner.get("/v1/hosts").status_code == 200
+        assert runner.get("/v1/hosts").status_code == 200
+    assert world.refresh_posts == [world.refresh_token]
+    assert _alg(_stored_token()) == "EdDSA"
