@@ -431,7 +431,7 @@ async def test_host_with_a_failing_refresh_endpoint_backs_off_then_recovers(
     assert dials_refused > len(world.refresh_posts)  # not one POST per dial
     gaps = [b - a for a, b in itertools.pairwise(post_times)]
     assert gaps[0] >= cli_auth.FORCED_REFRESH_BACKOFF_BASE_S
-    assert gaps == sorted(gaps)  # the refresh's own backoff grows
+    assert all(b > a for a, b in itertools.pairwise(gaps))  # its own backoff grows
     assert server.bearers[server.recovered_at - 1] == f"Bearer {_stored_token()}"
     # The renewed token goes out at once.
     assert waits[server.recovered_at - 2] == 0.5
@@ -519,4 +519,25 @@ def test_runner_with_a_failing_refresh_endpoint_posts_once_per_backoff(
     ) as runner:
         for _ in range(5):
             assert runner.get("/v1/hosts").status_code == 401
+    assert len(world.refresh_posts) == 1
+
+
+def test_a_renewal_by_another_process_is_used_during_the_backoff(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli_auth, "_clock", _Clock())
+    world.refresh_outages[0] = 1
+    assert cli_auth.refresh_stored_token(_SERVER, rejected_token=world.hs256_login) is None
+    # Another process (say the host daemon) renews the login meanwhile.
+    renewed = world.client.post(
+        "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": world.refresh_token}
+    ).json()["access_token"]
+    cli_auth.store_token(
+        _SERVER,
+        token=renewed,
+        user_id="admin",
+        expires_at=time.time() + 3600,
+        refresh_token=world.refresh_token,
+    )
+    assert cli_auth.refresh_stored_token(_SERVER, rejected_token=world.hs256_login) == renewed
     assert len(world.refresh_posts) == 1
