@@ -2221,6 +2221,21 @@ def _enforce_wrapper_guard() -> None:
 
 
 @capture_cli_entry
+def _is_auth_invocation(argv: list[str]) -> bool:
+    """fork: whether ``auth`` is in command position, past any global flags.
+
+    :param argv: Arguments after the program name, e.g.
+        ``["--profiling", "auth", "refresh"]``.
+    :returns: ``True`` for ``auth``, ``--profiling auth``, ``-- auth`` and so on.
+    """
+    global_flags = {opt for param in cli.params for opt in (*param.opts, *param.secondary_opts)}
+    for token in argv:
+        if token in global_flags or token == "--":
+            continue
+        return token == "auth"
+    return False
+
+
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -2275,7 +2290,7 @@ def main() -> None:
     # fork: `omnigent auth` handles the stored refresh token for other
     # clients. It runs before the cwd joins sys.path (a planted queue.py
     # would run with the token) and writes no per-spawn CLI log file.
-    if argv[:1] == ["auth"]:
+    if _is_auth_invocation(argv):
         cli(args=argv)
         return
 
@@ -2380,8 +2395,16 @@ def main() -> None:
     if not _should_skip_update_check(argv):
         _warn_deprecated_harness_path_env_vars()
 
+    from omnigent.cli_auth import TokenFileLockError
+
     try:
         cli(args=argv, standalone_mode=False)
+    except TokenFileLockError as exc:
+        # fork: an unreadable token lock (a root-owned one left by sudo) is
+        # an operator fix, not a crash.
+        log_cli_exception(exc, prefix="Token lock file unusable")
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1) from exc
     except click.ClickException as exc:
         log_cli_exception(exc, prefix="Click CLI error")
         exc.show()

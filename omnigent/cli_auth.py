@@ -408,6 +408,18 @@ def stored_token_status(server_url: str) -> str:
     return "ok"
 
 
+class TokenFileLockError(PermissionError):
+    """fork: the token lock file exists but this user cannot open it."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(
+            f"cannot open the token lock file {path}: permission denied. It is "
+            f"probably owned by root (left by `sudo omnigent`). Fix it with "
+            f"`sudo chown $USER {path}`, or remove the file."
+        )
+        self.path = path
+
+
 @contextlib.contextmanager
 def _token_file_lock() -> Iterator[None]:
     """Exclusive advisory lock over token-file read-modify-write cycles.
@@ -438,9 +450,13 @@ def _token_file_lock() -> Iterator[None]:
     except ImportError:
         yield
         return
-    # fork: flock needs no write access, so open read-only: a lock file left
-    # 0444 (say, by `sudo -E omnigent`) must not break login or refresh.
-    lock_fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, 0o600)
+    # fork: flock needs no write access, so open read-only: a lock file we may
+    # only read (0444) still locks. One we cannot open at all, typically a
+    # root-owned 0600 file left by `sudo omnigent`, gets an actionable error.
+    try:
+        lock_fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, 0o600)
+    except PermissionError as exc:
+        raise TokenFileLockError(lock_path) from exc
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         _lock_holder.depth = 1
@@ -514,11 +530,13 @@ class RefreshResult:
         ``omnigent login``), ``"backoff"`` (try again after *retry_after*),
         or ``"error"``.
     :ivar retry_after: Seconds until the next refresh is allowed, e.g. ``42.0``.
+    :ivar detail: For ``"error"``, what went wrong and how to fix it, if known.
     """
 
     token: str | None
     status: RefreshStatus
     retry_after: float = 0.0
+    detail: str | None = None
 
 
 def _refresh_digest(secret: str) -> str:
@@ -736,6 +754,9 @@ def refresh_login(
                 result = RefreshResult(None, "error")
             if json.dumps(state, sort_keys=True) != before:
                 _write_tokens_file(_refresh_state_path(), state)
+    except TokenFileLockError as exc:
+        _logger.warning("Token refresh for %s skipped: %s", normalized, exc)
+        return RefreshResult(None, "error", detail=str(exc))
     except OSError as exc:
         # Cannot lock/persist (read-only or full state dir) — a refresh we
         # could not store is worse than none, so decline and let the caller

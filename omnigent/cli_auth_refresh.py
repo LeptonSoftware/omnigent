@@ -44,8 +44,11 @@ def auth_group() -> None:
         "  11  backing off: stderr's last line is `retry_after=<seconds>`\n"
         "\b\n"
         'With --json, stdout is {"status": "ok|dead|backoff|error", "retry_after": n};\n'
-        "the status is authoritative. Nothing is imported from the current\n"
-        "directory, and nothing is logged to a file: logs go to stderr.\n"
+        "the status is authoritative. Logs go to stderr, never to a file.\n"
+        "\b\n"
+        "omnigent does not add the current directory to the import path for\n"
+        "`auth`; run it with PYTHONSAFEPATH=1 and a clean PYTHONPATH when\n"
+        "calling it from code, as jarvis does.\n"
         "No token is ever printed: re-read auth_tokens.json after exit 0."
     ),
 )
@@ -93,5 +96,5 @@ def _finish(result: cli_auth.RefreshResult, as_json: bool, detail: str | None) -
     elif result.status == "backoff":
         click.echo(f"retry_after={retry_after}", err=True)
     elif result.status == "error":
-        click.echo(detail or "The refresh failed.", err=True)
+        click.echo(detail or result.detail or "The refresh failed.", err=True)
     raise SystemExit(_EXIT_CODES[result.status])
