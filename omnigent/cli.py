@@ -11570,6 +11570,11 @@ def setup(internal_beta: bool) -> None:
 # distribution; hide the group when none are available.
 # `omnigent lakebox` is kept as an alias for `omnigent sandbox …
 # --provider lakebox`, registered only when the lakebox provider ships.
+# fork: `omnigent auth refresh`, the shared login refresh for non-Python clients.
+from omnigent.cli_auth_refresh import auth_group as _auth_group  # noqa: E402
+
+cli.add_command(_auth_group)
+
 if _sandbox_providers():
     cli.add_command(_sandbox_group)
     if "lakebox" in _sandbox_providers():
