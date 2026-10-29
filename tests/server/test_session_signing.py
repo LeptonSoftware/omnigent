@@ -678,3 +678,26 @@ def test_every_production_mint_site_names_its_token_kind() -> None:
                 unnamed.append(f"{path.relative_to(root)}:{node.lineno} {name}")
     assert unnamed == []
 
+
+def test_setup_loopback_cli_token_is_signed_by_the_signer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``/auth/setup``'s loopback CLI token is EdDSA in eddsa mode, not HS256."""
+    from omnigent import cli_auth
+    from tests.server.test_accounts import _build_accounts_app
+
+    key = Ed25519PrivateKey.generate()
+    key_file = tmp_path / "signing.pem"
+    key_file.write_bytes(_private_pem(key))
+    monkeypatch.setenv("OMNIGENT_SESSION_SIGNING", "eddsa")
+    monkeypatch.setenv("OMNIGENT_SESSION_SIGNING_KEY_FILE", str(key_file))
+
+    for client in _build_accounts_app(tmp_path, monkeypatch, init_admin_password=None):
+        resp = client.post("/auth/setup", json={"username": "alice", "password": "alice-pw-12345"})
+        assert resp.status_code == 200, resp.text
+
+    token = cli_auth.load_token("http://localhost:8000")
+    assert token is not None
+    assert jwt.get_unverified_header(token)["alg"] == "EdDSA"
+    claims = jwt.decode(token, key.public_key(), algorithms=["EdDSA"], audience="jarvis")
+    assert claims["sub"] == "alice"
