@@ -859,10 +859,14 @@ def test_refused_refresh_token_is_not_presented_again(token_dir, monkeypatch) ->
 
 
 def test_transient_refresh_failure_is_retried(token_dir, monkeypatch) -> None:
-    """A 5xx is not a verdict on the token, so the next call asks again."""
+    """A 5xx is not a verdict on the token, so a call after the backoff asks again."""
     import httpx
 
+    from omnigent import cli_auth
     from omnigent.cli_auth import refresh_stored_token, store_token
+
+    now = [1000.0]
+    monkeypatch.setattr(cli_auth, "_clock", lambda: now[0])
 
     store_token(
         "http://localhost:6767",
@@ -879,6 +883,7 @@ def test_transient_refresh_failure_is_retried(token_dir, monkeypatch) -> None:
 
     monkeypatch.setattr(httpx, "post", _bounce)
     refresh_stored_token("http://localhost:6767")
+    now[0] += cli_auth.FORCED_REFRESH_BACKOFF_CAP_S * 2  # fork: past the backoff
     refresh_stored_token("http://localhost:6767")
     assert posts == ["refresh-1", "refresh-1"]
 
@@ -887,7 +892,11 @@ def test_proxy_400_does_not_mark_refresh_token_dead(token_dir, monkeypatch) -> N
     """A 400/401 without an OAuth error body (e.g. from a proxy) is retried."""
     import httpx
 
+    from omnigent import cli_auth
     from omnigent.cli_auth import refresh_stored_token, store_token
+
+    now = [1000.0]
+    monkeypatch.setattr(cli_auth, "_clock", lambda: now[0])
 
     store_token(
         "http://localhost:6767",
@@ -906,6 +915,7 @@ def test_proxy_400_does_not_mark_refresh_token_dead(token_dir, monkeypatch) -> N
 
     monkeypatch.setattr(httpx, "post", _proxy_reject)
     refresh_stored_token("http://localhost:6767")
+    now[0] += cli_auth.FORCED_REFRESH_BACKOFF_CAP_S * 2  # fork: past the backoff
     refresh_stored_token("http://localhost:6767")
     assert posts == ["refresh-1", "refresh-1"]
 
@@ -1055,6 +1065,7 @@ def test_refresh_no_material_does_not_touch_lock_file(token_dir, monkeypatch) ->
     from omnigent.cli_auth import refresh_stored_token, store_token
 
     store_token("http://localhost:6767", token="jwt", user_id="a@x", expires_at=time.time() - 10)
+    (token_dir / "auth_tokens.lock").unlink()  # fork: storing takes the lock too
 
     def _boom(*_a, **_kw):
         raise AssertionError("lock file must not be created when nothing to refresh")
@@ -1124,7 +1135,11 @@ def test_refresh_rejects_unusable_response_fields(token_dir, monkeypatch) -> Non
 
     import httpx
 
+    from omnigent import cli_auth
     from omnigent.cli_auth import refresh_stored_token, store_token
+
+    now = [1000.0]
+    monkeypatch.setattr(cli_auth, "_clock", lambda: now[0])
 
     def _seed():
         store_token(
@@ -1151,6 +1166,7 @@ def test_refresh_rejects_unusable_response_fields(token_dir, monkeypatch) -> Non
     assert entry["token"] == "stale" and entry["refresh_token"] == "refresh-1"
 
     # Non-finite expires_in → falls back to a sane lifetime, not "never expires".
+    now[0] += cli_auth.FORCED_REFRESH_BACKOFF_CAP_S * 2  # fork: past the backoff
     _seed()
     monkeypatch.setattr(
         httpx,
