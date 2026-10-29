@@ -457,7 +457,13 @@ def _run_omnigent(cwd: Path, home: Path, *args: str) -> subprocess.CompletedProc
     )
 
 
-def test_auth_refresh_imports_nothing_from_the_cwd_and_writes_no_log(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "global_flags",
+    [[], ["--profiling"], ["--"], ["--debug"], ["--log-to-stderr", "--profiling", "--"]],
+)
+def test_auth_refresh_imports_nothing_from_the_cwd_and_writes_no_log(
+    tmp_path: Path, global_flags: list[str]
+) -> None:
     home, work = tmp_path / "home", tmp_path / "work"
     home.mkdir()
     work.mkdir()
@@ -476,10 +482,69 @@ def test_auth_refresh_imports_nothing_from_the_cwd_and_writes_no_log(tmp_path: P
     refused = hashlib.sha256(b"t").hexdigest()
 
     done = _run_omnigent(
-        work, home, "auth", "refresh", "--server", server, "--refused-sha256", refused, "--json"
+        work,
+        home,
+        *global_flags,
+        "auth",
+        "refresh",
+        "--server",
+        server,
+        "--refused-sha256",
+        refused,
+        "--json",
     )
 
     assert json.loads(done.stdout)["status"] == "backoff", done.stderr
     assert done.returncode == 11
     assert not marker.exists(), marker.read_text()
     assert not list(home.glob(".omnigent/logs/cli/*")), "auth refresh wrote a CLI log file"
+
+
+def _unreadable_lock(root: Path) -> Path:
+    """A lock file this user cannot open, as a root-owned 0600 one left by sudo."""
+    lock = root / "auth_tokens.lock"
+    lock.touch()
+    lock.chmod(0)
+    if os.access(lock, os.R_OK):  # running as root: nothing is unreadable
+        pytest.skip("needs a non-root user")
+    return lock
+
+
+def test_an_unreadable_lock_file_names_itself_and_the_fix(box: _Box) -> None:
+    lock = _unreadable_lock(box.root)
+    with pytest.raises(cli_auth.TokenFileLockError) as raised:
+        _store("login")
+    assert str(lock) in str(raised.value) and "sudo chown $USER" in str(raised.value)
+
+
+def test_refresh_reports_an_unreadable_lock_file(box: _Box) -> None:
+    _store("login")
+    lock = _unreadable_lock(box.root)
+    code, out, err = _run("--refused-sha256", _sha("login"), "--json")
+    assert code == 1 and json.loads(out)["status"] == "error"
+    message = err.strip().splitlines()[-1]  # the command's own line, not a log record
+    assert message.startswith("cannot open the token lock file")
+    assert str(lock) in message and "sudo chown $USER" in message
+    assert box.endpoint.posts == []
+
+
+def test_login_with_an_unreadable_lock_file_exits_cleanly(
+    box: _Box, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import omnigent.cli as cli_mod
+
+    lock = _unreadable_lock(box.root)
+
+    def _login(*args: object, **kwargs: object) -> None:
+        _store("login")  # what `omnigent login` does once it has a token
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(box.root / "data"))  # its CLI log goes here
+    monkeypatch.setattr(cli_mod, "cli", _login)
+    monkeypatch.setattr(cli_mod, "_is_auth_invocation", lambda argv: False)
+    monkeypatch.setattr(sys, "argv", ["omnigent", "login", "http://localhost:8000"])
+    with pytest.raises(SystemExit) as exited:
+        cli_mod.main()
+    assert exited.value.code == 1
+    err = capsys.readouterr().err
+    assert err.startswith("Error: cannot open the token lock file"), err  # no crash screen
+    assert str(lock) in err and "sudo chown $USER" in err
