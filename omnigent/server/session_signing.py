@@ -27,16 +27,18 @@ Settings (environment, like the other auth secrets; never the YAML file):
   datetime with offset. While ``eddsa`` is on, HS256 tokens signed with the
   cookie secret are accepted strictly before this instant and refused from
   it on. Unset means refused at once. Set it to at least the deploy date
-  plus the longest token lifetime the old server minted (the CLI login
-  token lives ``OMNIGENT_OIDC_SESSION_TTL_HOURS``, 30 days on prod) plus a
-  margin, so no HS256 token outlives the window it was minted under.
+  plus the longest token lifetime the old server minted (cookies and CLI
+  logins live ``OMNIGENT_OIDC_SESSION_TTL_HOURS`` /
+  ``OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS``, 30 days on prod) plus a margin,
+  so no HS256 token outlives the window it was minted under.
   Clients that still hold one when the window closes recover by
   themselves: a 401 makes them refresh once through their refresh grant.
 
 Production must set ``OMNIGENT_SESSION_SIGNING=eddsa`` explicitly. Docker
-compose passes ``""`` for an unset variable, and an empty mode with a
-missing or unreadable key falls back to ``hs256`` with only a log warning;
-an explicit ``eddsa`` refuses to start instead.
+compose passes ``""`` for an unset variable, and an empty mode with no key
+configured (say the key variable was left out of the env file) falls back
+to ``hs256`` with only a log warning; an explicit ``eddsa`` refuses to
+start instead.
 
 Two token kinds (:data:`TokenKind`), chosen explicitly at every mint site:
 ``identity`` tokens (browser cookie, CLI and host login, the login grant's
@@ -55,8 +57,9 @@ path, this mode, and the ``bytes`` form of :func:`as_signing_keys` go
 away in the follow-up that removes legacy tokens.
 
 Verification, on both algorithms: ``exp``, ``iat`` and ``sub`` are
-required, ``exp``/``iat``/``nbf`` must be JSON numbers, clocks may
-disagree by :data:`CLOCK_SKEW_LEEWAY_SECONDS`, and the signature segment
+required, ``exp``/``iat``/``nbf`` must be JSON numbers, ``iat``/``nbf``
+may lie up to :data:`CLOCK_SKEW_LEEWAY_SECONDS` in the future (``exp`` is
+exact), and the signature segment
 must be canonical unpadded base64url (PyJWT alone accepts a padded or
 bit-flipped final character, so one token would have several spellings).
 EdDSA tokens additionally need ``iss`` and ``aud``; HS256 tokens never had
