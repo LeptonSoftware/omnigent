@@ -186,12 +186,16 @@ def _tunnel_bearers(spy: _ConnectSpy) -> list[str]:
 
 
 async def _run_host(
-    monkeypatch: pytest.MonkeyPatch, script: Sequence[BaseException | int | None]
+    monkeypatch: pytest.MonkeyPatch,
+    script: Sequence[BaseException | int | None],
+    *,
+    base_s: float = 0.0,
+    cap_s: float = 0.0,
 ) -> tuple[_ConnectSpy, list[float]]:
     import websockets.asyncio.client as ws_client
 
-    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
-    monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", base_s)
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", cap_s)
     spy = _ConnectSpy(list(script))
     real_connect = ws_client.connect
     host = _host(_SERVER)
@@ -222,9 +226,7 @@ async def test_host_refused_with_a_month_left_refreshes_once_and_reconnects(
 ) -> None:
     # The tunnel closes before accept() for a bad bearer, which reaches the
     # host as HTTP 403; then the renewed token is accepted.
-    spy, waits = await _run_host(
-        monkeypatch, [_invalid_status(403), None, asyncio.CancelledError()]
-    )
+    spy, _ = await _run_host(monkeypatch, [_invalid_status(403), None, asyncio.CancelledError()])
 
     first, second = _tunnel_bearers(spy)[:2]
     assert first == f"Bearer {world.hs256_login}"
@@ -232,10 +234,24 @@ async def test_host_refused_with_a_month_left_refreshes_once_and_reconnects(
     assert _alg(renewed) == "EdDSA"
     assert second == f"Bearer {renewed}"
     assert world.refresh_posts == [world.refresh_token]
-    # The renewed token goes out at once, not after the backoff.
-    assert waits[0] == 0.0
     # And the server really accepts it.
     assert world.client.get("/v1/hosts", headers=_bearer(renewed)).status_code == 200
+
+
+async def test_host_dials_at_once_with_the_renewed_token(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal after an outage does not sit out the grown backoff."""
+    spy, waits = await _run_host(
+        monkeypatch,
+        [_invalid_status(503)] * 3 + [_invalid_status(403), None, asyncio.CancelledError()],
+        base_s=0.01,
+        cap_s=100.0,
+    )
+
+    assert waits[2] > 0.02  # the 503s grew the backoff
+    assert waits[3] == 0.01  # the refusal's refresh resets it
+    assert _tunnel_bearers(spy)[4] == f"Bearer {_stored_token()}"
 
 
 async def test_host_forces_one_refresh_not_one_per_retry(
