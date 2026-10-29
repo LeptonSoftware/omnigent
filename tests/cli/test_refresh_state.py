@@ -140,6 +140,20 @@ def test_a_malformed_state_record_reads_as_absent(box: _Box, record: object) -> 
     assert len(box.endpoint.posts) == 1
 
 
+@pytest.mark.parametrize("counter", ["x", True, -3, 2.5, None])
+def test_a_malformed_failure_count_reads_as_zero(box: _Box, counter: object) -> None:
+    """The failure path reads the counter too: it must back off, not error."""
+    _store("login")
+    box.endpoint.mode = "503"
+    box.write_record({"outcome": "transient", "failures": counter})
+    result = cli_auth.refresh_login(_SERVER, refused_sha256=_sha("login"))
+    assert (result.status, result.retry_after) == (
+        "backoff",
+        cli_auth.FORCED_REFRESH_BACKOFF_BASE_S,
+    )
+    assert box.record()["failures"] == 1
+
+
 def test_a_malformed_state_file_reads_as_absent(box: _Box) -> None:
     _store("login")
     (box.root / cli_auth.REFRESH_STATE_FILE_NAME).write_text(
