@@ -66,12 +66,14 @@ from omnigent.server.oidc import (
     derive_code_challenge,
     generate_code_verifier,
     mint_session_cookie,
+    mint_session_token,
 )
 from omnigent.server.oidc_access import OidcAdmissionPolicy, resolve_allowed_domains_path
 from omnigent.server.routes._oauth import NO_STORE_HEADERS, oauth_error
 from omnigent.server.routes.device_auth import (
     JARVIS_LOGIN_GRANT_CLIENT_ID,
     _generate_user_code,
+    create_login_grant,
     issue_login_grant,
 )
 from omnigent.server.session_signing import IDENTITY, JARVIS_AZP  # fork
@@ -127,6 +129,11 @@ _LOGIN_REDIRECT_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 # The caller's anti-CSRF state, echoed back with the code.
 _LOGIN_REDIRECT_STATE_RE = re.compile(r"[A-Za-z0-9._~-]{16,512}")
 _CLI_REDEEM_MAX_BODY_BYTES = 4096
+# fork: lifetime of the token a redirect login redeems. The refresh grant
+# carries the long part; this is the first of its short access tokens.
+LOGIN_REDIRECT_TOKEN_TTL_ENV = "OMNIGENT_LOGIN_REDIRECT_TOKEN_TTL_SECONDS"
+_LOGIN_REDIRECT_TOKEN_TTL_DEFAULT = 3600
+_LOGIN_REDIRECT_TOKEN_TTL_MAX = 12 * 3600
 # How long an OIDC invite URL stays redeemable. Matches the accounts
 # provider's default invite window (72h) — long enough to share
 # out-of-band, short enough to bound exposure of an unused link.
@@ -280,6 +287,7 @@ def create_auth_router(
     _state_cookie = _AUTH_STATE_COOKIE_SECURE if _secure else _AUTH_STATE_COOKIE_PLAIN
 
     login_redirect_uris = login_redirect_uris_from_env()
+    login_redirect_token_ttl = login_redirect_token_ttl_from_env()
 
     # In-memory store for CLI login tickets. Tickets are short-lived
     # (5 min) and single-use. Keyed by ticket ID.
@@ -837,6 +845,12 @@ def create_auth_router(
                     status_code=400,
                     content={"error": "state (16-512 URL-safe characters) is required"},
                 )
+            if device_grant_store is None:
+                # Without a stored grant its token could never be revoked.
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "redirect login needs refresh grants on this server"},
+                )
 
         _evict_expired_tickets(_cli_tickets)
 
@@ -847,7 +861,7 @@ def create_auth_router(
             _cli_tickets[ticket_id] = _CliTicket(
                 code_challenge=code_challenge,
                 redirect_uri=redirect_uri,
-                redirect_state=redirect_state,
+                redirect_state=str(redirect_state),
             )
             return JSONResponse(
                 status_code=200,
@@ -1183,25 +1197,37 @@ def create_auth_router(
         if session_iat is None or session_iat < int(ticket.created_at):
             return _bounce_to_login(request, ticket_id, reauth=True, step="cli-redirect")
 
-        ticket.token = mint_session_cookie(
-            user_id=user_id,
-            keys=config.signing_keys,  # fork
+        # The grant comes first: the token names it, so revoking the grant
+        # (logout, /oauth/revoke) kills the token as well as its refreshes.
+        assert device_grant_store is not None, "cli-login refuses redirect tickets without one"
+        try:
+            grant = create_login_grant(
+                device_grant_store,
+                user_id=user_id,
+                cookie_secret=config.cookie_secret,
+                client_id=JARVIS_LOGIN_GRANT_CLIENT_ID,
+                signed_in_at=session_iat,
+            )
+        except Exception:
+            _logger.exception("cli-redirect: login grant issuance failed")
+            del _cli_tickets[ticket_id]
+            return HTMLResponse(
+                _cli_consent_html(error="Sign-in failed. Start again from where you signed in."),
+                status_code=500,
+                headers=_CLI_BROWSER_HEADERS,
+            )
+        ticket.token = mint_session_token(
+            user_id,
+            config.signing_keys,  # fork
+            login_redirect_token_ttl,
+            config.provider_type,
             kind=IDENTITY,
-            ttl_hours=config.session_ttl_hours,
-            provider=config.provider_type,
             azp=JARVIS_AZP,
+            grant_id=grant.grant_id,
+            auth_time=session_iat,
         )
         ticket.user_id = user_id
-        if device_grant_store is not None:
-            try:
-                ticket.refresh_token = issue_login_grant(
-                    device_grant_store,
-                    user_id=user_id,
-                    cookie_secret=config.cookie_secret,
-                    client_id=JARVIS_LOGIN_GRANT_CLIENT_ID,
-                )
-            except Exception:
-                _logger.exception("cli-redirect: refresh grant issuance failed")
+        ticket.refresh_token = grant.refresh_token
         code = secrets.token_urlsafe(32)
         ticket.code_hash = _sha256_hex(code)
         _logger.info("cli-redirect: %s signed in through a redirect login", user_id)
@@ -1220,8 +1246,8 @@ def create_auth_router(
         Any attempt with a wrong code or verifier burns the ticket.
 
         :param request: A server-to-server JSON POST.
-        :returns: 200 ``{"token", "user_id", "expires_in"}`` plus
-            ``refresh_token`` when a grant store is wired; 400
+        :returns: 200 ``{"token", "refresh_token", "user_id",
+            "expires_in"}``; 400
             ``invalid_request`` for a malformed body or a ticket that is not a
             redirect login (left untouched); 400 ``invalid_grant`` for a
             wrong code or verifier or a ticket not yet signed in; 410
@@ -1261,13 +1287,12 @@ def create_auth_router(
         ):
             _logger.warning("cli-redeem: wrong code or verifier; login ticket burned")
             return oauth_error("invalid_grant")
-        content: dict[str, object] = {
+        content = {
             "token": ticket.token,
+            "refresh_token": ticket.refresh_token,
             "user_id": ticket.user_id,
-            "expires_in": config.session_ttl_hours * 3600,
+            "expires_in": login_redirect_token_ttl,
         }
-        if ticket.refresh_token is not None:
-            content["refresh_token"] = ticket.refresh_token
         return JSONResponse(status_code=200, content=content, headers=NO_STORE_HEADERS)
 
     # ── Native sign-in ──────────────────────────────────────────────────────
@@ -1500,6 +1525,28 @@ def login_redirect_uris_from_env() -> frozenset[str]:
             )
         uris.add(entry)
     return frozenset(uris)
+
+
+def login_redirect_token_ttl_from_env() -> int:
+    """Read the lifetime of the token a redirect login redeems.
+
+    :returns: Seconds from :data:`LOGIN_REDIRECT_TOKEN_TTL_ENV`, default
+        3600 (one access-token lifetime; the refresh grant renews it).
+    :raises RuntimeError: When set to anything but an integer in 60..43200.
+    """
+    raw = os.environ.get(LOGIN_REDIRECT_TOKEN_TTL_ENV, "").strip()
+    if not raw:
+        return _LOGIN_REDIRECT_TOKEN_TTL_DEFAULT
+    try:
+        ttl = int(raw)
+    except ValueError:
+        ttl = 0
+    if not 60 <= ttl <= _LOGIN_REDIRECT_TOKEN_TTL_MAX:
+        raise RuntimeError(
+            f"{LOGIN_REDIRECT_TOKEN_TTL_ENV} must be whole seconds between 60 and "
+            f"{_LOGIN_REDIRECT_TOKEN_TTL_MAX}; got {raw!r}"
+        )
+    return ttl
 
 
 def _is_registrable_redirect_uri(uri: str, *, allow_http_loopback: bool) -> bool:

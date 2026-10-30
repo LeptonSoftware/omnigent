@@ -681,11 +681,13 @@ def test_login_grant_refresh_is_identity_and_device_grant_refresh_is_internal(
     assert keys.decode(device.json()["access_token"])["aud"] == ["omnigent"]
 
 
-def test_azp_is_refused_on_internal_tokens() -> None:
+@pytest.mark.parametrize("claim", [{"azp": JARVIS_AZP}, {"auth_time": 1700000000}])
+def test_jarvis_claims_are_refused_on_internal_tokens(claim: dict[str, object]) -> None:
+    (name,) = claim
     for keys in (_eddsa_keys(), SessionSigningKeys.hs256(_SECRET)):
-        assert keys.decode(keys.encode(_claims(azp=JARVIS_AZP), kind=IDENTITY))["azp"] == "jarvis"
-        with pytest.raises(ValueError, match="azp"):
-            keys.encode(_claims(azp=JARVIS_AZP), kind=INTERNAL)
+        assert keys.decode(keys.encode(_claims(**claim), kind=IDENTITY))[name] == claim[name]
+        with pytest.raises(ValueError, match="only minted on identity tokens"):
+            keys.encode(_claims(**claim), kind=INTERNAL)
 
 
 def test_only_the_jarvis_login_grant_refresh_carries_azp(tmp_path: Path) -> None:
@@ -697,6 +699,7 @@ def test_only_the_jarvis_login_grant_refresh_carries_azp(tmp_path: Path) -> None
     from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
     from omnigent.server.routes.device_auth import (
         JARVIS_LOGIN_GRANT_CLIENT_ID,
+        create_login_grant,
         create_oauth_token_router,
         issue_login_grant,
         mint_delegated_token,
@@ -710,13 +713,15 @@ def test_only_the_jarvis_login_grant_refresh_carries_azp(tmp_path: Path) -> None
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
     app = FastAPI()
     app.include_router(create_oauth_token_router(provider, store))  # type: ignore[arg-type]
+    signed_in_at = int(time.time()) - 120
     refreshes = {
-        "jarvis": issue_login_grant(
+        "jarvis": create_login_grant(
             store,
             user_id="alice@example.com",
             cookie_secret=_SECRET,
             client_id=JARVIS_LOGIN_GRANT_CLIENT_ID,
-        ),
+            signed_in_at=signed_in_at,
+        ).refresh_token,
         "cli": issue_login_grant(store, user_id="alice@example.com", cookie_secret=_SECRET),
         "device": "device-refresh-token",
     }
@@ -737,16 +742,23 @@ def test_only_the_jarvis_login_grant_refresh_carries_azp(tmp_path: Path) -> None
             for name, token in refreshes.items()
         }
     assert claims["jarvis"]["azp"] == "jarvis"
+    assert claims["jarvis"]["auth_time"] == signed_in_at
     assert claims["jarvis"]["aud"] == ["omnigent", "jarvis"]
-    assert "azp" not in claims["cli"]
-    assert "azp" not in claims["device"]
-    machine = mint_delegated_token(
-        "svc@example.com", keys, 600, "oidc", grant_id=None, client_id="jarvis", jti="j"
+    machine = keys.decode(
+        mint_delegated_token(
+            "svc@example.com", keys, 600, "oidc", grant_id=None, client_id="jarvis", jti="j"
+        )
     )
-    assert "azp" not in keys.decode(machine)
+    for other in (claims["cli"], claims["device"], machine):
+        assert "azp" not in other
+        assert "auth_time" not in other
     with pytest.raises(ValueError, match="login-grant"):
-        issue_login_grant(
-            store, user_id="alice@example.com", cookie_secret=_SECRET, client_id="slack"
+        create_login_grant(
+            store,
+            user_id="alice@example.com",
+            cookie_secret=_SECRET,
+            client_id="slack",
+            signed_in_at=signed_in_at,
         )
 
 

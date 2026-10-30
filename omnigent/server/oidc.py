@@ -67,6 +67,8 @@ def mint_session_token(
     cli_login_ticket: str | None = None,
     kind: TokenKind = INTERNAL,  # fork: identity mints pass IDENTITY
     azp: str | None = None,
+    grant_id: str | None = None,
+    auth_time: int | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -90,6 +92,9 @@ def mint_session_token(
         ``internal``, is Omnigent only; identity logins pass ``identity``.
     :param azp: fork: the ``azp`` claim, set only for the Jarvis web
         sign-in (:data:`omnigent.server.session_signing.JARVIS_AZP`).
+    :param grant_id: fork: the login grant this token belongs to; the auth
+        layer refuses the token once that grant is revoked.
+    :param auth_time: fork: when the person signed in (epoch seconds).
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
@@ -105,6 +110,10 @@ def mint_session_token(
         payload["cli_login_ticket"] = cli_login_ticket
     if azp is not None:
         payload["azp"] = azp
+    if grant_id is not None:
+        payload["grant_id"] = grant_id
+    if auth_time is not None:
+        payload["auth_time"] = auth_time
     return as_signing_keys(keys).encode(payload, kind=kind)  # fork: EdDSA when a key is configured
 
 
@@ -117,7 +126,6 @@ def mint_session_cookie(
     account_generation: str | None = None,
     cli_login_ticket: str | None = None,
     kind: TokenKind = INTERNAL,  # fork: identity mints pass IDENTITY
-    azp: str | None = None,
 ) -> str:
     """Mint a signed session cookie JWT.
 
@@ -129,7 +137,6 @@ def mint_session_cookie(
         or ``"github"``. Stored as an informational claim.
     :param cli_login_ticket: Ticket authenticated by the browser callback.
     :param kind: fork: see :func:`mint_session_token`.
-    :param azp: fork: see :func:`mint_session_token`.
     :returns: An HS256-signed JWT string.
     """
     return mint_session_token(
@@ -140,7 +147,6 @@ def mint_session_cookie(
         account_generation=account_generation,
         cli_login_ticket=cli_login_ticket,
         kind=kind,
-        azp=azp,
     )
 
 

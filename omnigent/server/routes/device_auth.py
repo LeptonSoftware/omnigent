@@ -55,6 +55,7 @@ import os
 import secrets
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request
@@ -126,9 +127,22 @@ def _is_login_grant(client_id: str | None) -> bool:
     return client_id in _LOGIN_GRANT_CLIENT_IDS
 
 
-def _login_grant_azp(client_id: str | None) -> str | None:
-    """The ``azp`` a login grant's refreshed token carries, if any."""
-    return JARVIS_AZP if client_id == JARVIS_LOGIN_GRANT_CLIENT_ID else None
+def _is_jarvis_login_grant(client_id: str | None) -> bool:
+    """Whether a grant is the Jarvis web sign-in's; its tokens carry ``azp`` + ``auth_time``."""
+    return client_id == JARVIS_LOGIN_GRANT_CLIENT_ID
+
+
+@dataclass(frozen=True)
+class LoginGrant:
+    """A freshly issued login grant.
+
+    :param grant_id: The stored grant's id; tokens carrying it die when the
+        grant is revoked.
+    :param refresh_token: The raw refresh token (stored only hashed).
+    """
+
+    grant_id: str
+    refresh_token: str
 
 
 # RFC 8628 timings.
@@ -243,6 +257,7 @@ def mint_delegated_token(
     account_generation: str | None = None,
     kind: TokenKind = INTERNAL,  # fork: only the first-party login grant passes IDENTITY
     azp: str | None = None,
+    auth_time: int | None = None,
 ) -> str:
     """Mint a grant-derived or client-credential access token.
 
@@ -288,6 +303,8 @@ def mint_delegated_token(
         ``internal`` (Omnigent only).
     :param azp: fork: the ``azp`` claim; only a Jarvis login grant's
         refresh sets it (see :data:`JARVIS_LOGIN_GRANT_CLIENT_ID`).
+    :param auth_time: fork: the sign-in instant, copied onto a Jarvis login
+        grant's refreshes.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
@@ -307,6 +324,8 @@ def mint_delegated_token(
         payload["scope"] = scope
     if azp is not None:
         payload["azp"] = azp
+    if auth_time is not None:
+        payload["auth_time"] = auth_time
     return as_signing_keys(keys).encode(payload, kind=kind)  # fork: EdDSA when a key is configured
 
 
@@ -386,7 +405,6 @@ def issue_login_grant(
     *,
     user_id: str,
     cookie_secret: bytes,
-    client_id: str = LOGIN_GRANT_CLIENT_ID,
 ) -> str:
     """Create a redeemed refresh grant for an interactive login.
 
@@ -401,22 +419,49 @@ def issue_login_grant(
     :param device_grant_store: Grant persistence.
     :param user_id: The just-authenticated identity.
     :param cookie_secret: HMAC key for hashing the refresh token.
+    :returns: The raw refresh token to hand to the client (stored hashed).
+    """
+    return create_login_grant(
+        device_grant_store,
+        user_id=user_id,
+        cookie_secret=cookie_secret,
+        client_id=LOGIN_GRANT_CLIENT_ID,
+        signed_in_at=int(time.time()),
+    ).refresh_token
+
+
+def create_login_grant(
+    device_grant_store: DeviceGrantStore,
+    *,
+    user_id: str,
+    cookie_secret: bytes,
+    client_id: str,
+    signed_in_at: int,
+) -> LoginGrant:
+    """Create a redeemed login grant and return its id with the refresh token.
+
+    :param device_grant_store: Grant persistence.
+    :param user_id: The just-authenticated identity.
+    :param cookie_secret: HMAC key for hashing the refresh token.
     :param client_id: :data:`LOGIN_GRANT_CLIENT_ID` (CLI, host, native app)
         or :data:`JARVIS_LOGIN_GRANT_CLIENT_ID` (the Jarvis web sign-in).
-    :returns: The raw refresh token to hand to the client (stored hashed).
+    :param signed_in_at: The sign-in instant (epoch seconds). Stored as the
+        grant's ``approved_at``: it anchors the absolute lifetime and is the
+        ``auth_time`` a Jarvis grant's refreshes carry.
+    :returns: The grant id and raw refresh token.
     :raises ValueError: For any other ``client_id``.
     """
     if not _is_login_grant(client_id):
         raise ValueError(f"not a login-grant client id: {client_id!r}")
     refresh_token = _mint_refresh_token()
-    device_grant_store.create_redeemed_grant(
+    grant = device_grant_store.create_redeemed_grant(
         secrets.token_urlsafe(24),
         user_id=user_id,
         client_id=client_id,
         refresh_token_hash=hash_secret(refresh_token, cookie_secret),
-        created_at=int(time.time()),
+        created_at=signed_in_at,
     )
-    return refresh_token
+    return LoginGrant(grant_id=grant.id, refresh_token=refresh_token)
 
 
 def create_oauth_token_router(
@@ -505,6 +550,7 @@ def create_oauth_token_router(
         # session JWT it replaces (scope=None); a third-party device grant
         # stays restricted to the delegated allowlist.
         login_grant = _is_login_grant(client_id)
+        jarvis = _is_jarvis_login_grant(client_id)
         scope = None if login_grant else DELEGATED_SCOPE
         return mint_delegated_token(
             user_id,
@@ -519,7 +565,8 @@ def create_oauth_token_router(
             # fork: the CLI/host login's refresh is an identity token; a
             # third-party device grant's is Omnigent-only.
             kind=IDENTITY if login_grant else INTERNAL,
-            azp=_login_grant_azp(client_id),
+            azp=JARVIS_AZP if jarvis else None,
+            auth_time=grant.approved_at if jarvis else None,
         )
 
     @router.post("/oauth/token", dependencies=[])

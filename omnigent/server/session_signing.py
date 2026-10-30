@@ -47,10 +47,11 @@ tokens (managed-runner tokens handed to sandboxes, machine client
 credentials, third-party device grants) carry ``aud: ["omnigent"]`` only,
 so no other service accepts them.
 
-Claim ``azp`` (:data:`JARVIS_AZP`) marks an identity token Omnigent issued to
-the Jarvis web sign-in (``/auth/cli-login`` with a ``redirect_uri``) and the
-refreshes of that sign-in's grant. No other mint site sets it, and
-:meth:`SessionSigningKeys.encode` refuses it on an ``internal`` token.
+Claims ``azp`` (:data:`JARVIS_AZP`) and ``auth_time`` (the sign-in instant)
+mark an identity token Omnigent issued to the Jarvis web sign-in
+(``/auth/cli-login`` with a ``redirect_uri``) and the refreshes of that
+sign-in's grant. No other mint site sets them, and
+:meth:`SessionSigningKeys.encode` refuses them on an ``internal`` token.
 
 ``hs256`` mode mints exactly what the server minted before this change and
 always accepts HS256, whatever ``OMNIGENT_LEGACY_HS256_UNTIL`` says: it is
@@ -132,6 +133,7 @@ JARVIS_AZP = "jarvis"
 """``azp`` of a token issued to the Jarvis web sign-in; see the module docstring."""
 
 _REQUIRED_CLAIMS = ("exp", "iat", "sub")
+_IDENTITY_ONLY_CLAIMS = frozenset({"azp", "auth_time"})
 _NUMERIC_CLAIMS = ("exp", "iat", "nbf")
 _B64URL_UNPADDED = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -257,8 +259,8 @@ class SessionSigningKeys:
             every mint site states who may accept the token.
         """
         audience = self.audience_for(kind)
-        if "azp" in claims and kind != IDENTITY:
-            raise ValueError("azp is only minted on identity tokens")
+        if kind != IDENTITY and not _IDENTITY_ONLY_CLAIMS.isdisjoint(claims):
+            raise ValueError("azp and auth_time are only minted on identity tokens")
         if self.mode == MODE_HS256:
             return jwt.encode(claims, self.legacy_secret, algorithm="HS256")
         assert self.signing_key is not None and self.issuer is not None

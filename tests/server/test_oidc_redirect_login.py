@@ -8,6 +8,10 @@ it, so whoever made a login link cannot collect the person who used it.
 
 from __future__ import annotations
 
+import atexit
+import functools
+import shutil
+import tempfile
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -18,14 +22,18 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import jwt
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from starlette.responses import JSONResponse
 
+from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import RESERVED_USER_LOCAL, UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import mint_session_cookie
 from omnigent.server.routes.auth import (
     LOGIN_REDIRECT_ALLOW_HTTP_LOOPBACK_ENV,
+    LOGIN_REDIRECT_TOKEN_TTL_ENV,
     LOGIN_REDIRECT_URIS_ENV,
+    create_auth_router,
     login_redirect_uris_from_env,
 )
 from omnigent.server.routes.device_auth import create_oauth_token_router
@@ -34,10 +42,8 @@ from tests.server.integration.oidc_fixtures import (
     _mint_state_cookie,
     _mock_httpx_client_for_github,
     _pkce_pair,
+    build_oidc_transport,
     make_oidc_config,
-)
-from tests.server.integration.oidc_fixtures import (
-    build_oidc_transport as _build_app,
 )
 
 _REDIRECT_URI = "https://jarvis.example.com/auth/callback"
@@ -49,12 +55,49 @@ def _registered_redirect(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OMNIGENT_OIDC_LEGACY_TICKET_LOGIN", "0")
     monkeypatch.setenv(LOGIN_REDIRECT_URIS_ENV, f"{_REDIRECT_URI}, https://other.example.com/cb")
     monkeypatch.delenv(LOGIN_REDIRECT_ALLOW_HTTP_LOOPBACK_ENV, raising=False)
+    monkeypatch.delenv(LOGIN_REDIRECT_TOKEN_TTL_ENV, raising=False)
+
+
+def _build_app(store: DeviceGrantStore) -> httpx.ASGITransport:
+    """The OIDC auth routes, ``/oauth/token`` and a ``/v1/me`` probe on one grant store."""
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=make_oidc_config())
+    provider.set_grant_revocation_check(store.is_revoked)  # as create_app wires it
+    app = FastAPI()
+    app.state.base_path = ""
+    app.include_router(
+        create_auth_router(
+            auth_provider=provider,
+            permission_store=None,
+            admin_list=AdminList(Path("/tmp/nonexistent-admin-list.txt")),
+            device_grant_store=store,
+        ),
+        prefix="/auth",
+    )
+    app.include_router(create_oauth_token_router(provider, store))
+
+    @app.get("/v1/me")
+    async def me(request: Request) -> JSONResponse:
+        # create_app's /v1/me answers 401 exactly when get_user_id is None.
+        user_id = provider.get_user_id(request)
+        return JSONResponse(status_code=200 if user_id else 401, content={"user_id": user_id})
+
+    return httpx.ASGITransport(app=app)
+
+
+@functools.cache
+def _shared_store() -> DeviceGrantStore:
+    """One grant store for the tests that do not inspect it (building one is slow)."""
+    scratch = tempfile.mkdtemp(prefix="redirect-login-")
+    atexit.register(shutil.rmtree, scratch, ignore_errors=True)
+    return DeviceGrantStore(f"sqlite:///{scratch}/grants.db")
 
 
 @asynccontextmanager
 async def _client(store: DeviceGrantStore | None = None) -> AsyncIterator[httpx.AsyncClient]:
     async with httpx.AsyncClient(
-        transport=_build_app(store), base_url="http://test", follow_redirects=False
+        transport=_build_app(store or _shared_store()),
+        base_url="http://test",
+        follow_redirects=False,
     ) as client:
         yield client
 
@@ -273,6 +316,12 @@ async def test_redirect_login_skips_consent_and_redeems_once(tmp_path: Path) -> 
         claims = _claims(body["token"])
         assert claims["sub"] == "alice@example.com"
         assert claims["azp"] == "jarvis"
+        assert isinstance(claims["grant_id"], str)
+        assert claims["auth_time"] == _claims(client.cookies["ap_session"])["iat"]
+        assert claims["exp"] - claims["iat"] == 3600 == body["expires_in"]
+        # Jarvis reads ``act`` as "refreshed"; the redeemed token has none.
+        assert "act" not in claims
+        assert "scope" not in claims
         assert "cli_login_ticket" not in claims
 
         again = await _redeem(client, ticket, code, verifier)
@@ -492,15 +541,8 @@ async def test_code_goes_to_the_uri_the_ticket_named() -> None:
 # ── azp ──────────────────────────────────────────────────────────
 
 
-def _token_app(store: DeviceGrantStore) -> httpx.ASGITransport:
-    provider = UnifiedAuthProvider(source="oidc", oidc_config=make_oidc_config())
-    app = FastAPI()
-    app.include_router(create_oauth_token_router(provider, store))
-    return httpx.ASGITransport(app=app)
-
-
 async def _refresh(store: DeviceGrantStore, refresh_token: str) -> dict[str, object]:
-    async with httpx.AsyncClient(transport=_token_app(store), base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=_build_app(store), base_url="http://test") as client:
         response = await client.post(
             "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh_token}
         )
@@ -538,10 +580,12 @@ async def test_azp_rides_the_redirect_login_and_its_refresh_only(tmp_path: Path)
     assert jarvis_refresh["act"] == {"client_id": "jarvis"}
     assert "scope" not in jarvis_refresh
 
-    assert "azp" not in _claims(cli["token"])
-    assert "azp" not in _claims(browser_cookie)
+    for claims in (_claims(cli["token"]), _claims(browser_cookie)):
+        assert "azp" not in claims
+        assert "auth_time" not in claims
     cli_refresh = await _refresh(store, cli["refresh_token"])
     assert "azp" not in cli_refresh
+    assert "auth_time" not in cli_refresh
     assert cli_refresh["act"] == {"client_id": "omnigent-cli"}
 
 
@@ -581,3 +625,115 @@ async def test_attacker_ticket_yields_nothing_when_a_victim_signs_in(tmp_path: P
         # The guess burned the ticket: even the real code no longer works.
         code = parse_qs(urlsplit(delivered.headers["location"]).query)["code"][0]
         assert (await _redeem(attacker, ticket, code, verifier)).status_code == 410
+
+
+# ── Revocation, auth_time, lifetime ──────────────────────────────
+
+
+async def _redeemed(client: httpx.AsyncClient) -> dict[str, str]:
+    ticket, verifier = await _create_redirect_ticket(client)
+    code = await _deliver_code(client, ticket)
+    redeemed = await _redeem(client, ticket, code, verifier)
+    assert redeemed.status_code == 200, redeemed.text
+    return redeemed.json()
+
+
+@pytest.mark.parametrize("revoke", ["oauth_revoke", "grant_revoked"])
+async def test_revoking_the_grant_kills_the_redeemed_token_and_its_refresh(
+    revoke: str, tmp_path: Path
+) -> None:
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/grants.db")
+    async with _client(store) as client:
+        body = await _redeemed(client)
+        # The bearer alone, as Jarvis presents it: no Omnigent browser cookie.
+        client.cookies.clear()
+        bearer = {"Authorization": f"Bearer {body['token']}"}
+        assert (await client.get("/v1/me", headers=bearer)).json()["user_id"] == (
+            "alice@example.com"
+        )
+        if revoke == "oauth_revoke":
+            revoked = await client.post(
+                "/oauth/revoke", data={"refresh_token": body["refresh_token"]}
+            )
+            assert revoked.status_code == 200
+        else:
+            store.revoke(str(_claims(body["token"])["grant_id"]))
+
+        assert (await client.get("/v1/me", headers=bearer)).status_code == 401
+        refreshed = await client.post(
+            "/oauth/token",
+            data={"grant_type": "refresh_token", "refresh_token": body["refresh_token"]},
+        )
+        assert refreshed.status_code == 400
+        assert "access_token" not in refreshed.json()
+
+
+async def test_auth_time_is_the_sign_in_and_survives_refresh(tmp_path: Path) -> None:
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/grants.db")
+    async with _client(store) as client:
+        body = await _redeemed(client)
+        signed_in_at = _claims(client.cookies["ap_session"])["iat"]
+        redeemed = _claims(body["token"])
+        assert redeemed["auth_time"] == signed_in_at
+        later = time.time() + 600
+        with patch("omnigent.server.routes.device_auth.time.time", return_value=later):
+            response = await client.post(
+                "/oauth/token",
+                data={"grant_type": "refresh_token", "refresh_token": body["refresh_token"]},
+            )
+    assert response.status_code == 200, response.text
+    # Minted ten minutes "from now", so decode with that much leeway.
+    refreshed = jwt.decode(
+        response.json()["access_token"], TEST_SIGNING_KEY, algorithms=["HS256"], leeway=900
+    )
+    assert refreshed["auth_time"] == signed_in_at
+    assert refreshed["iat"] >= int(later)
+    assert refreshed["grant_id"] == redeemed["grant_id"]
+    assert refreshed["act"] == {"client_id": "jarvis"}
+
+
+@pytest.mark.parametrize(("setting", "ttl"), [("", 3600), ("60", 60), ("43200", 43200)])
+async def test_redeemed_token_lifetime_is_configurable(
+    setting: str, ttl: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(LOGIN_REDIRECT_TOKEN_TTL_ENV, setting)
+    async with _client() as client:
+        body = await _redeemed(client)
+    claims = _claims(body["token"])
+    assert claims["exp"] - claims["iat"] == ttl == int(body["expires_in"])
+
+
+@pytest.mark.parametrize("setting", ["59", "43201", "0", "-1", "1.5", "an hour"])
+def test_invalid_redeemed_token_lifetime_refuses_to_start(
+    setting: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(LOGIN_REDIRECT_TOKEN_TTL_ENV, setting)
+    with pytest.raises(RuntimeError, match=LOGIN_REDIRECT_TOKEN_TTL_ENV):
+        _build_app(DeviceGrantStore(f"sqlite:///{tmp_path}/grants.db"))
+
+
+async def test_redirect_login_needs_a_grant_store() -> None:
+    """Without a stored grant, a redirect login's token could never be revoked."""
+    _, challenge = _pkce_pair()
+    async with httpx.AsyncClient(
+        transport=build_oidc_transport(None), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/auth/cli-login",
+            json={"code_challenge": challenge, "redirect_uri": _REDIRECT_URI, "state": _STATE},
+        )
+    assert response.status_code == 400
+    assert "ticket" not in response.json()
+
+
+async def test_grant_failure_sends_no_code_and_burns_the_ticket() -> None:
+    async with _client() as client:
+        ticket, verifier = await _create_redirect_ticket(client)
+        callback = await _sign_in(client, ticket)
+        with patch(
+            "omnigent.server.routes.auth.create_login_grant", side_effect=RuntimeError("db down")
+        ):
+            failed = await client.get(callback.headers["location"])
+        assert failed.status_code == 500
+        assert "location" not in failed.headers
+        assert (await _redeem(client, ticket, "guess", verifier)).status_code == 410
