@@ -71,7 +71,6 @@ from omnigent.server.oidc import (
 from omnigent.server.oidc_access import OidcAdmissionPolicy, resolve_allowed_domains_path
 from omnigent.server.routes._oauth import NO_STORE_HEADERS, oauth_error
 from omnigent.server.routes.device_auth import (
-    JARVIS_LOGIN_GRANT_CLIENT_ID,
     _generate_user_code,
     create_login_grant,
     issue_login_grant,
@@ -1205,8 +1204,7 @@ def create_auth_router(
                 device_grant_store,
                 user_id=user_id,
                 cookie_secret=config.cookie_secret,
-                client_id=JARVIS_LOGIN_GRANT_CLIENT_ID,
-                signed_in_at=session_iat,
+                jarvis_signed_in_at=session_iat,
             )
         except Exception:
             _logger.exception("cli-redirect: login grant issuance failed")

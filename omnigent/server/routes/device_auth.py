@@ -63,6 +63,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+from omnigent.entities import DeviceGrant
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
@@ -109,26 +110,37 @@ DELEGATED_SCOPE = "sessions"
 # to treat as first-party. See :func:`issue_login_grant`,
 # ``_is_login_grant``, and the reservation guard in ``device_authorize``.
 LOGIN_GRANT_CLIENT_ID = "omnigent-cli"
-# Reserved ``client_id`` of the Jarvis web sign-in's login grant (the
-# ``redirect_uri`` form of ``/auth/cli-login``). Its refreshes carry
-# ``azp: "jarvis"``; no other grant's do.
+# ``client_id`` of the Jarvis web sign-in's login grant (the ``redirect_uri``
+# form of ``/auth/cli-login``). Reserved like the CLI's, but device/authorize
+# accepted it until it was, so the name alone never makes a Jarvis grant:
+# see :func:`_is_jarvis_login_grant`.
 JARVIS_LOGIN_GRANT_CLIENT_ID = "jarvis"
-_LOGIN_GRANT_CLIENT_IDS = frozenset({LOGIN_GRANT_CLIENT_ID, JARVIS_LOGIN_GRANT_CLIENT_ID})
+_RESERVED_LOGIN_CLIENT_IDS = frozenset({LOGIN_GRANT_CLIENT_ID, JARVIS_LOGIN_GRANT_CLIENT_ID})
 
 
-def _is_login_grant(client_id: str | None) -> bool:
+def _is_reserved_login_client_id(client_id: str | None) -> bool:
+    """Whether device/authorize must refuse *client_id* (a login-grant name)."""
+    return client_id in _RESERVED_LOGIN_CLIENT_IDS
+
+
+def _is_jarvis_login_grant(grant: DeviceGrant) -> bool:
+    """Whether *grant* is the Jarvis web sign-in's; its tokens carry ``azp`` + ``auth_time``.
+
+    Needs ``jarvis_signed_in_at``, which only :func:`create_login_grant` sets:
+    a device grant named ``jarvis`` before that name was reserved has none.
+    """
+    return (
+        grant.client_id == JARVIS_LOGIN_GRANT_CLIENT_ID and grant.jarvis_signed_in_at is not None
+    )
+
+
+def _is_login_grant(grant: DeviceGrant) -> bool:
     """Return True for a first-party login grant (vs. a device grant).
 
-    Trustworthy because both login-grant client ids are reserved: the
-    device-authorize path rejects them, so only the server-side login
-    flows can create a grant carrying one.
+    The CLI's client id was reserved from the start, so the name is enough
+    for it; a Jarvis grant also needs its sign-in column.
     """
-    return client_id in _LOGIN_GRANT_CLIENT_IDS
-
-
-def _is_jarvis_login_grant(client_id: str | None) -> bool:
-    """Whether a grant is the Jarvis web sign-in's; its tokens carry ``azp`` + ``auth_time``."""
-    return client_id == JARVIS_LOGIN_GRANT_CLIENT_ID
+    return grant.client_id == LOGIN_GRANT_CLIENT_ID or _is_jarvis_login_grant(grant)
 
 
 @dataclass(frozen=True)
@@ -421,11 +433,7 @@ def issue_login_grant(
     :returns: The raw refresh token to hand to the client (stored hashed).
     """
     return create_login_grant(
-        device_grant_store,
-        user_id=user_id,
-        cookie_secret=cookie_secret,
-        client_id=LOGIN_GRANT_CLIENT_ID,
-        signed_in_at=int(time.time()),
+        device_grant_store, user_id=user_id, cookie_secret=cookie_secret
     ).refresh_token
 
 
@@ -434,31 +442,29 @@ def create_login_grant(
     *,
     user_id: str,
     cookie_secret: bytes,
-    client_id: str,
-    signed_in_at: int,
+    jarvis_signed_in_at: int | None = None,
 ) -> LoginGrant:
     """Create a redeemed login grant and return its id with the refresh token.
 
     :param device_grant_store: Grant persistence.
     :param user_id: The just-authenticated identity.
     :param cookie_secret: HMAC key for hashing the refresh token.
-    :param client_id: :data:`LOGIN_GRANT_CLIENT_ID` (CLI, host, native app)
-        or :data:`JARVIS_LOGIN_GRANT_CLIENT_ID` (the Jarvis web sign-in).
-    :param signed_in_at: The sign-in instant (epoch seconds). Stored as the
-        grant's ``approved_at``: it anchors the absolute lifetime and is the
-        ``auth_time`` a Jarvis grant's refreshes carry.
+    :param jarvis_signed_in_at: The Jarvis web sign-in's sign-in instant
+        (epoch seconds). Set, the grant is a Jarvis login grant
+        (:data:`JARVIS_LOGIN_GRANT_CLIENT_ID`) and every refresh copies this
+        value into ``auth_time``. ``None`` makes a CLI/host login grant.
     :returns: The grant id and raw refresh token.
-    :raises ValueError: For any other ``client_id``.
     """
-    if not _is_login_grant(client_id):
-        raise ValueError(f"not a login-grant client id: {client_id!r}")
     refresh_token = _mint_refresh_token()
     grant = device_grant_store.create_redeemed_grant(
         secrets.token_urlsafe(24),
         user_id=user_id,
-        client_id=client_id,
+        client_id=(
+            LOGIN_GRANT_CLIENT_ID if jarvis_signed_in_at is None else JARVIS_LOGIN_GRANT_CLIENT_ID
+        ),
         refresh_token_hash=hash_secret(refresh_token, cookie_secret),
-        created_at=signed_in_at,
+        created_at=int(time.time()),
+        jarvis_signed_in_at=jarvis_signed_in_at,
     )
     return LoginGrant(grant_id=grant.id, refresh_token=refresh_token)
 
@@ -533,18 +539,19 @@ def create_oauth_token_router(
         except Exception:  # noqa: BLE001 — housekeeping must never fail a refresh
             _logger.debug("oauth/token: opportunistic grant purge failed", exc_info=True)
 
-    def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:
+    def _issue_access_token(grant_id: str, user_id: str) -> str:
         grant = device_grant_store.authorize_access(grant_id)
         if grant is None or (
             auth_provider._source == "accounts"
             and not auth_provider.accepts_account_generation(user_id, grant.account_generation)
         ):
             raise OmnigentError("grant authority has been revoked", code=ErrorCode.UNAUTHORIZED)
+        client_id = grant.client_id
         # A first-party login grant renews with the SAME authority as the
         # session JWT it replaces (scope=None); a third-party device grant
         # stays restricted to the delegated allowlist.
-        login_grant = _is_login_grant(client_id)
-        jarvis = _is_jarvis_login_grant(client_id)
+        login_grant = _is_login_grant(grant)
+        jarvis = _is_jarvis_login_grant(grant)
         scope = None if login_grant else DELEGATED_SCOPE
         return mint_delegated_token(
             user_id,
@@ -560,7 +567,7 @@ def create_oauth_token_router(
             # third-party device grant's is Omnigent-only.
             kind=IDENTITY if login_grant else INTERNAL,
             azp=JARVIS_AZP if jarvis else None,
-            auth_time=grant.approved_at if jarvis else None,
+            auth_time=grant.jarvis_signed_in_at if jarvis else None,
         )
 
     @router.post("/oauth/token", dependencies=[])
@@ -639,7 +646,7 @@ def create_oauth_token_router(
         if grant.user_id is None:
             return _oauth_error("invalid_grant")
 
-        if _is_login_grant(grant.client_id):
+        if _is_login_grant(grant):
             # First-party login grants do NOT rotate. The bearer is an
             # unattended host/CLI, so a lost refresh response (network blip,
             # crash between the server committing and the client persisting)
@@ -647,7 +654,7 @@ def create_oauth_token_router(
             # token stays valid for the grant lifetime; only the short-lived
             # access token is renewed. Revocation + the absolute lifetime cap
             # bound the exposure.
-            access_token = _issue_access_token(grant.id, grant.user_id, grant.client_id or "")
+            access_token = _issue_access_token(grant.id, grant.user_id)
             return JSONResponse(
                 status_code=200,
                 content={
@@ -682,11 +689,7 @@ def create_oauth_token_router(
             return _oauth_error("invalid_grant")
         if rotated.user_id is None:
             return _oauth_error("invalid_grant")
-        access_token = _issue_access_token(
-            rotated.id,
-            rotated.user_id,
-            rotated.client_id or "",
-        )
+        access_token = _issue_access_token(rotated.id, rotated.user_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -857,7 +860,7 @@ def create_device_auth_router(
         # refreshed tokens carry full session authority. They are reserved:
         # a device client must never be able to self-declare into that
         # class by naming one here.
-        if _is_login_grant(client_id):
+        if _is_reserved_login_client_id(client_id):
             _logger.warning("device/authorize: refused reserved client_id %r", client_id)
             return _oauth_error("invalid_request")
 

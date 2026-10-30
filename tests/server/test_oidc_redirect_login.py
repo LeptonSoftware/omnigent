@@ -22,9 +22,11 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import jwt
 import pytest
+import sqlalchemy as sa
 from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse
 
+from omnigent.db.utils import get_or_create_engine
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import RESERVED_USER_LOCAL, UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore
@@ -690,6 +692,25 @@ async def test_auth_time_is_the_sign_in_and_survives_refresh(tmp_path: Path) -> 
     assert refreshed["iat"] >= int(later)
     assert refreshed["grant_id"] == redeemed["grant_id"]
     assert refreshed["act"] == {"client_id": "jarvis"}
+
+
+async def test_moving_the_grant_lifetime_anchor_never_changes_auth_time(tmp_path: Path) -> None:
+    """auth_time is the sign-in, not ``approved_at``, so renewing a grant cannot refresh it."""
+    uri = f"sqlite:///{tmp_path}/grants.db"
+    store = DeviceGrantStore(uri)
+    async with _client(store) as client:
+        body = await _redeemed(client)
+    signed_in_at = _claims(body["token"])["auth_time"]
+    first = await _refresh(store, body["refresh_token"])
+    # As a renew-on-use would: move the grant's lifetime anchor forward.
+    with get_or_create_engine(uri).begin() as connection:
+        moved = connection.execute(
+            sa.text("UPDATE device_grants SET approved_at = approved_at + 3000 WHERE id = :id"),
+            {"id": first["grant_id"]},
+        )
+        assert moved.rowcount == 1
+    second = await _refresh(store, body["refresh_token"])
+    assert first["auth_time"] == second["auth_time"] == signed_in_at
 
 
 @pytest.mark.parametrize(("setting", "ttl"), [("", 3600), ("60", 60), ("43200", 43200)])
