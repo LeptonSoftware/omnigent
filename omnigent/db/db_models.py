@@ -536,6 +536,10 @@ class SqlDeviceGrant(OmnigentBase):
         max lifetime, forcing periodic re-consent.
     :param last_polled_at: Unix epoch seconds of the last token-poll,
         used to enforce the RFC 8628 ``interval`` / ``slow_down``.
+    :param jarvis_signed_in_at: fork: when the person signed in, set only on
+        the Jarvis web sign-in's login grant and ``NULL`` on every other row
+        (including every row older than the column). It marks the grant as a
+        Jarvis login and is the ``auth_time`` its tokens carry.
     """
 
     __tablename__ = "device_grants"
@@ -567,6 +571,7 @@ class SqlDeviceGrant(OmnigentBase):
     expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
     approved_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_polled_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    jarvis_signed_in_at: Mapped[int | None] = mapped_column(Integer, nullable=True)  # fork
 
     __table_args__ = (
         CheckConstraint("status IN (1, 2, 3, 4, 5)", name="ck_device_grants_status"),
