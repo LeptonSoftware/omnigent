@@ -793,13 +793,14 @@ def test_login_grant_token_keeps_session_authority(
     assert disabled_app.get("/v1/hosts", headers=auth).status_code == 401
 
 
-def test_device_authorize_refuses_reserved_login_client_id(app: TestClient) -> None:
+@pytest.mark.parametrize("client_id", ["omnigent-cli", "jarvis", " jarvis "])
+def test_device_authorize_refuses_reserved_login_client_id(
+    app: TestClient, client_id: str
+) -> None:
     """A device client cannot self-declare into the first-party login-grant
     class by naming its reserved client_id — that would hand it a
-    full-authority (unscoped) token on refresh."""
-    from omnigent.server.routes.device_auth import LOGIN_GRANT_CLIENT_ID
-
-    r = app.post("/oauth/device/authorize", json={"client_id": LOGIN_GRANT_CLIENT_ID})
+    full-authority (unscoped) token on refresh, or the Jarvis ``azp``."""
+    r = app.post("/oauth/device/authorize", json={"client_id": client_id})
     assert r.status_code == 400 and r.json()["error"] == "invalid_request"
     assert "device_code" not in r.text
 

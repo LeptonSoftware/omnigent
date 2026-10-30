@@ -29,6 +29,7 @@ from omnigent.server.session_signing import (
     CLOCK_SKEW_LEEWAY_SECONDS,
     IDENTITY,
     INTERNAL,
+    JARVIS_AZP,
     JWKS_CACHE_CONTROL,
     MODE_EDDSA,
     PublicSigningKey,
@@ -678,6 +679,75 @@ def test_login_grant_refresh_is_identity_and_device_grant_refresh_is_internal(
     assert device.status_code == 200, device.text
     assert keys.decode(login.json()["access_token"])["aud"] == ["omnigent", "jarvis"]
     assert keys.decode(device.json()["access_token"])["aud"] == ["omnigent"]
+
+
+def test_azp_is_refused_on_internal_tokens() -> None:
+    for keys in (_eddsa_keys(), SessionSigningKeys.hs256(_SECRET)):
+        assert keys.decode(keys.encode(_claims(azp=JARVIS_AZP), kind=IDENTITY))["azp"] == "jarvis"
+        with pytest.raises(ValueError, match="azp"):
+            keys.encode(_claims(azp=JARVIS_AZP), kind=INTERNAL)
+
+
+def test_only_the_jarvis_login_grant_refresh_carries_azp(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+    from omnigent.server.routes.device_auth import (
+        JARVIS_LOGIN_GRANT_CLIENT_ID,
+        create_oauth_token_router,
+        issue_login_grant,
+        mint_delegated_token,
+    )
+
+    keys = _eddsa_keys()
+    provider = SimpleNamespace(
+        _source="oidc",
+        _oidc_config=SimpleNamespace(cookie_secret=_SECRET, signing_keys=keys),
+    )
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+    app = FastAPI()
+    app.include_router(create_oauth_token_router(provider, store))  # type: ignore[arg-type]
+    refreshes = {
+        "jarvis": issue_login_grant(
+            store,
+            user_id="alice@example.com",
+            cookie_secret=_SECRET,
+            client_id=JARVIS_LOGIN_GRANT_CLIENT_ID,
+        ),
+        "cli": issue_login_grant(store, user_id="alice@example.com", cookie_secret=_SECRET),
+        "device": "device-refresh-token",
+    }
+    store.create_redeemed_grant(
+        "slack-grant",
+        user_id="alice@example.com",
+        client_id="slack",
+        refresh_token_hash=hash_secret(refreshes["device"], _SECRET),
+        created_at=int(time.time()),
+    )
+    with TestClient(app) as client:
+        claims = {
+            name: keys.decode(
+                client.post(
+                    "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": token}
+                ).json()["access_token"]
+            )
+            for name, token in refreshes.items()
+        }
+    assert claims["jarvis"]["azp"] == "jarvis"
+    assert claims["jarvis"]["aud"] == ["omnigent", "jarvis"]
+    assert "azp" not in claims["cli"]
+    assert "azp" not in claims["device"]
+    machine = mint_delegated_token(
+        "svc@example.com", keys, 600, "oidc", grant_id=None, client_id="jarvis", jti="j"
+    )
+    assert "azp" not in keys.decode(machine)
+    with pytest.raises(ValueError, match="login-grant"):
+        issue_login_grant(
+            store, user_id="alice@example.com", cookie_secret=_SECRET, client_id="slack"
+        )
 
 
 def test_every_production_mint_site_names_its_token_kind() -> None:

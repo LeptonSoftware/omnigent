@@ -76,6 +76,7 @@ from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.session_signing import (  # fork
     IDENTITY,
     INTERNAL,
+    JARVIS_AZP,
     SessionSigningKeys,
     TokenKind,
     as_signing_keys,
@@ -108,16 +109,26 @@ DELEGATED_SCOPE = "sessions"
 # to treat as first-party. See :func:`issue_login_grant`,
 # ``_is_login_grant``, and the reservation guard in ``device_authorize``.
 LOGIN_GRANT_CLIENT_ID = "omnigent-cli"
+# Reserved ``client_id`` of the Jarvis web sign-in's login grant (the
+# ``redirect_uri`` form of ``/auth/cli-login``). Its refreshes carry
+# ``azp: "jarvis"``; no other grant's do.
+JARVIS_LOGIN_GRANT_CLIENT_ID = "jarvis"
+_LOGIN_GRANT_CLIENT_IDS = frozenset({LOGIN_GRANT_CLIENT_ID, JARVIS_LOGIN_GRANT_CLIENT_ID})
 
 
 def _is_login_grant(client_id: str | None) -> bool:
     """Return True for a first-party login grant (vs. a device grant).
 
-    Trustworthy because :data:`LOGIN_GRANT_CLIENT_ID` is reserved: the
-    device-authorize path rejects it, so only the server-side login flow
-    can create a grant carrying it.
+    Trustworthy because both login-grant client ids are reserved: the
+    device-authorize path rejects them, so only the server-side login
+    flows can create a grant carrying one.
     """
-    return client_id == LOGIN_GRANT_CLIENT_ID
+    return client_id in _LOGIN_GRANT_CLIENT_IDS
+
+
+def _login_grant_azp(client_id: str | None) -> str | None:
+    """The ``azp`` a login grant's refreshed token carries, if any."""
+    return JARVIS_AZP if client_id == JARVIS_LOGIN_GRANT_CLIENT_ID else None
 
 
 # RFC 8628 timings.
@@ -231,6 +242,7 @@ def mint_delegated_token(
     scope: str | None = DELEGATED_SCOPE,
     account_generation: str | None = None,
     kind: TokenKind = INTERNAL,  # fork: only the first-party login grant passes IDENTITY
+    azp: str | None = None,
 ) -> str:
     """Mint a grant-derived or client-credential access token.
 
@@ -274,6 +286,8 @@ def mint_delegated_token(
     :param kind: fork: who may accept the token
         (:data:`omnigent.server.session_signing.TokenKind`). Defaults to
         ``internal`` (Omnigent only).
+    :param azp: fork: the ``azp`` claim; only a Jarvis login grant's
+        refresh sets it (see :data:`JARVIS_LOGIN_GRANT_CLIENT_ID`).
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
@@ -291,6 +305,8 @@ def mint_delegated_token(
         payload["grant_id"] = grant_id
     if scope is not None:
         payload["scope"] = scope
+    if azp is not None:
+        payload["azp"] = azp
     return as_signing_keys(keys).encode(payload, kind=kind)  # fork: EdDSA when a key is configured
 
 
@@ -370,6 +386,7 @@ def issue_login_grant(
     *,
     user_id: str,
     cookie_secret: bytes,
+    client_id: str = LOGIN_GRANT_CLIENT_ID,
 ) -> str:
     """Create a redeemed refresh grant for an interactive login.
 
@@ -384,13 +401,18 @@ def issue_login_grant(
     :param device_grant_store: Grant persistence.
     :param user_id: The just-authenticated identity.
     :param cookie_secret: HMAC key for hashing the refresh token.
+    :param client_id: :data:`LOGIN_GRANT_CLIENT_ID` (CLI, host, native app)
+        or :data:`JARVIS_LOGIN_GRANT_CLIENT_ID` (the Jarvis web sign-in).
     :returns: The raw refresh token to hand to the client (stored hashed).
+    :raises ValueError: For any other ``client_id``.
     """
+    if not _is_login_grant(client_id):
+        raise ValueError(f"not a login-grant client id: {client_id!r}")
     refresh_token = _mint_refresh_token()
     device_grant_store.create_redeemed_grant(
         secrets.token_urlsafe(24),
         user_id=user_id,
-        client_id=LOGIN_GRANT_CLIENT_ID,
+        client_id=client_id,
         refresh_token_hash=hash_secret(refresh_token, cookie_secret),
         created_at=int(time.time()),
     )
@@ -497,6 +519,7 @@ def create_oauth_token_router(
             # fork: the CLI/host login's refresh is an identity token; a
             # third-party device grant's is Omnigent-only.
             kind=IDENTITY if login_grant else INTERNAL,
+            azp=_login_grant_azp(client_id),
         )
 
     @router.post("/oauth/token", dependencies=[])
@@ -800,14 +823,12 @@ def create_device_auth_router(
         if not isinstance(body, dict):
             body = {}
         client_id = _client_id(body)
-        # LOGIN_GRANT_CLIENT_ID marks a first-party login grant, whose
-        # refreshed tokens carry full session authority. It is reserved:
+        # The login-grant client ids mark first-party login grants, whose
+        # refreshed tokens carry full session authority. They are reserved:
         # a device client must never be able to self-declare into that
-        # class by naming it here.
+        # class by naming one here.
         if _is_login_grant(client_id):
-            _logger.warning(
-                "device/authorize: refused reserved client_id %r", LOGIN_GRANT_CLIENT_ID
-            )
+            _logger.warning("device/authorize: refused reserved client_id %r", client_id)
             return _oauth_error("invalid_request")
 
         device_code = secrets.token_urlsafe(32)
