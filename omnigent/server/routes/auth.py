@@ -2,10 +2,19 @@
 
 Provides ``/auth/login``, ``/auth/callback``, ``/auth/logout``,
 ``/auth/cli-login``, ``/auth/cli-consent``, ``/auth/cli-approve``,
-``/auth/cli-deny``, ``/auth/cli-upgrade``, ``/auth/cli-poll``, and
+``/auth/cli-deny``, ``/auth/cli-upgrade``, ``/auth/cli-poll``,
+``/auth/cli-redirect``, ``/auth/cli-redeem``, and
 ``/auth/native-token`` endpoints that implement the full OIDC
 authorization code flow with PKCE. The ``cli-login`` / ``cli-poll`` pair
 supports the ``omnigent login`` CLI command.
+
+A ``cli-login`` that names a registered ``redirect_uri`` (the Jarvis web
+sign-in, see :data:`LOGIN_REDIRECT_URIS_ENV`) is an authorization-code
+login instead: no consent page, the browser that signed in is sent to the
+``redirect_uri`` with a one-time ``code``, and the caller exchanges code +
+PKCE verifier at ``/auth/cli-redeem``. ``cli-poll`` never answers such a
+ticket, so a login link sent to someone else cannot be collected by
+whoever made it.
 
 Native apps sign in through the system browser with an RFC 8252
 redirect: a loopback (the desktop shell) or an allowlisted private-use
@@ -24,10 +33,12 @@ These routes are only mounted when ``OMNIGENT_AUTH_PROVIDER=oidc``.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import html
 import json
 import logging
+import os
 import re
 import secrets
 import time
@@ -59,10 +70,11 @@ from omnigent.server.oidc import (
 from omnigent.server.oidc_access import OidcAdmissionPolicy, resolve_allowed_domains_path
 from omnigent.server.routes._oauth import NO_STORE_HEADERS, oauth_error
 from omnigent.server.routes.device_auth import (
+    JARVIS_LOGIN_GRANT_CLIENT_ID,
     _generate_user_code,
     issue_login_grant,
 )
-from omnigent.server.session_signing import IDENTITY  # fork
+from omnigent.server.session_signing import IDENTITY, JARVIS_AZP  # fork
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -106,6 +118,15 @@ _NATIVE_PARAMS = ("native_redirect_uri", "native_state", "code_challenge", "code
 _S256_CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 _CODE_VERIFIER_RE = re.compile(r"[A-Za-z0-9._~-]{43,128}")
 _NATIVE_STATE_RE = re.compile(r"[A-Za-z0-9._~-]{1,256}")
+# fork: comma-separated redirect URIs a redirect ``cli-login`` may name,
+# matched exactly. Each must be an https URL without userinfo, query or
+# fragment; http loopback entries need LOGIN_REDIRECT_ALLOW_HTTP_LOOPBACK_ENV.
+LOGIN_REDIRECT_URIS_ENV = "OMNIGENT_LOGIN_REDIRECT_URIS"
+LOGIN_REDIRECT_ALLOW_HTTP_LOOPBACK_ENV = "OMNIGENT_LOGIN_REDIRECT_ALLOW_HTTP_LOOPBACK"
+_LOGIN_REDIRECT_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+# The caller's anti-CSRF state, echoed back with the code.
+_LOGIN_REDIRECT_STATE_RE = re.compile(r"[A-Za-z0-9._~-]{16,512}")
+_CLI_REDEEM_MAX_BODY_BYTES = 4096
 # How long an OIDC invite URL stays redeemable. Matches the accounts
 # provider's default invite window (72h) — long enough to share
 # out-of-band, short enough to bound exposure of an unused link.
@@ -152,6 +173,12 @@ class _CliTicket:
     :param code_challenge: PKCE S256 challenge supplied by the CLI.
     :param user_code: Human-readable code shown on the browser consent page.
     :param denied: Whether the browser denied this login request.
+    :param redirect_uri: fork: a registered redirect URI; set, the ticket is
+        a redirect login, fulfilled at ``/auth/cli-redirect`` and redeemed
+        only at ``/auth/cli-redeem``, never at ``cli-poll``.
+    :param redirect_state: fork: the caller's ``state``, echoed with the code.
+    :param code_hash: fork: hex SHA-256 of the one-time code sent to
+        ``redirect_uri``; the code itself is never stored.
     """
 
     created_at: float = field(default_factory=time.time)
@@ -161,6 +188,9 @@ class _CliTicket:
     code_challenge: str = ""
     user_code: str = ""
     denied: bool = False
+    redirect_uri: str | None = None
+    redirect_state: str = ""
+    code_hash: str | None = None
 
 
 @dataclass
@@ -248,6 +278,8 @@ def create_auth_router(
     _secure = config.secure_cookies
     _session_cookie = config.session_cookie_name
     _state_cookie = _AUTH_STATE_COOKIE_SECURE if _secure else _AUTH_STATE_COOKIE_PLAIN
+
+    login_redirect_uris = login_redirect_uris_from_env()
 
     # In-memory store for CLI login tickets. Tickets are short-lived
     # (5 min) and single-use. Keyed by ticket ID.
@@ -614,8 +646,9 @@ def create_auth_router(
                 resp = legacy_resp
             elif time.time() - ticket.created_at <= _CLI_TICKET_TTL_SECONDS:
                 base_path = getattr(request.app.state, "base_path", "")
+                step = "cli-redirect" if ticket.redirect_uri is not None else "cli-consent"
                 resp = RedirectResponse(
-                    url=f"{base_path}/auth/cli-consent?ticket={quote(str(ticket_id))}",
+                    url=f"{base_path}/auth/{step}?ticket={quote(str(ticket_id))}",
                     status_code=302,
                 )
             else:
@@ -788,10 +821,43 @@ def create_auth_router(
                 status_code=400,
                 content={"error": f"code_challenge (S256) is required. {_CLI_UPGRADE_MESSAGE}"},
             )
+        redirect_uri = body.get("redirect_uri")
+        redirect_state = body.get("state")
+        if redirect_uri is not None or redirect_state is not None:
+            if not isinstance(redirect_uri, str) or redirect_uri not in login_redirect_uris:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "redirect_uri is not registered on this server"},
+                )
+            if (
+                not isinstance(redirect_state, str)
+                or _LOGIN_REDIRECT_STATE_RE.fullmatch(redirect_state) is None
+            ):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "state (16-512 URL-safe characters) is required"},
+                )
 
         _evict_expired_tickets(_cli_tickets)
 
         ticket_id = secrets.token_urlsafe(32)
+        login_url = f"/auth/login?ticket={ticket_id}&reauth=1"
+        if redirect_uri is not None:
+            # No consent page, so no code for the person to compare.
+            _cli_tickets[ticket_id] = _CliTicket(
+                code_challenge=code_challenge,
+                redirect_uri=redirect_uri,
+                redirect_state=redirect_state,
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "ticket": ticket_id,
+                    "login_url": login_url,
+                    "expires_in": _CLI_TICKET_TTL_SECONDS,
+                },
+                headers=NO_STORE_HEADERS,
+            )
         user_code = _generate_user_code()
         _cli_tickets[ticket_id] = _CliTicket(
             code_challenge=code_challenge,
@@ -801,7 +867,7 @@ def create_auth_router(
             status_code=200,
             content={
                 "ticket": ticket_id,
-                "login_url": f"/auth/login?ticket={ticket_id}&reauth=1",
+                "login_url": login_url,
                 "user_code": user_code,
                 "expires_in": _CLI_TICKET_TTL_SECONDS,
             },
@@ -815,9 +881,11 @@ def create_auth_router(
             headers=_CLI_BROWSER_HEADERS,
         )
 
-    def _bounce_to_login(request: Request, ticket_id: str, *, reauth: bool) -> RedirectResponse:
+    def _bounce_to_login(
+        request: Request, ticket_id: str, *, reauth: bool, step: str = "cli-consent"
+    ) -> RedirectResponse:
         base_path = getattr(request.app.state, "base_path", "")
-        return_to = f"{base_path}/auth/cli-consent?ticket={quote(ticket_id)}"
+        return_to = f"{base_path}/auth/{step}?ticket={quote(ticket_id)}"
         url = f"{base_path}/auth/login?return_to={quote(return_to, safe='')}"
         url += f"&ticket={quote(ticket_id)}"
         if reauth:
@@ -837,12 +905,19 @@ def create_auth_router(
         iat = payload.get("iat")
         return iat if isinstance(iat, int) else None
 
-    def _cli_ticket(ticket_id: str) -> _CliTicket | None:
+    def _live_ticket(ticket_id: str) -> _CliTicket | None:
         ticket = _cli_tickets.get(ticket_id)
         if ticket is None:
             return None
         if time.time() - ticket.created_at > _CLI_TICKET_TTL_SECONDS:
             del _cli_tickets[ticket_id]
+            return None
+        return ticket
+
+    def _cli_ticket(ticket_id: str) -> _CliTicket | None:
+        """A live consent-page ticket; a redirect ticket never reaches the consent page."""
+        ticket = _live_ticket(ticket_id)
+        if ticket is None or ticket.redirect_uri is not None:
             return None
         return ticket
 
@@ -1011,6 +1086,13 @@ def create_auth_router(
                 headers=NO_STORE_HEADERS,
             )
 
+        if ticket.redirect_uri is not None:
+            # fork: its token goes only to whoever holds the redirect's code.
+            return JSONResponse(
+                status_code=400,
+                content={"error": "This login ticket is redeemed at /auth/cli-redeem"},
+                headers=NO_STORE_HEADERS,
+            )
         if not ticket.code_challenge:  # fork: pre-PKCE ticket has no verifier to check
             return legacy_ticket_login.poll_response(
                 _cli_tickets, ticket_id, ticket, expires_in=config.session_ttl_hours * 3600
@@ -1068,6 +1150,124 @@ def create_auth_router(
         # extra key, new CLIs against old servers see it absent.
         if refresh_token is not None:
             content["refresh_token"] = refresh_token
+        return JSONResponse(status_code=200, content=content, headers=NO_STORE_HEADERS)
+
+    # ── Redirect login (the Jarvis web sign-in) ────────────────────
+
+    @router.get("/cli-redirect")
+    async def cli_redirect(request: Request) -> Response:
+        """Fulfill a redirect ticket and send its one-time code to the redirect URI.
+
+        Reached from ``/auth/callback`` after a fresh sign-in, in place of
+        the consent page. The code goes only to this browser, at a
+        registered URI, and is redeemed with the caller's PKCE verifier.
+
+        :param request: The browser request, carrying ``ticket`` and the
+            session cookie the callback just set.
+        :returns: 302 to ``redirect_uri?code=…&state=…``; 302 back to the
+            login when the session is missing or predates the ticket; 400
+            for an unknown, expired, consent or already-used ticket.
+        """
+        ticket_id = (request.query_params.get("ticket") or "").strip()
+        user_id = auth_provider.get_user_id(request)
+        if user_id is None:
+            return _bounce_to_login(request, ticket_id, reauth=True, step="cli-redirect")
+        ticket = _live_ticket(ticket_id)
+        if ticket is None or ticket.redirect_uri is None or ticket.code_hash is not None:
+            return HTMLResponse(
+                _cli_consent_html(error="This login request is invalid or has expired."),
+                status_code=400,
+                headers=_CLI_BROWSER_HEADERS,
+            )
+        session_iat = _session_iat(request, ticket_id)
+        if session_iat is None or session_iat < int(ticket.created_at):
+            return _bounce_to_login(request, ticket_id, reauth=True, step="cli-redirect")
+
+        ticket.token = mint_session_cookie(
+            user_id=user_id,
+            keys=config.signing_keys,  # fork
+            kind=IDENTITY,
+            ttl_hours=config.session_ttl_hours,
+            provider=config.provider_type,
+            azp=JARVIS_AZP,
+        )
+        ticket.user_id = user_id
+        if device_grant_store is not None:
+            try:
+                ticket.refresh_token = issue_login_grant(
+                    device_grant_store,
+                    user_id=user_id,
+                    cookie_secret=config.cookie_secret,
+                    client_id=JARVIS_LOGIN_GRANT_CLIENT_ID,
+                )
+            except Exception:
+                _logger.exception("cli-redirect: refresh grant issuance failed")
+        code = secrets.token_urlsafe(32)
+        ticket.code_hash = _sha256_hex(code)
+        _logger.info("cli-redirect: %s signed in through a redirect login", user_id)
+        query = urlencode({"code": code, "state": ticket.redirect_state})
+        return RedirectResponse(
+            url=f"{ticket.redirect_uri}?{query}",
+            status_code=302,
+            headers={**_CLI_BROWSER_HEADERS, "Referrer-Policy": "no-referrer"},
+        )
+
+    @router.post("/cli-redeem")
+    async def cli_redeem(request: Request) -> Response:
+        """Exchange a redirect login's code and PKCE verifier for its tokens, once.
+
+        The JSON body carries ``ticket``, ``code`` and ``code_verifier``.
+        Any attempt with a wrong code or verifier burns the ticket.
+
+        :param request: A server-to-server JSON POST.
+        :returns: 200 ``{"token", "user_id", "expires_in"}`` plus
+            ``refresh_token`` when a grant store is wired; 400
+            ``invalid_request`` for a malformed body or a ticket that is not a
+            redirect login (left untouched); 400 ``invalid_grant`` for a
+            wrong code or verifier or a ticket not yet signed in; 410
+            ``expired_token`` for an unknown or expired ticket; 413 for an
+            oversized body.
+        """
+        raw_body = bytearray()
+        async for chunk in request.stream():
+            if len(raw_body) + len(chunk) > _CLI_REDEEM_MAX_BODY_BYTES:
+                return oauth_error("invalid_request", status_code=413)
+            raw_body.extend(chunk)
+        try:
+            body = json.loads(raw_body)
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+            return oauth_error("invalid_request")
+        if not isinstance(body, dict):
+            return oauth_error("invalid_request")
+        ticket_id = body.get("ticket")
+        code = body.get("code")
+        verifier = body.get("code_verifier")
+        if not isinstance(ticket_id, str) or not ticket_id:
+            return oauth_error("invalid_request")
+        ticket = _live_ticket(ticket_id)
+        if ticket is None:
+            return oauth_error("expired_token", status_code=410)
+        if ticket.redirect_uri is None:
+            return oauth_error("invalid_request")
+        # Consumed before the proof is checked: one guess per sign-in.
+        del _cli_tickets[ticket_id]
+        if (
+            not isinstance(code, str)
+            or not isinstance(verifier, str)
+            or ticket.code_hash is None
+            or not hmac.compare_digest(_sha256_hex(code), ticket.code_hash)
+            or _CODE_VERIFIER_RE.fullmatch(verifier) is None
+            or not hmac.compare_digest(derive_code_challenge(verifier), ticket.code_challenge)
+        ):
+            _logger.warning("cli-redeem: wrong code or verifier; login ticket burned")
+            return oauth_error("invalid_grant")
+        content: dict[str, object] = {
+            "token": ticket.token,
+            "user_id": ticket.user_id,
+            "expires_in": config.session_ttl_hours * 3600,
+        }
+        if ticket.refresh_token is not None:
+            content["refresh_token"] = ticket.refresh_token
         return JSONResponse(status_code=200, content=content, headers=NO_STORE_HEADERS)
 
     # ── Native sign-in ──────────────────────────────────────────────────────
@@ -1267,6 +1467,65 @@ def _cli_consent_html(
 
 
 # ── Private helpers ──────────────────────────────────────────────
+
+
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def login_redirect_uris_from_env() -> frozenset[str]:
+    """Read the redirect URIs a redirect ``cli-login`` may name.
+
+    From :data:`LOGIN_REDIRECT_URIS_ENV`, comma-separated, matched exactly
+    at ``cli-login``. Unset or empty registers none.
+
+    :returns: The registered URIs, e.g.
+        ``frozenset({"https://jarvis.example.com/auth/callback"})``.
+    :raises RuntimeError: When an entry is not an https URL with a host and
+        no userinfo, query or fragment. An http entry is accepted only for a
+        loopback host while :data:`LOGIN_REDIRECT_ALLOW_HTTP_LOOPBACK_ENV`
+        is ``1``.
+    """
+    raw = os.environ.get(LOGIN_REDIRECT_URIS_ENV, "")
+    allow_http_loopback = os.environ.get(LOGIN_REDIRECT_ALLOW_HTTP_LOOPBACK_ENV, "").strip() == "1"
+    uris: set[str] = set()
+    for entry in (part.strip() for part in raw.split(",")):
+        if not entry:
+            continue
+        if not _is_registrable_redirect_uri(entry, allow_http_loopback=allow_http_loopback):
+            raise RuntimeError(
+                f"{LOGIN_REDIRECT_URIS_ENV} entry {entry!r} must be an https URL with no "
+                "userinfo, query or fragment (http only for loopback, with "
+                f"{LOGIN_REDIRECT_ALLOW_HTTP_LOOPBACK_ENV}=1)"
+            )
+        uris.add(entry)
+    return frozenset(uris)
+
+
+def _is_registrable_redirect_uri(uri: str, *, allow_http_loopback: bool) -> bool:
+    if any(character.isspace() for character in uri) or "\\" in uri:
+        return False
+    try:
+        parts = urlsplit(uri)
+        port = parts.port
+    except ValueError:
+        return False
+    if (
+        not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or "?" in uri
+        or "#" in uri
+        or (port is not None and port <= 0)
+    ):
+        return False
+    if parts.scheme == "https":
+        return True
+    return (
+        parts.scheme == "http"
+        and allow_http_loopback
+        and parts.hostname in _LOGIN_REDIRECT_LOOPBACK_HOSTS
+    )
 
 
 def _evict_expired_tickets(tickets: dict[str, _CliTicket]) -> None:

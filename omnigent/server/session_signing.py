@@ -47,6 +47,11 @@ tokens (managed-runner tokens handed to sandboxes, machine client
 credentials, third-party device grants) carry ``aud: ["omnigent"]`` only,
 so no other service accepts them.
 
+Claim ``azp`` (:data:`JARVIS_AZP`) marks an identity token Omnigent issued to
+the Jarvis web sign-in (``/auth/cli-login`` with a ``redirect_uri``) and the
+refreshes of that sign-in's grant. No other mint site sets it, and
+:meth:`SessionSigningKeys.encode` refuses it on an ``internal`` token.
+
 ``hs256`` mode mints exactly what the server minted before this change and
 always accepts HS256, whatever ``OMNIGENT_LEGACY_HS256_UNTIL`` says: it is
 the rollback switch, and a rollback that also expired every HS256 token
@@ -123,6 +128,8 @@ login and its refresh); carries the configured audience, ``jarvis`` included.
 ``aud`` is ``["omnigent"]`` only."""
 IDENTITY: TokenKind = "identity"
 INTERNAL: TokenKind = "internal"
+JARVIS_AZP = "jarvis"
+"""``azp`` of a token issued to the Jarvis web sign-in; see the module docstring."""
 
 _REQUIRED_CLAIMS = ("exp", "iat", "sub")
 _NUMERIC_CLAIMS = ("exp", "iat", "nbf")
@@ -250,6 +257,8 @@ class SessionSigningKeys:
             every mint site states who may accept the token.
         """
         audience = self.audience_for(kind)
+        if "azp" in claims and kind != IDENTITY:
+            raise ValueError("azp is only minted on identity tokens")
         if self.mode == MODE_HS256:
             return jwt.encode(claims, self.legacy_secret, algorithm="HS256")
         assert self.signing_key is not None and self.issuer is not None
