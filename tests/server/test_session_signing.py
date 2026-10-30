@@ -29,6 +29,7 @@ from omnigent.server.session_signing import (
     CLOCK_SKEW_LEEWAY_SECONDS,
     IDENTITY,
     INTERNAL,
+    JARVIS_AZP,
     JWKS_CACHE_CONTROL,
     MODE_EDDSA,
     PublicSigningKey,
@@ -678,6 +679,90 @@ def test_login_grant_refresh_is_identity_and_device_grant_refresh_is_internal(
     assert device.status_code == 200, device.text
     assert keys.decode(login.json()["access_token"])["aud"] == ["omnigent", "jarvis"]
     assert keys.decode(device.json()["access_token"])["aud"] == ["omnigent"]
+
+
+@pytest.mark.parametrize("claim", [{"azp": JARVIS_AZP}, {"auth_time": 1700000000}])
+def test_jarvis_claims_are_refused_on_internal_tokens(claim: dict[str, object]) -> None:
+    (name,) = claim
+    for keys in (_eddsa_keys(), SessionSigningKeys.hs256(_SECRET)):
+        assert keys.decode(keys.encode(_claims(**claim), kind=IDENTITY))[name] == claim[name]
+        with pytest.raises(ValueError, match="only minted on identity tokens"):
+            keys.encode(_claims(**claim), kind=INTERNAL)
+
+
+def test_only_the_jarvis_login_grant_refresh_carries_azp(tmp_path: Path) -> None:
+    """A device grant named ``jarvis`` from before the name was reserved stays a device grant."""
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+    from omnigent.server.routes.device_auth import (
+        DELEGATED_SCOPE,
+        create_login_grant,
+        create_oauth_token_router,
+        issue_login_grant,
+        mint_delegated_token,
+    )
+
+    keys = _eddsa_keys()
+    provider = SimpleNamespace(
+        _source="oidc",
+        _oidc_config=SimpleNamespace(cookie_secret=_SECRET, signing_keys=keys),
+    )
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+    app = FastAPI()
+    app.include_router(create_oauth_token_router(provider, store))  # type: ignore[arg-type]
+    signed_in_at = int(time.time()) - 120
+    refreshes = {
+        "jarvis": create_login_grant(
+            store,
+            user_id="alice@example.com",
+            cookie_secret=_SECRET,
+            jarvis_signed_in_at=signed_in_at,
+        ).refresh_token,
+        "cli": issue_login_grant(store, user_id="alice@example.com", cookie_secret=_SECRET),
+        "device": "device-refresh-token",
+        "old_jarvis_device": "old-jarvis-device-refresh-token",
+    }
+    for grant_id, client_id, name in (
+        ("slack-grant", "slack", "device"),
+        ("old-jarvis-grant", "jarvis", "old_jarvis_device"),
+    ):
+        store.create_redeemed_grant(
+            grant_id,
+            user_id="alice@example.com",
+            client_id=client_id,
+            refresh_token_hash=hash_secret(refreshes[name], _SECRET),
+            created_at=int(time.time()),
+        )
+    with TestClient(app) as client:
+        responses = {
+            name: client.post(
+                "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": token}
+            ).json()
+            for name, token in refreshes.items()
+        }
+    claims = {name: keys.decode(body["access_token"]) for name, body in responses.items()}
+    assert claims["jarvis"]["azp"] == "jarvis"
+    assert claims["jarvis"]["auth_time"] == signed_in_at
+    assert claims["jarvis"]["aud"] == ["omnigent", "jarvis"]
+    assert "scope" not in claims["jarvis"]
+    machine = keys.decode(
+        mint_delegated_token(
+            "svc@example.com", keys, 600, "oidc", grant_id=None, client_id="jarvis", jti="j"
+        )
+    )
+    for other in (claims["cli"], claims["device"], claims["old_jarvis_device"], machine):
+        assert "azp" not in other
+        assert "auth_time" not in other
+    # The old ``jarvis`` device grant keeps a device grant's narrow authority
+    # and rotates its refresh token like one.
+    old = claims["old_jarvis_device"]
+    assert old["aud"] == ["omnigent"]
+    assert old["scope"] == DELEGATED_SCOPE
+    assert responses["old_jarvis_device"]["refresh_token"] != refreshes["old_jarvis_device"]
 
 
 def test_every_production_mint_site_names_its_token_kind() -> None:

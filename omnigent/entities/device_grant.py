@@ -38,6 +38,8 @@ class DeviceGrant:
         absolute lifetime clock), or ``None`` while pending.
     :param last_polled_at: Unix epoch seconds of the last token poll,
         or ``None`` if never polled.
+    :param jarvis_signed_in_at: fork: the sign-in instant of a Jarvis web
+        sign-in's login grant; ``None`` on every other grant.
     """
 
     id: str
@@ -50,3 +52,4 @@ class DeviceGrant:
     approved_at: int | None
     last_polled_at: int | None
     account_generation: str | None = None
+    jarvis_signed_in_at: int | None = None

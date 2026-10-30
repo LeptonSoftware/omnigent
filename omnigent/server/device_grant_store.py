@@ -76,6 +76,7 @@ def _to_device_grant(row: SqlDeviceGrant) -> DeviceGrant:
         approved_at=row.approved_at,
         last_polled_at=row.last_polled_at,
         account_generation=row.account_generation,
+        jarvis_signed_in_at=row.jarvis_signed_in_at,
     )
 
 
@@ -161,6 +162,7 @@ class DeviceGrantStore:
         client_id: str | None,
         refresh_token_hash: str,
         created_at: int,
+        jarvis_signed_in_at: int | None = None,
     ) -> DeviceGrant:
         """Persist a grant born ``redeemed`` — no device-code consent step.
 
@@ -182,6 +184,8 @@ class DeviceGrantStore:
             token. The store never sees the raw token.
         :param created_at: Unix epoch seconds; also ``approved_at``, the
             anchor for the grant's absolute lifetime.
+        :param jarvis_signed_in_at: fork: the sign-in instant, only for the
+            Jarvis web sign-in's login grant.
         :returns: The created :class:`DeviceGrant`.
         """
         device_code_hash = secrets.token_urlsafe(32)
@@ -203,6 +207,7 @@ class DeviceGrantStore:
                 expires_at=created_at,
                 approved_at=created_at,
                 last_polled_at=None,
+                jarvis_signed_in_at=jarvis_signed_in_at,
             )
             session.add(row)
             session.flush()
