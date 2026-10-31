@@ -3,7 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { useViewerAuthorId } from "@/hooks/useViewerAuthorId";
 import {
   type Bubble,
   type BubbleCache,
@@ -217,6 +217,7 @@ export function SideChatPane({
   );
 
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
+  const viewerAuthorId = useViewerAuthorId();
   const bubbles = useMemo<Bubble[]>(() => {
     const committed = stripGatedSubagentRoutingChips(
       reorderCommittedRequestElicitations(
@@ -231,15 +232,13 @@ export function SideChatPane({
       subagentRoutingOverride,
     );
     if (pendingUserMessages.length === 0) return committed;
-    return mergePendingBubbles(
-      committed,
-      buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
-    );
+    return mergePendingBubbles(committed, buildPendingBubbles(pendingUserMessages, viewerAuthorId));
   }, [
     visibleBlocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    viewerAuthorId,
     subagentRoutingOverride,
     sessionStatus,
   ]);

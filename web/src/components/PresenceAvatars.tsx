@@ -1,6 +1,6 @@
 import { Avatar, AvatarFallback, AvatarGroupCount } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { useViewerAuthorId } from "@/hooks/useViewerAuthorId";
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chatStore";
@@ -23,7 +23,7 @@ const MAX_VISIBLE_VIEWERS = 3;
  */
 export function PresenceAvatars() {
   const viewers = useChatStore((s) => s.viewers);
-  const self = getCurrentAuthorId();
+  const self = useViewerAuthorId();
   const others = viewers.filter((viewer) => viewer.userId !== self);
   if (others.length === 0) return null;
   const visible = others.slice(0, MAX_VISIBLE_VIEWERS);

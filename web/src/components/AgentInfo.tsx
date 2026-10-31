@@ -36,7 +36,7 @@ import {
 } from "@/hooks/usePolicies";
 import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
 import { isOwnerLevel, isSessionSharedWithOthers } from "@/lib/permissionsApi";
-import { getCurrentUserId } from "@/lib/identity";
+import { useViewerId } from "@/hooks/useViewerId";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -1370,7 +1370,7 @@ export function AgentInfoContent({
   // undefined when permissions are off (single-user) or still loading, in
   // which case the row is omitted rather than showing a placeholder.
   const { data: owner } = useSessionOwner(sessionId ?? null);
-  const viewerId = getCurrentUserId();
+  const viewerId = useViewerId();
   // Only surface the owner once the session is actually shared — a private
   // solo session has no "owner" worth showing. A non-owner viewer already
   // implies a share; the owner needs the grant list (manage-only, readable by
