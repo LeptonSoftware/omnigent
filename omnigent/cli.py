@@ -2221,6 +2221,21 @@ def _enforce_wrapper_guard() -> None:
 
 
 @capture_cli_entry
+def _is_auth_invocation(argv: list[str]) -> bool:
+    """fork: whether ``auth`` is in command position, past any global flags.
+
+    :param argv: Arguments after the program name, e.g.
+        ``["--profiling", "auth", "refresh"]``.
+    :returns: ``True`` for ``auth``, ``--profiling auth``, ``-- auth`` and so on.
+    """
+    global_flags = {opt for param in cli.params for opt in (*param.opts, *param.secondary_opts)}
+    for token in argv:
+        if token in global_flags or token == "--":
+            continue
+        return token == "auth"
+    return False
+
+
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -2257,10 +2272,6 @@ def main() -> None:
     # to pass through. Refuse naked calls before any work happens.
     _enforce_wrapper_guard()
 
-    cwd = os.getcwd()
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
-
     # Legacy-codepage stdio (Windows ANSI, C locale, PYTHONIOENCODING)
     # can't encode the CLI's glyphs; harden the streams before any command
     # renders so the write degrades instead of aborting.
@@ -2275,6 +2286,17 @@ def main() -> None:
         os.environ[LOG_LEVEL_ENV_VAR] = "DEBUG"
     if log_to_stderr:
         os.environ[LOG_TO_STDERR_ENV_VAR] = "1"
+
+    # fork: `omnigent auth` handles the stored refresh token for other
+    # clients. It runs before the cwd joins sys.path (a planted queue.py
+    # would run with the token) and writes no per-spawn CLI log file.
+    if _is_auth_invocation(argv):
+        cli(args=argv)
+        return
+
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
 
     # Bare ``omnigent`` with no args behaves like ``omnigent start`` on an
     # interactive terminal: bring up the local server / host in the background
@@ -2373,8 +2395,16 @@ def main() -> None:
     if not _should_skip_update_check(argv):
         _warn_deprecated_harness_path_env_vars()
 
+    from omnigent.cli_auth import TokenFileLockError
+
     try:
         cli(args=argv, standalone_mode=False)
+    except TokenFileLockError as exc:
+        # fork: an unreadable token lock (a root-owned one left by sudo) is
+        # an operator fix, not a crash.
+        log_cli_exception(exc, prefix="Token lock file unusable")
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1) from exc
     except click.ClickException as exc:
         log_cli_exception(exc, prefix="Click CLI error")
         exc.show()
@@ -11570,6 +11600,11 @@ def setup(internal_beta: bool) -> None:
 # distribution; hide the group when none are available.
 # `omnigent lakebox` is kept as an alias for `omnigent sandbox …
 # --provider lakebox`, registered only when the lakebox provider ships.
+# fork: `omnigent auth refresh`, the shared login refresh for non-Python clients.
+from omnigent.cli_auth_refresh import auth_group as _auth_group  # noqa: E402
+
+cli.add_command(_auth_group)
+
 if _sandbox_providers():
     cli.add_command(_sandbox_group)
     if "lakebox" in _sandbox_providers():

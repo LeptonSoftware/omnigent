@@ -46,6 +46,7 @@ from omnigent.server.passwords import (
     needs_rehash,
     verify_password,
 )
+from omnigent.server.session_signing import IDENTITY  # fork
 from omnigent.stores.permission_store import PermissionStore
 
 if TYPE_CHECKING:
@@ -271,7 +272,8 @@ def create_accounts_auth_router(
         bind_account_authority(user_id, generation)
         session_jwt = mint_session_cookie(
             user_id=user_id,
-            cookie_secret=config.cookie_secret,
+            keys=config.signing_keys,  # fork
+            kind=IDENTITY,  # fork: a sign-in; Jarvis accepts it
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=generation,
@@ -342,7 +344,8 @@ def create_accounts_auth_router(
 
         session_jwt = mint_session_cookie(
             user_id=username,
-            cookie_secret=config.cookie_secret,
+            keys=config.signing_keys,  # fork
+            kind=IDENTITY,  # fork: a sign-in; Jarvis accepts it
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=generation,
@@ -511,7 +514,8 @@ def create_accounts_auth_router(
             user = account_store.get_user(username) or user
         session_jwt = mint_session_cookie(
             user_id=username,
-            cookie_secret=config.cookie_secret,
+            keys=config.signing_keys,  # fork
+            kind=IDENTITY,  # fork: a sign-in; Jarvis accepts it
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=user.account_generation,
@@ -599,7 +603,7 @@ def create_accounts_auth_router(
             _mint_loopback_cli_token(
                 username,
                 base_url=config.base_url,
-                cookie_secret=config.cookie_secret,
+                cookie_secret=config.signing_keys,  # fork: EdDSA when a key is configured
                 session_ttl_hours=config.session_ttl_hours,
                 account_generation=user.account_generation,
             )
@@ -614,7 +618,8 @@ def create_accounts_auth_router(
                 permission_store.reassign_user_grants(RESERVED_USER_LOCAL, username)
         session_jwt = mint_session_cookie(
             user_id=username,
-            cookie_secret=config.cookie_secret,
+            keys=config.signing_keys,  # fork
+            kind=IDENTITY,  # fork: a sign-in; Jarvis accepts it
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=user.account_generation,
@@ -703,7 +708,8 @@ def create_accounts_auth_router(
         promote_if_listed(admin_list, account_store, token.user_id)
         session_jwt = mint_session_cookie(
             user_id=token.user_id,
-            cookie_secret=config.cookie_secret,
+            keys=config.signing_keys,  # fork
+            kind=IDENTITY,  # fork: a sign-in; Jarvis accepts it
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=user.account_generation,

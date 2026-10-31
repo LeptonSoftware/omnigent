@@ -78,7 +78,7 @@ def oidc_users_client(tmp_path: Path, db_uri: str) -> Iterator[tuple[TestClient,
     )
     admin_jwt = mint_session_cookie(
         user_id="admin@example.com",
-        cookie_secret=config.cookie_secret,
+        keys=config.cookie_secret,
         ttl_hours=8,
         provider="oidc",
     )
@@ -118,7 +118,7 @@ def test_users_route_rejects_non_admin(
     client, _admin_jwt = oidc_users_client
     member_jwt = mint_session_cookie(
         user_id="member@example.com",
-        cookie_secret=_TEST_SECRET,
+        keys=_TEST_SECRET,
         ttl_hours=8,
         provider="oidc",
     )

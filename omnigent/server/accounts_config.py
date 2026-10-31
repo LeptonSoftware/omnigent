@@ -49,6 +49,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from omnigent.server.session_signing import SessionSigningKeys
+
 
 @dataclass(frozen=True)
 class AccountsConfig:
@@ -76,6 +78,12 @@ class AccountsConfig:
     init_admin_password: str | None
     invite_ttl_seconds: int
     magic_ttl_seconds: int
+    session_keys: SessionSigningKeys | None = None  # fork: None = HS256 with cookie_secret
+
+    @property
+    def signing_keys(self) -> SessionSigningKeys:  # fork
+        """Keys that mint and verify session tokens."""
+        return self.session_keys or SessionSigningKeys.hs256(self.cookie_secret)
 
     @property
     def secure_cookies(self) -> bool:

@@ -1245,6 +1245,11 @@ class HostProcess:
         self._login_redirect_streak = 0
         # Reset by a successful upgrade or non-auth error; bounds fresh-host refresh retries.
         self._auth_retry_streak = 0
+        # fork: an auth rejection asked the token factory for one forced
+        # refresh; the next dial goes out promptly only if it renewed the
+        # bearer last sent on the tunnel.
+        self._auth_refresh_requested = False
+        self._last_tunnel_bearer: str | None = None
         # Consecutive connection-refused connect failures; reset by an accepted
         # upgrade or any non-refused error. Fatal past a bounded streak only
         # when the server URL is loopback (the local server is gone).
@@ -1608,6 +1613,36 @@ class HostProcess:
             body = body[:_UPGRADE_BODY_MAX_CHARS] + "…"
         return self._classify_http_status(exc.response.status_code, body)
 
+    def _request_auth_refresh(self, status: int) -> bool:
+        """fork: force one refresh of the stored login after the server refused it.
+
+        The token factory otherwise renews only within 90 s of the token's
+        local ``expires_at``, so a token the server stopped accepting early
+        (an HS256 login after the EdDSA switch, 30 days from expiry) would
+        be re-sent on every reconnect. :func:`omnigent.cli_auth.refresh_stored_token`
+        refreshes a refused token at most once per machine and backs off a
+        failed refresh, so neither a server refusing fresh tokens nor a
+        broken refresh endpoint is hit once per dial. The reconnect loop
+        redials at once only when the bearer actually changed.
+
+        :param status: The refusing HTTP status, e.g. ``401``.
+        :returns: ``True`` when the next dial carries a renewed token.
+        """
+        factory = self._auth_token_factory
+        if factory is None:
+            return False
+        from omnigent.runner._entry import _invalidate_auth_token_factory
+
+        if not _invalidate_auth_token_factory(factory):
+            return False
+        self._auth_refresh_requested = True
+        _logger.log(
+            logging.INFO if self._auth_retry_streak == 1 else logging.DEBUG,
+            "Host tunnel refused (HTTP %d); refreshing the stored login.",
+            status,
+        )
+        return True
+
     def _classify_http_status(self, status: int, body: str = "") -> HostConnectError | None:
         """Map a rejected-upgrade HTTP status to a fatal error, or ``None``.
 
@@ -1631,6 +1666,9 @@ class HostProcess:
         if status in (401, 403):
             # Fresh hosts can race OAuth refresh; connected hosts preserve active sessions.
             self._auth_retry_streak += 1
+            # fork: the tunnel refuses a bad bearer before accept(), which
+            # reaches us as 403, so both statuses count as a refused token.
+            self._request_auth_refresh(status)
             cause = f"Connection refused (HTTP {status}): the host tunnel was rejected."
             should_retry = self._ever_connected or (
                 self._auth_retry_streak < _MAX_CONSECUTIVE_AUTH_ERRORS
@@ -4257,6 +4295,13 @@ class HostProcess:
                     login_dead = self._auth_retry_streak >= _AUTH_REJECT_ESCALATE_ATTEMPTS
                     if login_dead:
                         wait_s = max(wait_s, _AUTH_REJECT_SLOW_RETRY_S)
+                    if self._auth_refresh_requested:
+                        self._auth_refresh_requested = False
+                        if await self._auth_bearer_renewed():
+                            # fork: redial at once with the renewed token. A
+                            # failed refresh keeps the backoff growing.
+                            login_dead = False
+                            wait_s = _RECONNECT_BASE_S
                     _logger.warning(
                         "Host tunnel disconnected: %s. Reconnecting in %.1fs%s",
                         exc,
@@ -4406,9 +4451,9 @@ class HostProcess:
         """Sleep *wait_s* before the next dial, waking early when it is moot.
 
         Wakes when the lifecycle monitor loses ownership. With
-        *watch_login*, also wakes as soon as the stored-token file changes,
-        so a long auth-rejection wait ends the moment the operator runs
-        ``omnigent login``.
+        *watch_login*, also wakes as soon as the stored login changes to one
+        not already refused, so a long auth-rejection wait ends the moment
+        the operator runs ``omnigent login``.
 
         :param wait_s: Maximum seconds to wait, e.g. ``60.0``.
         :param watch_login: Poll the token file for a fresh login.
@@ -4417,15 +4462,19 @@ class HostProcess:
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._lifecycle_lost.wait(), timeout=wait_s)
             return
-        from omnigent.cli_auth import _token_file_path
+        from omnigent.cli_auth import is_refused_login, stored_login_digest
 
-        def _token_file_stamp() -> float | None:
-            try:
-                return _token_file_path().stat().st_mtime
-            except OSError:
-                return None
+        def _new_usable_login() -> bool:
+            # fork: wake for a changed login only, never for a token this
+            # machine already saw refused, or for a rewrite of the same one.
+            digest = stored_login_digest(self._server_url)
+            return (
+                digest is not None
+                and digest != start_digest
+                and not is_refused_login(self._server_url, digest)
+            )
 
-        start_stamp = _token_file_stamp()
+        start_digest = stored_login_digest(self._server_url)
         deadline = time.monotonic() + wait_s
         while (remaining := deadline - time.monotonic()) > 0:
             with contextlib.suppress(asyncio.TimeoutError):
@@ -4434,7 +4483,7 @@ class HostProcess:
                 )
             if self._lifecycle_lost.is_set():
                 return
-            if _token_file_stamp() != start_stamp:
+            if _new_usable_login():
                 _logger.info("Stored login changed; reconnecting now.")
                 return
 
@@ -4678,9 +4727,19 @@ class HostProcess:
             headers[MANAGED_HOST_TOKEN_HEADER] = managed_token
             return headers
         token = self._current_auth_token()
+        self._last_tunnel_bearer = token  # fork: see _auth_bearer_renewed
         if token:
             headers["Authorization"] = f"Bearer {token}"
         return headers
+
+    async def _auth_bearer_renewed(self) -> bool:
+        """fork: run the requested forced refresh now; did it change the bearer?
+
+        :returns: ``True`` when the factory now returns a token other than the
+            one the tunnel just sent and had refused.
+        """
+        token = await self._run_host_subprocess_in_thread(self._current_auth_token)
+        return token is not None and token != self._last_tunnel_bearer
 
     def _current_auth_token(self, *, initialize: bool = True) -> str | None:
         """Return a bearer from the host's retained refreshable auth context.

@@ -20,7 +20,13 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import httpx
-import jwt
+
+from omnigent.server.session_signing import (  # fork
+    INTERNAL,
+    SessionSigningKeys,
+    TokenKind,
+    as_signing_keys,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -53,12 +59,13 @@ def derive_code_challenge(code_verifier: str) -> str:
 
 def mint_session_token(
     user_id: str,
-    cookie_secret: bytes,
+    keys: SessionSigningKeys | bytes,
     ttl_seconds: int,
     provider: str,
     *,
     account_generation: str | None = None,
     cli_login_ticket: str | None = None,
+    kind: TokenKind = INTERNAL,  # fork: identity mints pass IDENTITY
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -71,12 +78,15 @@ def mint_session_token(
 
     :param user_id: The authenticated user's email, e.g.
         ``"alice@example.com"``.
-    :param cookie_secret: HMAC key for HS256 signing.
+    :param keys: Session signing keys (a bare cookie secret signs HS256).
     :param ttl_seconds: Token lifetime in seconds.
     :param provider: Identity provider name, e.g. ``"google"`` or
         ``"accounts"``. Stored as an informational claim.
     :param cli_login_ticket: Ticket authenticated by the browser callback,
         never included in runner, refresh, or CLI-issued credentials.
+    :param kind: fork: who may accept the token
+        (:data:`omnigent.server.session_signing.TokenKind`). The default,
+        ``internal``, is Omnigent only; identity logins pass ``identity``.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
@@ -90,36 +100,39 @@ def mint_session_token(
         payload["account_generation"] = account_generation
     if cli_login_ticket is not None:
         payload["cli_login_ticket"] = cli_login_ticket
-    return jwt.encode(payload, cookie_secret, algorithm="HS256")
+    return as_signing_keys(keys).encode(payload, kind=kind)  # fork: EdDSA when a key is configured
 
 
 def mint_session_cookie(
     user_id: str,
-    cookie_secret: bytes,
+    keys: SessionSigningKeys | bytes,
     ttl_hours: int,
     provider: str,
     *,
     account_generation: str | None = None,
     cli_login_ticket: str | None = None,
+    kind: TokenKind = INTERNAL,  # fork: identity mints pass IDENTITY
 ) -> str:
     """Mint a signed session cookie JWT.
 
     :param user_id: The authenticated user's email, e.g.
         ``"alice@example.com"``.
-    :param cookie_secret: HMAC key for HS256 signing.
+    :param keys: Session signing keys (a bare cookie secret signs HS256).
     :param ttl_hours: Session lifetime in hours.
     :param provider: Identity provider name, e.g. ``"google"``
         or ``"github"``. Stored as an informational claim.
     :param cli_login_ticket: Ticket authenticated by the browser callback.
+    :param kind: fork: see :func:`mint_session_token`.
     :returns: An HS256-signed JWT string.
     """
     return mint_session_token(
         user_id,
-        cookie_secret,
+        keys,
         ttl_hours * 3600,
         provider,
         account_generation=account_generation,
         cli_login_ticket=cli_login_ticket,
+        kind=kind,
     )
 
 
@@ -207,6 +220,12 @@ class OIDCConfig:
     allow_invites: bool
     skip_email_verification: bool = False
     email_claim: str = "email"
+    session_keys: SessionSigningKeys | None = None  # fork: None = HS256 with cookie_secret
+
+    @property
+    def signing_keys(self) -> SessionSigningKeys:  # fork
+        """Keys that mint and verify session tokens."""
+        return self.session_keys or SessionSigningKeys.hs256(self.cookie_secret)
 
     @property
     def base_url(self) -> str:
