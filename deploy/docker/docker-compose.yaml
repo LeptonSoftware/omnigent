@@ -120,6 +120,12 @@ services:
       # IdPs (e.g. Microsoft Entra ID) that issue preferred_username
       # instead of email. Empty means the default (email); see .env.example.
       OMNIGENT_OIDC_EMAIL_CLAIM: "${OMNIGENT_OIDC_EMAIL_CLAIM:-}"
+      # Fork: IdP status check on refresh (see .env.example). Unset keeps
+      # the absolute grant lifetime.
+      OMNIGENT_IDP_STATUS_PROVIDER: "${OMNIGENT_IDP_STATUS_PROVIDER:-}"
+      OMNIGENT_AUTHENTIK_URL: "${OMNIGENT_AUTHENTIK_URL:-}"
+      OMNIGENT_AUTHENTIK_API_TOKEN: "${OMNIGENT_AUTHENTIK_API_TOKEN:-}"
+      OMNIGENT_AUTHENTIK_APP_SLUG: "${OMNIGENT_AUTHENTIK_APP_SLUG:-}"
       # Opt-in OIDC invites (admin pre-authorizes one off-domain email).
       # Off unless set. The admin list (/data/admins) and the optional
       # allowed-domains file (/data/allowed_domains) need no env var —
