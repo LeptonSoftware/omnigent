@@ -10545,13 +10545,13 @@ async def _routing_host_for_create(
     :raises HTTPException: 404 if ``host_id`` is unknown, 403 if it belongs
         to another user.
     """
-    from omnigent.server.routes._host_launch import resolve_host_owner
+    from omnigent.server.host_access import resolve_host_access  # fork: shared team hosts
 
     host_store = getattr(request.app.state, "host_store", None)
     if host_store is None or body.host_id is None:
         return None
     return await asyncio.to_thread(
-        resolve_host_owner,
+        resolve_host_access,
         user_id=user_id,
         host_id=body.host_id,
         host_store=host_store,

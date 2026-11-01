@@ -11,9 +11,10 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import CAP_HARNESS_STARTUP, HostHarnessStartupFrame, encode_host_frame
 from omnigent.host.harness_startup import SUPPORTED_HARNESSES, HarnessStartup
 from omnigent.server.auth import AuthProvider
+from omnigent.server.host_access import resolve_host_access  # fork: shared team hosts
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
+from omnigent.server.routes._host_launch import host_absent_error
 from omnigent.stores.host_store import HostStore
 
 _STARTUP_TIMEOUT_S = 15.0
@@ -33,7 +34,7 @@ def create_harness_startup_router(
         """Read host launch defaults, configured invocation, and env-wrapper settings."""
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(
-            resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
+            resolve_host_access, user_id=user_id, host_id=host_id, host_store=host_store
         )
         harness = canonicalize_harness(harness) or harness
         if harness not in SUPPORTED_HARNESSES:
