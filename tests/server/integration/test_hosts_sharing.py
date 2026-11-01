@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.errors import OmnigentError
@@ -339,11 +340,12 @@ async def test_create_on_a_shared_host_follows_the_grant(
     alices_host: HostStore, caller: str, level: str | None, expected: int
 ) -> None:
     """
-    Verify ``POST /v1/sessions`` with a ``host_id`` admits exactly a "use" grantee.
+    Verify the two host checks that ``POST /v1/sessions`` runs with a ``host_id``
+    admit exactly a "use" grantee.
 
-    The create path resolves the host twice before launching, for harness
-    readiness and for routing. Both must take the grant, or Bob can launch
-    on Alice's host only by creating first and launching second.
+    Harness readiness and routing each resolve the host before launch. Both must
+    take the grant, or Bob can launch on Alice's host only by creating first and
+    launching second.
     """
     from types import SimpleNamespace
 
@@ -352,6 +354,12 @@ async def test_create_on_a_shared_host_follows_the_grant(
     )
     from omnigent.server.routes._sessions.orchestration import _routing_host_for_create
 
+    alices_host.upsert_on_connect(
+        host_id=_HOST_ID,
+        name="alice-laptop",
+        user_id=ALICE,
+        configured_harnesses={"claude-native": True, "codex-native": False},
+    )
     if level is not None:
         alices_host.grant_host_access(_HOST_ID, BOB, level)
 
@@ -365,6 +373,17 @@ async def test_create_on_a_shared_host_follows_the_grant(
             conversation_store=None,  # type: ignore[arg-type]
             host_store=alices_host,
         )
+        # The readiness check runs for a grantee too: a harness the host lacks is refused.
+        with pytest.raises(OmnigentError):
+            await validate_create_harness_readiness(
+                harness="codex-native",
+                host_id=_HOST_ID,
+                parent_session_id=None,
+                inherited_runner_id=None,
+                user_id=caller,
+                conversation_store=None,  # type: ignore[arg-type]
+                host_store=alices_host,
+            )
 
     async def routing() -> None:
         request = SimpleNamespace(
@@ -384,3 +403,65 @@ async def test_create_on_a_shared_host_follows_the_grant(
             with pytest.raises(Exception) as exc:
                 await check()
             assert getattr(exc.value, "status_code", None) == expected, check.__name__
+
+
+@pytest.mark.parametrize(
+    ("caller", "level", "reaches"),
+    [(ALICE, None, True), (BOB, "use", True), (BOB, "read", False), (CAROL, None, False)],
+)
+async def test_new_session_picker_reads_follow_the_grant(
+    alices_host: HostStore, db_uri: str, caller: str, level: str | None, reaches: bool
+) -> None:
+    """
+    Verify the picker's host reads admit the owner and a "use" grantee only.
+
+    The host is offline here, so a caller who passes the grant check gets the
+    host-absent answer instead of 403.
+    """
+    from omnigent.server.routes.harness_startup import create_harness_startup_router
+    from omnigent.server.routes.mcp_servers import create_mcp_servers_router
+    from omnigent.server.routes.mcp_tools import create_mcp_tools_router
+    from omnigent.server.routes.plugins import create_plugins_router
+    from omnigent.server.routes.skill_content import create_skill_content_router
+    from omnigent.server.routes.skills import create_skills_router
+
+    if level is not None:
+        alices_host.grant_host_access(_HOST_ID, BOB, level)
+    auth = UnifiedAuthProvider(source="header")
+    registry = HostRegistry()
+    app = FastAPI()
+    for make in (
+        create_harness_startup_router,
+        create_mcp_servers_router,
+        create_mcp_tools_router,
+        create_plugins_router,
+        create_skill_content_router,
+    ):
+        app.include_router(make(registry, alices_host, auth_provider=auth), prefix="/v1")
+    app.include_router(
+        create_skills_router(
+            registry, alices_host, SqlAlchemyConversationStore(db_uri), auth_provider=auth
+        ),
+        prefix="/v1",
+    )
+
+    @app.exception_handler(OmnigentError)
+    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(status_code=exc.http_status, content={"detail": exc.message})
+
+    requests = [
+        ("GET", f"/v1/hosts/{_HOST_ID}/harnesses/claude-native/startup"),
+        ("GET", f"/v1/hosts/{_HOST_ID}/mcp-servers"),
+        ("POST", f"/v1/hosts/{_HOST_ID}/mcp-servers/tools"),
+        ("GET", f"/v1/hosts/{_HOST_ID}/plugins"),
+        ("GET", f"/v1/hosts/{_HOST_ID}/harnesses/claude-native/skills/review"),
+        ("GET", f"/v1/skills?host_id={_HOST_ID}&harness=claude&path=/home/alice"),
+    ]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        for method, url in requests:
+            body = {"harness": "claude", "server": "github"}
+            response = await c.request(method, url, headers=_as(caller), json=body)
+            if reaches:
+                assert response.status_code != 403, (url, response.text)
+            else:
+                assert response.status_code == 403, (url, response.text)
