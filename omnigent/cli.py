@@ -2086,6 +2086,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
     {
         "agent",
         "agy",
+        "auth",
         "antigravity",
         "attach",
         "claude",
@@ -2228,7 +2229,8 @@ def _is_auth_invocation(argv: list[str]) -> bool:
         ``["--profiling", "auth", "refresh"]``.
     :returns: ``True`` for ``auth``, ``--profiling auth``, ``-- auth`` and so on.
     """
-    global_flags = {opt for param in cli.params for opt in (*param.opts, *param.secondary_opts)}
+    params = getattr(cli, "params", ())  # a test may swap ``cli`` for a plain function
+    global_flags = {opt for param in params for opt in (*param.opts, *param.secondary_opts)}
     for token in argv:
         if token in global_flags or token == "--":
             continue

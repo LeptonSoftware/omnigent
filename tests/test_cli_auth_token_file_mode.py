@@ -125,5 +125,7 @@ def test_a_failed_write_does_not_destroy_existing_tokens(state, monkeypatch):
         cli_auth.store_token(SERVER, "eyJ-REPLACEMENT", "alice@example.com", 9e9)
 
     assert json.loads(state.read_text())[SERVER]["token"] == "eyJ-ORIGINAL"
-    leftovers = [p.name for p in state.parent.iterdir() if p.name != state.name]
+    # auth_tokens.lock is the machine-wide refresh lock: it stays by design.
+    keep = {state.name, state.with_suffix(".lock").name}
+    leftovers = [p.name for p in state.parent.iterdir() if p.name not in keep]
     assert leftovers == [], f"temp not cleaned up: {leftovers}"
