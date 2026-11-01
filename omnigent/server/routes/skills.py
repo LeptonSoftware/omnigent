@@ -12,9 +12,10 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import HostSkillsFrame, HostSkillsResultFrame, encode_host_frame
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
+from omnigent.server.host_access import resolve_host_access  # fork: shared team hosts
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
-from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
+from omnigent.server.routes._host_launch import host_absent_error
 from omnigent.server.routes._session_create_validation import validate_session_agent
 from omnigent.server.schemas import SkillSummary
 from omnigent.spec.types import AgentSpec
@@ -101,7 +102,7 @@ def create_skills_router(
                     status_code=422, detail="Provide session_id or host_id, harness, and path"
                 )
             host = await asyncio.to_thread(
-                resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
+                resolve_host_access, user_id=user_id, host_id=host_id, host_store=host_store
             )
             harness = canonicalize_harness(harness) or harness
             if agent_id is not None:
