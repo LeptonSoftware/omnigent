@@ -29,6 +29,12 @@ be able to write resources without a separate Omnigent account.
   re-authentication prompt. When a newly launched runner explicitly reports a
   pending host sign-in, its first message waits on that same runner until the
   sign-in finishes or its bounded wait expires.
+- `auth-refresh`: `omnigent auth refresh --server <url>` refreshes the stored
+  login for a client that is not Python (Jarvis, scripts), sharing the
+  machine's refresh lock and backoff. Exit 0 means the stored token is usable,
+  10 means the login is dead (run `omnigent login <url>`), 11 means backing off
+  (`retry_after=<seconds>` on stderr's last line); `--json` prints the status.
+  No token is ever printed.
 - `proxy-env`: login detects the right mode even with HTTP proxy variables set.
 - `host-lifecycle`: register in the foreground or background, run as a per-user
   system service, and check status, stop, stop a session, or reset the host ID.
@@ -67,7 +73,8 @@ be able to write resources without a separate Omnigent account.
 
 ## How to get to it (user POV)
 
-**CLI sign-in:** `omnigent login <server-url>`.
+**CLI sign-in:** `omnigent login <server-url>`. A client that holds the stored login
+refreshes it with `omnigent auth refresh --server <server-url>`.
 
 **Host:** `omnigent host <server-url>` (or `--server`), `omnigent host ""` for a
 local server, `--background`, `--no-open`, `--non-interactive`, and the

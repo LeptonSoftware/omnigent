@@ -28,15 +28,26 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+_COLUMN = "jarvis_signed_in_at"
+
+
+def _has_column() -> bool:
+    """Whether device_grants already has the column: a retried upgrade (a
+    database stamped back below this revision) must not add it twice."""
+    columns = sa.inspect(op.get_bind()).get_columns("device_grants")
+    return _COLUMN in {column["name"] for column in columns}
+
+
 def upgrade() -> None:
     """Add jarvis_signed_in_at to device_grants, NULL on every existing row."""
-    op.add_column(
-        "device_grants",
-        sa.Column("jarvis_signed_in_at", sa.Integer(), nullable=True),
-    )
+    if _has_column():
+        return
+    op.add_column("device_grants", sa.Column(_COLUMN, sa.Integer(), nullable=True))
 
 
 def downgrade() -> None:
     """Remove jarvis_signed_in_at from device_grants."""
+    if not _has_column():
+        return
     with op.batch_alter_table("device_grants") as batch_op:
-        batch_op.drop_column("jarvis_signed_in_at")
+        batch_op.drop_column(_COLUMN)
