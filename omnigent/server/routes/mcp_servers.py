@@ -16,9 +16,10 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.server.auth import AuthProvider
+from omnigent.server.host_access import resolve_host_access  # fork: shared team hosts
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
+from omnigent.server.routes._host_launch import host_absent_error
 from omnigent.stores.host_store import HostStore
 
 _MCP_SERVERS_TIMEOUT_S = 15.0
@@ -67,7 +68,7 @@ def create_mcp_servers_router(
         """
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(
-            resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
+            resolve_host_access, user_id=user_id, host_id=host_id, host_store=host_store
         )
         conn = host_registry.get(host_id)
         if conn is None:

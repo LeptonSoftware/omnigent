@@ -27,7 +27,7 @@ async def validate_create_harness_readiness(
     Children on an existing runner use their ancestor's host. Legacy hosts
     without readiness reports remain unknown; host launch checks still apply.
     """
-    from omnigent.server.routes._host_launch import resolve_host_owner
+    from omnigent.server.host_access import resolve_host_access  # fork: shared team hosts
 
     if host_store is None or not harness or harness == "auto":
         return
@@ -48,7 +48,7 @@ async def validate_create_harness_readiness(
         host = await asyncio.to_thread(host_store.get_host, host_id) if host_id else None
     elif host_id:
         host = await asyncio.to_thread(
-            resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
+            resolve_host_access, user_id=user_id, host_id=host_id, host_store=host_store
         )
     else:
         host = None

@@ -2167,7 +2167,10 @@ async def test_routing_authorizes_host_ownership_before_touching_the_host() -> N
     request = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
-                host_store=SimpleNamespace(get_host=lambda host_id: _host(None)),
+                host_store=SimpleNamespace(
+                    get_host=lambda host_id: _host(None),
+                    get_host_access_level=lambda host_id, user_id: None,
+                ),
                 host_registry=SimpleNamespace(
                     get=lambda host_id: conn,
                     send_text=lambda host_conn, frame: sent.append(frame),

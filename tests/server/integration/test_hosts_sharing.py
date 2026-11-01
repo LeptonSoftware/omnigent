@@ -329,3 +329,58 @@ async def test_local_fallback_user_cannot_share_another_users_host(
     resp = await client.post(f"/v1/hosts/{_HOST_ID}/share", json={"user_id": BOB})
     assert resp.status_code == 403
     assert alices_host.list_host_grants(_HOST_ID) == []
+
+
+@pytest.mark.parametrize(
+    ("caller", "level", "expected"),
+    [(BOB, "use", 200), (BOB, "read", 403), (CAROL, None, 403)],
+)
+async def test_create_on_a_shared_host_follows_the_grant(
+    alices_host: HostStore, caller: str, level: str | None, expected: int
+) -> None:
+    """
+    Verify ``POST /v1/sessions`` with a ``host_id`` admits exactly a "use" grantee.
+
+    The create path resolves the host twice before launching, for harness
+    readiness and for routing. Both must take the grant, or Bob can launch
+    on Alice's host only by creating first and launching second.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.server.routes._session_harness_readiness import (
+        validate_create_harness_readiness,
+    )
+    from omnigent.server.routes._sessions.orchestration import _routing_host_for_create
+
+    if level is not None:
+        alices_host.grant_host_access(_HOST_ID, BOB, level)
+
+    async def readiness() -> None:
+        await validate_create_harness_readiness(
+            harness="claude-native",
+            host_id=_HOST_ID,
+            parent_session_id=None,
+            inherited_runner_id=None,
+            user_id=caller,
+            conversation_store=None,  # type: ignore[arg-type]
+            host_store=alices_host,
+        )
+
+    async def routing() -> None:
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(host_store=alices_host))
+        )
+        host = await _routing_host_for_create(
+            SimpleNamespace(host_id=_HOST_ID),  # type: ignore[arg-type]
+            request,  # type: ignore[arg-type]
+            caller,
+        )
+        assert host is not None and host.host_id == _HOST_ID
+
+    for check in (readiness, routing):
+        if expected == 200:
+            await check()
+        else:
+            with pytest.raises(Exception) as exc:
+                await check()
+            assert getattr(exc.value, "status_code", None) == expected, check.__name__

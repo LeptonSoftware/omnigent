@@ -17,9 +17,10 @@ from omnigent.host.frames import (
 )
 from omnigent.host.skill_content import MAX_SKILL_CONTENT_BYTES
 from omnigent.server.auth import AuthProvider
+from omnigent.server.host_access import resolve_host_access  # fork: shared team hosts
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
+from omnigent.server.routes._host_launch import host_absent_error
 from omnigent.stores.host_store import HostStore
 
 _SKILL_CONTENT_TIMEOUT_S = 15.0
@@ -64,7 +65,7 @@ def create_skill_content_router(
     ) -> SkillContentResponse:
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(
-            resolve_host_owner,
+            resolve_host_access,
             user_id=user_id,
             host_id=host_id,
             host_store=host_store,
