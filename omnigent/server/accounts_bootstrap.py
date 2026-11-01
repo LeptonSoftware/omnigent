@@ -48,6 +48,11 @@ from urllib.parse import urlparse
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.auth import _RESERVED_USERS
 from omnigent.server.passwords import hash_password
+from omnigent.server.session_signing import (  # fork
+    IDENTITY,
+    SessionSigningKeys,
+    as_signing_keys,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +190,7 @@ def _mint_loopback_cli_token(
     admin_username: str,
     *,
     base_url: str,
-    cookie_secret: bytes,
+    cookie_secret: SessionSigningKeys,  # fork: the provider's signing keys, never a raw secret
     session_ttl_hours: int,
     account_generation: str | None = None,
 ) -> bool:
@@ -210,7 +215,8 @@ def _mint_loopback_cli_token(
         ``"dhruv.gupta"``.
     :param base_url: This spawn's server URL, e.g.
         ``"http://127.0.0.1:54312"``.
-    :param cookie_secret: HMAC key for the HS256 session JWT.
+    :param cookie_secret: fork: the provider's session signing keys, so the
+        token is EdDSA when the server signs EdDSA.
     :param session_ttl_hours: Token lifetime in hours, e.g. ``8``.
     :returns: ``True`` if the token was written, ``False`` otherwise.
     """
@@ -221,7 +227,8 @@ def _mint_loopback_cli_token(
         now = int(time.time())
         tui_jwt = mint_session_cookie(
             user_id=admin_username,
-            cookie_secret=cookie_secret,
+            keys=cookie_secret,  # fork
+            kind=IDENTITY,  # fork: the operator's CLI login
             ttl_hours=session_ttl_hours,
             provider="accounts",
             account_generation=account_generation,
@@ -248,7 +255,7 @@ def bootstrap_admin(
     init_admin_password: str | None = None,
     base_url: str | None = None,
     session_ttl_hours: int = 8,
-    cookie_secret: bytes | None = None,
+    cookie_secret: SessionSigningKeys | bytes | None = None,  # fork: signing keys
 ) -> BootstrapResult:
     """Ensure an ``admin`` user exists; create + announce on first boot.
 
@@ -326,7 +333,7 @@ def bootstrap_admin(
                 refreshed = _mint_loopback_cli_token(
                     account.id,
                     base_url=base_url,
-                    cookie_secret=cookie_secret,
+                    cookie_secret=as_signing_keys(cookie_secret),  # fork
                     session_ttl_hours=session_ttl_hours,
                     account_generation=account.account_generation,
                 )
@@ -384,7 +391,7 @@ def bootstrap_admin(
         tui_token_written = _mint_loopback_cli_token(
             admin_username,
             base_url=base_url,
-            cookie_secret=cookie_secret,
+            cookie_secret=as_signing_keys(cookie_secret),  # fork
             session_ttl_hours=session_ttl_hours,
             account_generation=account.account_generation,
         )

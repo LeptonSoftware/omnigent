@@ -284,7 +284,7 @@ def test_accounts_source_reads_valid_cookie() -> None:
     cfg = _make_accounts_config()
     provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
     token = mint_session_cookie(
-        user_id="admin", cookie_secret=_TEST_COOKIE_SECRET, ttl_hours=8, provider="accounts"
+        user_id="admin", keys=_TEST_COOKIE_SECRET, ttl_hours=8, provider="accounts"
     )
 
     request = _FakeReq(cookies={cfg.session_cookie_name: token})
@@ -304,7 +304,7 @@ def test_accounts_source_rejects_reserved_user_in_cookie() -> None:
     cfg = _make_accounts_config()
     provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
     token = mint_session_cookie(
-        user_id="local", cookie_secret=_TEST_COOKIE_SECRET, ttl_hours=8, provider="accounts"
+        user_id="local", keys=_TEST_COOKIE_SECRET, ttl_hours=8, provider="accounts"
     )
 
     request = _FakeReq(cookies={cfg.session_cookie_name: token})
@@ -325,7 +325,7 @@ def test_accounts_source_rejects_cookie_signed_with_wrong_secret() -> None:
     provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
     other_secret = secrets.token_bytes(32)
     token = mint_session_cookie(
-        user_id="admin", cookie_secret=other_secret, ttl_hours=8, provider="accounts"
+        user_id="admin", keys=other_secret, ttl_hours=8, provider="accounts"
     )
 
     request = _FakeReq(cookies={cfg.session_cookie_name: token})
@@ -345,7 +345,7 @@ def test_accounts_source_accepts_bearer_token_for_cli() -> None:
     cfg = _make_accounts_config()
     provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
     token = mint_session_cookie(
-        user_id="admin", cookie_secret=_TEST_COOKIE_SECRET, ttl_hours=8, provider="accounts"
+        user_id="admin", keys=_TEST_COOKIE_SECRET, ttl_hours=8, provider="accounts"
     )
 
     request = _FakeReq(headers={"Authorization": f"Bearer {token}"})

@@ -572,6 +572,32 @@ def test_device_flow_grant_follows_the_same_rules(checked_device: Harness) -> No
     assert harness.status_after(rotated) == "revoked"
 
 
+def test_jarvis_login_grant_is_checked_and_keeps_its_sign_in(checked: Harness) -> None:
+    from omnigent.server.routes.device_auth import create_login_grant
+
+    signed_in_at = int(checked.clock["start"]) - 60
+    token = create_login_grant(
+        checked.store,
+        user_id="admin",
+        cookie_secret=checked.secret,
+        jarvis_signed_in_at=signed_in_at,
+    ).refresh_token
+
+    # Past the old 30-day cap an active user's Jarvis sign-in still refreshes,
+    # and the access token still names Jarvis and the original sign-in.
+    renewed = checked.refresh(token, day=400)
+    assert renewed.status_code == 200, renewed.text
+    claims = jwt.decode(renewed.json()["access_token"], options={"verify_signature": False})
+    assert claims["azp"] == "jarvis"
+    assert claims["auth_time"] == signed_in_at
+
+    checked.idp.users["admin"]["is_active"] = False
+    refused = checked.refresh(token, day=401)
+    assert refused.status_code == 400
+    assert refused.json()["error"] == "invalid_grant"
+    assert checked.status_after(renewed) == "revoked"
+
+
 def test_accounts_mode_with_authentik_configured_keeps_the_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

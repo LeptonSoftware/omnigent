@@ -24,6 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+from omnigent.server.session_signing import SessionSigningKeys
 
 _KEY = b"k" * 32
 
@@ -60,6 +61,7 @@ def test_router_factory_builds_for_oidc_mode(tmp_path: Path) -> None:
 
     oidc_cfg = SimpleNamespace(
         cookie_secret=_KEY,
+        signing_keys=SessionSigningKeys.hs256(_KEY),
         base_url="https://omni.example.test",
         session_cookie_name="__Host-omni_session",
         provider_type="oidc",
@@ -85,6 +87,7 @@ def test_router_factory_rejects_github_oauth_oidc(tmp_path: Path) -> None:
 
     oidc_cfg = SimpleNamespace(
         cookie_secret=_KEY,
+        signing_keys=SessionSigningKeys.hs256(_KEY),
         base_url="https://omni.example.test",
         session_cookie_name="__Host-omni_session",
         provider_type="github",
@@ -790,13 +793,14 @@ def test_login_grant_token_keeps_session_authority(
     assert disabled_app.get("/v1/hosts", headers=auth).status_code == 401
 
 
-def test_device_authorize_refuses_reserved_login_client_id(app: TestClient) -> None:
+@pytest.mark.parametrize("client_id", ["omnigent-cli", "jarvis", " jarvis "])
+def test_device_authorize_refuses_reserved_login_client_id(
+    app: TestClient, client_id: str
+) -> None:
     """A device client cannot self-declare into the first-party login-grant
     class by naming its reserved client_id — that would hand it a
-    full-authority (unscoped) token on refresh."""
-    from omnigent.server.routes.device_auth import LOGIN_GRANT_CLIENT_ID
-
-    r = app.post("/oauth/device/authorize", json={"client_id": LOGIN_GRANT_CLIENT_ID})
+    full-authority (unscoped) token on refresh, or the Jarvis ``azp``."""
+    r = app.post("/oauth/device/authorize", json={"client_id": client_id})
     assert r.status_code == 400 and r.json()["error"] == "invalid_request"
     assert "device_code" not in r.text
 
@@ -905,7 +909,12 @@ def test_oauth_token_router_oidc_mode(tmp_path: Path) -> None:
         issue_login_grant,
     )
 
-    provider = SimpleNamespace(_source="oidc", _oidc_config=SimpleNamespace(cookie_secret=_KEY))
+    provider = SimpleNamespace(
+        _source="oidc",
+        _oidc_config=SimpleNamespace(
+            cookie_secret=_KEY, signing_keys=SessionSigningKeys.hs256(_KEY)
+        ),
+    )
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
     app = FastAPI()
     app.include_router(create_oauth_token_router(provider, store))  # type: ignore[arg-type]
@@ -986,6 +995,7 @@ def test_app_skips_device_grant_for_github_oidc_without_crashing(
     # a GitHub-typed OIDC provider even when the flag is on.
     oidc_cfg = SimpleNamespace(
         cookie_secret=_KEY,
+        signing_keys=SessionSigningKeys.hs256(_KEY),
         base_url="https://omni.example.test",
         session_cookie_name="__Host-omni_session",
         provider_type="github",

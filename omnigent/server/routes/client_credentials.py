@@ -110,6 +110,7 @@ from omnigent.server.routes._oauth import (
     oauth_error,
 )
 from omnigent.server.routes.device_auth import DELEGATED_SCOPE, mint_delegated_token
+from omnigent.server.session_signing import INTERNAL  # fork
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -533,7 +534,7 @@ def create_client_credentials_handler(
 
         access_token = mint_delegated_token(
             config.sub,
-            cookie_secret,
+            cookie_config.signing_keys,  # fork
             config.token_ttl_seconds,
             provider_name,
             # No stored grant to revoke, so no claim — this is what tells the
@@ -542,6 +543,7 @@ def create_client_credentials_handler(
             client_id=config.client_id,
             jti=secrets.token_urlsafe(16),
             scope=DELEGATED_SCOPE,
+            kind=INTERNAL,  # fork: a machine token is Omnigent-only
         )
         _logger.info(
             "oauth/token: issued client-credentials token for client_id=%s (sub=%s)",
