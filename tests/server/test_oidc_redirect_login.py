@@ -15,6 +15,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
@@ -30,7 +31,7 @@ from omnigent.db.utils import get_or_create_engine
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import RESERVED_USER_LOCAL, UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore
-from omnigent.server.oidc import mint_session_cookie
+from omnigent.server.oidc import OIDCConfig, mint_session_cookie
 from omnigent.server.routes.auth import (
     LOGIN_REDIRECT_ALLOW_HTTP_LOOPBACK_ENV,
     LOGIN_REDIRECT_TOKEN_TTL_ENV,
@@ -60,9 +61,9 @@ def _registered_redirect(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(LOGIN_REDIRECT_TOKEN_TTL_ENV, raising=False)
 
 
-def _build_app(store: DeviceGrantStore) -> httpx.ASGITransport:
+def _build_app(store: DeviceGrantStore, config: OIDCConfig | None = None) -> httpx.ASGITransport:
     """The OIDC auth routes, ``/oauth/token`` and a ``/v1/me`` probe on one grant store."""
-    provider = UnifiedAuthProvider(source="oidc", oidc_config=make_oidc_config())
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=config or make_oidc_config())
     provider.set_grant_revocation_check(store.is_revoked)  # as create_app wires it
     app = FastAPI()
     app.state.base_path = ""
@@ -119,7 +120,7 @@ async def _create_redirect_ticket(
     )
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["login_url"] == f"/auth/login?ticket={body['ticket']}&reauth=1"
+    assert body["login_url"] == f"/auth/login?ticket={body['ticket']}"
     assert "user_code" not in body
     return body["ticket"], verifier
 
@@ -466,7 +467,7 @@ async def test_consent_forms_refuse_a_redirect_ticket(decision: str) -> None:
         assert (await _redeem(client, ticket, code, verifier)).status_code == 200
 
 
-async def test_stale_session_bounces_to_reauth_without_a_code() -> None:
+async def test_stale_session_bounces_to_login_without_a_code() -> None:
     async with _client() as client:
         ticket, verifier = await _create_redirect_ticket(client)
         await _sign_in(client, ticket)
@@ -479,7 +480,7 @@ async def test_stale_session_bounces_to_reauth_without_a_code() -> None:
         assert bounced.status_code == 302
         location = bounced.headers["location"]
         assert location.startswith("/auth/login?")
-        assert "reauth=1" in location
+        assert "reauth=1" not in location
         assert f"ticket={ticket}" in location
         assert "cli-redirect" in parse_qs(urlsplit(location).query)["return_to"][0]
         assert (await _redeem(client, ticket, "guess", verifier)).status_code == 400
@@ -758,3 +759,115 @@ async def test_grant_failure_sends_no_code_and_burns_the_ticket() -> None:
         assert failed.status_code == 500
         assert "location" not in failed.headers
         assert (await _redeem(client, ticket, "guess", verifier)).status_code == 410
+
+
+# ── One sign-in: a redirect ticket reuses the IdP session ────────
+
+
+def _idp_config() -> OIDCConfig:
+    """An IdP that has ``prompt=login`` and ``auth_time``, unlike GitHub."""
+    return replace(
+        make_oidc_config(),
+        issuer="https://sso.example.test",
+        provider_type="oidc",
+        authorization_endpoint="https://sso.example.test/authorize",
+        token_endpoint="https://sso.example.test/token",
+        jwks_uri="https://sso.example.test/jwks",
+        userinfo_endpoint=None,
+    )
+
+
+@asynccontextmanager
+async def _idp_client() -> AsyncIterator[httpx.AsyncClient]:
+    async with httpx.AsyncClient(
+        transport=_build_app(_shared_store(), _idp_config()),
+        base_url="http://test",
+        follow_redirects=False,
+    ) as client:
+        yield client
+
+
+async def _idp_authorize_query(client: httpx.AsyncClient, login_url: str) -> dict[str, list[str]]:
+    login = await client.get(login_url)
+    assert login.status_code == 302, login.text
+    return parse_qs(urlsplit(login.headers["location"]).query)
+
+
+async def _idp_sign_in(client: httpx.AsyncClient, ticket: str, claims: dict[str, object]):
+    """The IdP round trip, with an id_token carrying ``claims``, through to the delivered code."""
+    mock_cm = _mock_httpx_client_for_github(token_json={"id_token": "signed-by-the-idp"})
+    with (
+        patch("omnigent.server.routes.auth.httpx.AsyncClient", return_value=mock_cm),
+        patch(
+            "omnigent.server.routes.auth._validate_id_token",
+            return_value={"email": "alice@example.com", "email_verified": True, **claims},
+        ),
+    ):
+        callback = await client.get(
+            "/auth/callback",
+            params={"code": "auth-code", "state": "state"},
+            cookies={"ap_auth_state": _mint_state_cookie("state", ticket=ticket)},
+        )
+    assert callback.status_code == 302, callback.text
+    assert callback.headers["location"] == f"/auth/cli-redirect?ticket={ticket}"
+    redirect = await client.get(callback.headers["location"])
+    assert redirect.status_code == 302, redirect.text
+    (code,) = parse_qs(urlsplit(redirect.headers["location"]).query)["code"]
+    return code
+
+
+async def test_redirect_ticket_does_not_force_a_password_at_the_idp() -> None:
+    async with _idp_client() as client:
+        ticket, _ = await _create_redirect_ticket(client)
+        query = await _idp_authorize_query(client, f"/auth/login?ticket={ticket}")
+    assert "prompt" not in query
+    assert "max_age" not in query
+
+
+async def test_redirect_ticket_forces_a_password_when_the_caller_asks() -> None:
+    """Jarvis's "sign in again for deploys" (``?fresh=1``) adds ``reauth=1``."""
+    async with _idp_client() as client:
+        ticket, _ = await _create_redirect_ticket(client)
+        query = await _idp_authorize_query(client, f"/auth/login?ticket={ticket}&reauth=1")
+    assert query["prompt"] == ["login"]
+    assert query["max_age"] == ["0"]
+
+
+async def test_consent_ticket_still_forces_a_password_without_reauth_in_the_url() -> None:
+    """The anti-phishing gate stands: dropping ``reauth=1`` from a CLI link changes nothing."""
+    async with _idp_client() as client:
+        _, challenge = _pkce_pair()
+        created = await client.post(
+            "/auth/cli-login", json={"code_challenge": challenge, "code_challenge_method": "S256"}
+        )
+        ticket = created.json()["ticket"]
+        assert created.json()["login_url"] == f"/auth/login?ticket={ticket}&reauth=1"
+        query = await _idp_authorize_query(client, f"/auth/login?ticket={ticket}")
+    assert query["prompt"] == ["login"]
+    assert query["max_age"] == ["0"]
+
+
+async def test_unknown_ticket_still_forces_a_password() -> None:
+    async with _idp_client() as client:
+        query = await _idp_authorize_query(client, "/auth/login?ticket=nobody-issued-this")
+    assert query["prompt"] == ["login"]
+
+
+async def test_auth_time_is_when_the_person_authenticated_not_this_sign_in() -> None:
+    """A reused IdP session must not read as a recent sign-in: Jarvis's deploy gate reads this."""
+    authenticated_at = int(time.time()) - 3 * 86400
+    async with _idp_client() as client:
+        ticket, verifier = await _create_redirect_ticket(client)
+        code = await _idp_sign_in(client, ticket, {"auth_time": authenticated_at})
+        redeemed = await _redeem(client, ticket, code, verifier)
+    assert redeemed.status_code == 200, redeemed.text
+    assert _claims(redeemed.json()["token"])["auth_time"] == authenticated_at
+
+
+async def test_no_auth_time_from_the_idp_reads_as_long_ago() -> None:
+    async with _idp_client() as client:
+        ticket, verifier = await _create_redirect_ticket(client)
+        code = await _idp_sign_in(client, ticket, {})
+        redeemed = await _redeem(client, ticket, code, verifier)
+    assert redeemed.status_code == 200, redeemed.text
+    assert _claims(redeemed.json()["token"])["auth_time"] == 0
