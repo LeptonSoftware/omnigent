@@ -185,6 +185,9 @@ class _CliTicket:
     :param redirect_state: fork: the caller's ``state``, echoed with the code.
     :param code_hash: fork: hex SHA-256 of the one-time code sent to
         ``redirect_uri``; the code itself is never stored.
+    :param signed_in_at: fork: a redirect ticket's IdP ``auth_time``, when the
+        person last authenticated, set at the callback. ``0`` when the IdP gave
+        none, which reads as long ago and never as recent.
     """
 
     created_at: float = field(default_factory=time.time)
@@ -197,6 +200,7 @@ class _CliTicket:
     redirect_uri: str | None = None
     redirect_state: str = ""
     code_hash: str | None = None
+    signed_in_at: int | None = None
 
 
 @dataclass
@@ -291,6 +295,12 @@ def create_auth_router(
     # In-memory store for CLI login tickets. Tickets are short-lived
     # (5 min) and single-use. Keyed by ticket ID.
     _cli_tickets: dict[str, _CliTicket] = {}
+
+    def _is_redirect_ticket(ticket_id: str) -> bool:
+        """fork: whether a pending ticket is a redirect login (see ``_CliTicket``)."""
+        pending = _cli_tickets.get(ticket_id)
+        return pending is not None and pending.redirect_uri is not None
+
     # One-time codes for native sign-ins. Single-use, 60 s.
     _native_codes: dict[str, _NativeCode] = {}
 
@@ -362,8 +372,13 @@ def create_auth_router(
         invite = request.query_params.get("invite") if _invites_enabled else None
         # CLI tickets require fresh IdP authentication; device consent can
         # also request it. GitHub OAuth has no reauthentication parameter.
+        # fork: a redirect ticket does not: its code goes only to a registered
+        # URI and is redeemed with the PKCE verifier of the browser that began
+        # the sign-in, so a forwarded link gets nobody anything. Such a sign-in
+        # reuses the IdP session, unless the caller adds reauth=1.
         reauth = config.provider_type != "github" and (
-            bool(ticket) or request.query_params.get("reauth") == "1"
+            (bool(ticket) and not _is_redirect_ticket(ticket))
+            or request.query_params.get("reauth") == "1"
         )
 
         # Store state + code_verifier in a short-lived signed cookie.
@@ -624,9 +639,20 @@ def create_auth_router(
         authenticated_ticket = (
             ticket_id
             if isinstance(ticket_id, str)
-            and (config.provider_type == "github" or isinstance(reauth_at, int))
+            and (
+                config.provider_type == "github"
+                or isinstance(reauth_at, int)
+                or _is_redirect_ticket(ticket_id)  # fork
+            )
             else None
         )
+        if isinstance(ticket_id, str) and _is_redirect_ticket(ticket_id):  # fork
+            # The sign-in may have reused the IdP session, so now is not when
+            # the person authenticated; what Jarvis's deploy gate reads must be.
+            signed_in_at = None
+            if config.provider_type != "github":
+                signed_in_at = _resolve_oidc_auth_time(token_json, config) or 0
+            _cli_tickets[ticket_id].signed_in_at = signed_in_at
         session_jwt = mint_session_cookie(
             user_id=email,
             keys=config.signing_keys,  # fork
@@ -854,9 +880,9 @@ def create_auth_router(
         _evict_expired_tickets(_cli_tickets)
 
         ticket_id = secrets.token_urlsafe(32)
-        login_url = f"/auth/login?ticket={ticket_id}&reauth=1"
         if redirect_uri is not None:
             # No consent page, so no code for the person to compare.
+            login_url = f"/auth/login?ticket={ticket_id}"
             _cli_tickets[ticket_id] = _CliTicket(
                 code_challenge=code_challenge,
                 redirect_uri=redirect_uri,
@@ -872,6 +898,7 @@ def create_auth_router(
                 headers=NO_STORE_HEADERS,
             )
         user_code = _generate_user_code()
+        login_url = f"/auth/login?ticket={ticket_id}&reauth=1"
         _cli_tickets[ticket_id] = _CliTicket(
             code_challenge=code_challenge,
             user_code=user_code,
@@ -1171,8 +1198,8 @@ def create_auth_router(
     async def cli_redirect(request: Request) -> Response:
         """Fulfill a redirect ticket and send its one-time code to the redirect URI.
 
-        Reached from ``/auth/callback`` after a fresh sign-in, in place of
-        the consent page. The code goes only to this browser, at a
+        Reached from ``/auth/callback`` after a sign-in, in place of the
+        consent page. The code goes only to this browser, at a
         registered URI, and is redeemed with the caller's PKCE verifier.
 
         :param request: The browser request, carrying ``ticket`` and the
@@ -1184,7 +1211,7 @@ def create_auth_router(
         ticket_id = (request.query_params.get("ticket") or "").strip()
         user_id = auth_provider.get_user_id(request)
         if user_id is None:
-            return _bounce_to_login(request, ticket_id, reauth=True, step="cli-redirect")
+            return _bounce_to_login(request, ticket_id, reauth=False, step="cli-redirect")
         ticket = _live_ticket(ticket_id)
         if ticket is None or ticket.redirect_uri is None or ticket.code_hash is not None:
             return HTMLResponse(
@@ -1194,7 +1221,9 @@ def create_auth_router(
             )
         session_iat = _session_iat(request, ticket_id)
         if session_iat is None or session_iat < int(ticket.created_at):
-            return _bounce_to_login(request, ticket_id, reauth=True, step="cli-redirect")
+            return _bounce_to_login(request, ticket_id, reauth=False, step="cli-redirect")
+
+        signed_in_at = session_iat if ticket.signed_in_at is None else ticket.signed_in_at
 
         # The grant comes first: the token names it, so revoking the grant
         # (logout, /oauth/revoke) kills the token as well as its refreshes.
@@ -1204,7 +1233,7 @@ def create_auth_router(
                 device_grant_store,
                 user_id=user_id,
                 cookie_secret=config.cookie_secret,
-                jarvis_signed_in_at=session_iat,
+                jarvis_signed_in_at=signed_in_at,
             )
         except Exception:
             _logger.exception("cli-redirect: login grant issuance failed")
@@ -1222,7 +1251,7 @@ def create_auth_router(
             kind=IDENTITY,
             azp=JARVIS_AZP,
             grant_id=grant.grant_id,
-            auth_time=session_iat,
+            auth_time=signed_in_at,
         )
         ticket.user_id = user_id
         ticket.refresh_token = grant.refresh_token
