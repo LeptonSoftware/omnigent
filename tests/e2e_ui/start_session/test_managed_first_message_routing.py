@@ -107,6 +107,9 @@ def managed_replicas(
                     "OMNIGENT_URL": urls["ingress"],
                     "OMNIGENT_AUTH_TOKEN": "",
                     "VITE_DATABRICKS_WORKSPACE": "true",
+                    # Babel's React Compiler pass on every cold dev-server
+                    # module can push first load past the 30 s goto timeout.
+                    "OMNI_REACT_COMPILER": "0",
                 }
             else:
                 argv = [
