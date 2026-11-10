@@ -1495,6 +1495,7 @@ def register_core_routes(
     )
     async def list_sessions(
         request: Request,
+        response: Response,
         limit: int = Query(default=20, ge=1, le=1000),
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
@@ -1649,6 +1650,10 @@ def register_core_routes(
             # Pins are per-user: filter to the caller's own pin key.
             pinned_owner=user_id,
         )
+        if page.search_partial:
+            # The content match ran past its budget; these rows matched on
+            # title only. Clients can fall back to their own content index.
+            response.headers["X-Omnigent-Search-Partial"] = "content"
         # Side chats surface only as Workspace-rail tabs, so drop any
         # side-chat-labeled fork from the sidebar list (it is still a normal
         # session, just not listed as a top-level one here).

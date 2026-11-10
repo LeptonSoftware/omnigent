@@ -30,6 +30,7 @@ from sqlalchemy import (
     update,
     values,
 )
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.sql.selectable import Subquery
 
@@ -162,6 +163,16 @@ def _encode_session_state(
 # to the connection's next pooled use. Longer than the client's own
 # ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
+
+# Budget (ms) for the title-OR-content search statement before it degrades to
+# title-only. Content has no index (the trigram index on ``search_text`` was
+# dropped in ``gf1b2c3d4e5f``), so a term that is rare in the workspace probes
+# every item of every visible session: on a deployment with ~80 GB of items
+# that outlives _SEARCH_STATEMENT_TIMEOUT_MS and the request 500'd. Within this
+# budget the full match runs; past it the statement is cancelled inside a
+# savepoint and the page is answered from the title trigram index alone, with
+# ``PagedList.search_partial`` set so the route can tell the client.
+_SEARCH_CONTENT_BUDGET_MS = 5_000
 
 # Upper bound on rows fetched per SQL statement when listing conversation
 # items. A deployed managed-Postgres backend failed one oversized read of a
@@ -659,6 +670,45 @@ def _fetch_labels_bulk(
     for conv_id, key, value in rows:
         out.setdefault(conv_id, {})[key] = value
     return out
+
+
+def _run_search_with_budget(
+    session: Session,
+    stmt: Select[Any],
+    title_match: ColumnElement[bool],
+    content_match: ColumnElement[bool],
+) -> tuple[list[Any], bool]:
+    """Run a title-OR-content search page, degrading to title-only past the budget.
+
+    The full match runs in a savepoint under ``_SEARCH_CONTENT_BUDGET_MS``.
+    When Postgres cancels it, the savepoint rolls back (reverting its ``SET
+    LOCAL``) and the same page is read from the title trigram index alone.
+
+    :param session: The open conversation-store session (Postgres family).
+    :param stmt: The list statement with every filter but the search applied.
+    :param title_match: The ``lower(title) LIKE`` predicate.
+    :param content_match: The correlated item-content ``EXISTS`` predicate.
+    :returns: ``(rows, partial)``; ``partial`` is ``True`` when content
+        matching was skipped.
+    """
+    try:
+        with session.begin_nested():
+            session.execute(
+                text(f"SET LOCAL statement_timeout = {int(_SEARCH_CONTENT_BUDGET_MS)}")
+            )
+            rows = list(
+                session.execute(stmt.where(or_(title_match, content_match))).scalars().all()
+            )
+        return rows, False
+    except OperationalError as exc:
+        if getattr(exc.orig, "sqlstate", None) != "57014":  # query_canceled
+            raise
+        _logger.warning(
+            "session search content probe exceeded %d ms; answering from titles only",
+            _SEARCH_CONTENT_BUDGET_MS,
+        )
+    rows = list(session.execute(stmt.where(title_match)).scalars().all())
+    return rows, True
 
 
 def _fetch_search_snippets(
@@ -3046,6 +3096,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         accessible_set if accessible_set is not None else owned_set or set()
                     )
 
+        search_partial = False
         with self._conv_session("list_conversations") as session:
             # Bound the content-search scan server-side (Postgres only). SET
             # LOCAL scopes to this transaction and reverts on commit, so it
@@ -3183,7 +3234,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                     .exists()
                 )
-                stmt = stmt.where(or_(title_match, content_match))
+                # Applied after the rest of the statement is built, so the
+                # title-only fallback can reuse it (see the execute below).
             if project is not None:
                 # Dual-read by project NAME: a session is "in <name>" if it has
                 # EITHER the first-class membership (metadata.project_id → the
@@ -3300,7 +3352,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                 sort_fn(sort_col),
                 sort_fn(self._tiebreaker_col),  # insertion-order tiebreaker for timestamp ties
             ).limit(limit + 1)
-            rows = list(session.execute(stmt).scalars().all())
+            if search_query and is_postgres:
+                rows, search_partial = _run_search_with_budget(
+                    session, stmt, title_match, content_match
+                )
+            elif search_query:
+                stmt = stmt.where(or_(title_match, content_match))
+                rows = list(session.execute(stmt).scalars().all())
+            else:
+                rows = list(session.execute(stmt).scalars().all())
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
@@ -3315,7 +3375,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # search_snippet=None — the title already shows the hit. Items
             # are AP-side, so this must run inside the conv session.
             snippets = (
-                _fetch_search_snippets(session, row_ids, search_query) if search_query else {}
+                _fetch_search_snippets(session, row_ids, search_query)
+                if search_query and not search_partial
+                else {}
             )
             # Build AP-only entities; metadata fetched separately below.
             ap_entities = [(r, labels_by_conv.get(r.id, {})) for r in rows]
@@ -3348,6 +3410,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             first_id=convs[0].id if convs else None,
             last_id=convs[-1].id if convs else None,
             has_more=has_more,
+            search_partial=search_partial,
         )
 
     @staticmethod
