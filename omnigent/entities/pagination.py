@@ -20,12 +20,15 @@ class PagedList(Generic[T]):
     :param last_id: ID of the last item in the page, or ``None``
         if empty.
     :param has_more: ``True`` if more pages exist after this one.
+    :param search_partial: ``True`` when a search page matched titles only
+        because the content match ran out of time.
     """
 
     data: list[T] = field(default_factory=list)
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
+    search_partial: bool = False
 
 
 def paginate_in_memory(

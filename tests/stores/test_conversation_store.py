@@ -2003,6 +2003,59 @@ def test_list_conversations_search_sets_statement_timeout(
     assert any("statement_timeout" in s.lower() for s in statements), statements
 
 
+def test_list_conversations_search_degrades_to_titles_past_the_budget(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A content probe that outlives ``_SEARCH_CONTENT_BUDGET_MS`` answers from
+    titles alone and flags the page partial, instead of failing the request.
+
+    VIN-5121: on an ~80 GB ``conversation_items`` a rare term probed every item
+    of every visible session, hit the 15 s statement timeout and 500'd. Here a
+    second connection holds an ACCESS EXCLUSIVE lock on ``conversation_items``,
+    so the content probe blocks until its budget cancels it; the title-only
+    fallback never touches that table.
+    """
+    if conversation_store._conv_engine.dialect.name != "postgresql":
+        pytest.skip("statement_timeout is a Postgres feature")
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "_SEARCH_CONTENT_BUDGET_MS", 300)
+
+    titled = conversation_store.create_conversation()
+    conversation_store.update_conversation(titled.id, title="deployment runbook")
+    content_only = conversation_store.create_conversation()
+    conversation_store.update_conversation(content_only.id, title="General chat")
+    conversation_store.append(
+        content_only.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_budget1",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "fix the deployment pipeline"}],
+                ),
+            ),
+        ],
+    )
+
+    full = conversation_store.list_conversations(search_query="deployment")
+    assert {c.id for c in full.data} == {titled.id, content_only.id}
+    assert full.search_partial is False
+
+    with conversation_store._conv_engine.connect() as locker:
+        locker.execute(text("BEGIN"))
+        locker.execute(text("LOCK TABLE conversation_items IN ACCESS EXCLUSIVE MODE"))
+        page = conversation_store.list_conversations(search_query="deployment")
+        locker.execute(text("ROLLBACK"))
+
+    assert page.search_partial is True
+    assert [c.id for c in page.data] == [titled.id]
+    assert page.data[0].search_snippet is None
+
+
 def test_list_conversations_no_search_skips_statement_timeout(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
