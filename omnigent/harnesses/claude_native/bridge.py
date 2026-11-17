@@ -411,6 +411,16 @@ _OVERLAY_SURFACE = "an overlay"
 # e.g. a launch wrapper's output before Claude Code has drawn its input box —
 # and an Escape cannot clear it.
 _ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)* to \w", re.IGNORECASE)
+# Headlines of startup dialogs whose "Esc to cancel" quits Claude Code rather
+# than closing the dialog (2.1.299: the settings error exits 1, the folder-trust
+# question exits 0; 2.1.326: the --add-dir trust question exits 1). Only the
+# person may answer them.
+_ESCAPE_QUITS_DIALOG_HEADLINES = (
+    "Settings Error",
+    "Accessing workspace",
+    "Do you trust the files in this folder",
+    "Adding a new directory",
+)
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -1876,22 +1886,29 @@ def _account_home_dir() -> Path:
         return Path.home()
 
 
-def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | None = None) -> None:
+def ensure_claude_workspace_trusted(
+    workspace: Path,
+    env: Mapping[str, str] | None = None,
+    *,
+    added_dirs: Sequence[Path] = (),
+) -> None:
     """
     Pre-accept Claude Code's first-run trust + onboarding prompts.
 
-    Claude Code blocks on two TUI prompts the first time it launches in
+    Claude Code blocks on TUI prompts the first time it launches in
     a new context: a global onboarding flow (theme / login) gated by the
     top-level ``hasCompletedOnboarding`` key in its global config
-    (:func:`claude_global_config_path`, usually ``~/.claude.json``), and a
+    (:func:`claude_global_config_path`, usually ``~/.claude.json``), a
     per-directory "Do you trust the files in this folder?" dialog gated
-    by ``projects["<abs cwd>"].hasTrustDialogAccepted``. Neither fires a
+    by ``projects["<abs cwd>"].hasTrustDialogAccepted``, and an "Adding a
+    new directory" question (2.1.326+) for each ``--add-dir`` gated by the
+    same key. None fires a
     ``PermissionRequest`` hook, so on a host-spawned (web-UI-driven)
     session there is nobody at the terminal to answer them: Claude hangs
     and the web UI shows nothing. This is acute with
     per-session git worktrees, which hand Claude a brand-new —
-    therefore untrusted — directory on every session, and for sessions
-    rooted at the home directory, whose interactively accepted trust
+    therefore untrusted — directory on every session, and for the home
+    directory and added directories, whose interactively accepted trust
     Claude keeps for that session only.
 
     Seed both gating keys idempotently so the launch never blocks. Only
@@ -1902,13 +1919,12 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
     prompts — those still route to the web UI via the ``PermissionRequest``
     hook; only the unhookable startup gates are pre-accepted.
 
-    Concurrency: this is a read-modify-write of a file Claude itself also
-    rewrites. It runs once, before the terminal is launched (so Claude is
-    not yet writing for this session), and uses an atomic replace. Two
-    runners starting on the same host within the same instant could still
-    race on last-writer-wins; the only consequence is that one session may
-    re-show the trust prompt, which a relaunch clears. Matching this to
-    Claude's own lock-free writes keeps the helper simple.
+    Concurrency: this is a read-modify-write of a file that Claude Code
+    and every other session's launch also rewrite. It holds Claude Code's
+    own lock on the file (:func:`_claude_config_lock`, which 2.1.329 takes
+    for every save) and replaces the file atomically. Unlocked, a save
+    landing between this read and its replace dropped the trust just
+    seeded, and the session then sat at a prompt nobody answers (VIN-9331).
 
     :param workspace: The runner workspace Claude will launch in, e.g.
         ``Path("/home/user/repo-worktrees/feature-x")``. Resolved to an
@@ -1916,6 +1932,10 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
     :param env: Environment the Claude terminal is launched with, used to
         find the config file Claude will load. ``None`` uses this process's
         environment.
+    :param added_dirs: Omnigent-owned directories to trust for its
+        ``--add-dir`` folders, e.g. the claude-native bridge root above every
+        session's portable-skill overlay (Claude trusts a folder under a
+        trusted one).
     :returns: None.
     :raises ValueError: If the existing global config is not a regular
         file or is a broken or looping symlink, or it (or its ``projects`` map /
@@ -1925,8 +1945,34 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
         unexpected user config is never clobbered (fail loud).
     :raises json.JSONDecodeError: If the existing global config is
         not valid JSON, for the same reason.
+    :raises TimeoutError: If Claude Code's lock on the config stays held
+        past its timeout; nothing is written.
     """
     config_path = claude_global_config_path(workspace, env)
+    # The lock sits beside the path Claude opens, unresolved, so take it before
+    # following a symlinked config.
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with _claude_config_lock(config_path):
+        _seed_claude_trust(config_path, workspace, added_dirs)
+
+
+def _seed_claude_trust(config_path: Path, workspace: Path, added_dirs: Sequence[Path]) -> None:
+    """
+    Seed the onboarding and trust keys in one Claude global config.
+
+    The body of :func:`ensure_claude_workspace_trusted`, run under Claude
+    Code's lock on *config_path*.
+
+    :param config_path: The config Claude will load, e.g.
+        ``Path("/home/user/.claude.json")``.
+    :param workspace: The directory Claude launches in, e.g.
+        ``Path("/home/user/repo")``.
+    :param added_dirs: Further directories to trust, e.g.
+        ``(Path("/tmp/omnigent-501/claude-native"),)``.
+    :returns: None.
+    :raises ValueError: As :func:`ensure_claude_workspace_trusted`.
+    :raises json.JSONDecodeError: As :func:`ensure_claude_workspace_trusted`.
+    """
     if config_path.is_symlink():
         # Keep a symlinked (e.g. dotfile-managed) config; update its target.
         try:
@@ -1953,23 +1999,132 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
 
     # Per-directory trust gate. Claude keys its ``projects`` map by the
     # resolved absolute path, so match that exactly.
-    project_key = str(workspace.resolve())
     projects = data.setdefault("projects", {})
     if not isinstance(projects, dict):
         raise ValueError(f"{config_path} 'projects' is not a JSON object; refusing to overwrite.")
-    project = projects.setdefault(project_key, {})
-    if not isinstance(project, dict):
-        raise ValueError(
-            f"{config_path} projects[{project_key!r}] is not a JSON object; refusing to overwrite."
-        )
-    if project.get("hasTrustDialogAccepted") is not True:
-        project["hasTrustDialogAccepted"] = True
-        changed = True
+    for directory in (workspace, *added_dirs):
+        project_key = str(directory.resolve())
+        project = projects.setdefault(project_key, {})
+        if not isinstance(project, dict):
+            raise ValueError(
+                f"{config_path} projects[{project_key!r}] is not a JSON object; "
+                "refusing to overwrite."
+            )
+        if project.get("hasTrustDialogAccepted") is not True:
+            project["hasTrustDialogAccepted"] = True
+            changed = True
 
     if not changed:
         return
     config_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_user_json(config_path, data)
+
+
+# Claude Code's lock on its global config, as 2.1.329's saveGlobalConfig takes
+# it: proper-lockfile's protocol, the directory ``<config>.lock`` beside the
+# path as given, made with mkdir, stale once its mtime is 10 s old, touched
+# every 5 s by a live holder. claude-swap (and so cswap's pretrust) takes the
+# same lock, and serializes the takeover of a dead holder's lock through
+# ``<lock>.takeover``; this does the same, so all three exclude one another.
+_CLAUDE_CONFIG_LOCK_STALE_S = 10.0
+_CLAUDE_CONFIG_LOCK_TOUCH_S = 3.0
+_CLAUDE_CONFIG_LOCK_TIMEOUT_S = 30.0
+_CLAUDE_CONFIG_TAKEOVER_STALE_S = 5.0
+
+
+@contextlib.contextmanager
+def _claude_config_lock(
+    config_path: Path, timeout: float = _CLAUDE_CONFIG_LOCK_TIMEOUT_S
+) -> Iterator[None]:
+    """
+    Hold Claude Code's lock on its global config while it is rewritten.
+
+    Waits for a live holder, takes over one whose lock has gone stale, and
+    keeps the lock fresh while held so no waiter takes it over.
+
+    :param config_path: The config, as Claude opens it, e.g.
+        ``Path("/home/user/.claude.json")``; the lock is
+        ``/home/user/.claude.json.lock``.
+    :param timeout: Seconds to wait for a live holder, e.g. ``30.0``.
+    :returns: A context manager holding the lock.
+    :raises TimeoutError: If a live holder keeps it past *timeout*.
+    """
+    lock_dir = Path(f"{config_path}.lock")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            break
+        except FileExistsError:
+            pass
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"{lock_dir} has been held for over {timeout:.0f} s")
+        try:
+            held_since = os.stat(lock_dir).st_mtime
+        except FileNotFoundError:
+            time.sleep(0.05)
+            continue
+        if time.time() - held_since > _CLAUDE_CONFIG_LOCK_STALE_S:
+            if not _take_over_stale_claude_lock(lock_dir):
+                time.sleep(0.05)
+            continue
+        time.sleep(0.05 + secrets.randbelow(100) / 1000)
+
+    stop = threading.Event()
+
+    def touch() -> None:
+        while not stop.wait(_CLAUDE_CONFIG_LOCK_TOUCH_S):
+            try:
+                os.utime(lock_dir)
+            except FileNotFoundError:
+                return
+            except OSError:
+                continue
+
+    toucher = threading.Thread(target=touch, name="claude-config-lock", daemon=True)
+    toucher.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        toucher.join(timeout=1.0)
+        with contextlib.suppress(FileNotFoundError):
+            os.rmdir(lock_dir)
+
+
+def _take_over_stale_claude_lock(lock_dir: Path) -> bool:
+    """
+    Remove a dead holder's lock, if it is still stale, one waiter at a time.
+
+    Two waiters that both saw the same stale lock could otherwise each remove
+    it, the second removing the first one's fresh lock. The removal runs
+    inside ``<lock>.takeover`` and re-checks staleness there, as claude-swap
+    does.
+
+    :param lock_dir: The lock directory, e.g.
+        ``Path("/home/user/.claude.json.lock")``.
+    :returns: Whether this call removed it.
+    """
+    takeover = lock_dir.with_name(lock_dir.name + ".takeover")
+    try:
+        os.mkdir(takeover)
+    except FileExistsError:
+        with contextlib.suppress(OSError):
+            if time.time() - os.lstat(takeover).st_mtime > _CLAUDE_CONFIG_TAKEOVER_STALE_S:
+                os.rmdir(takeover)
+        return False
+    except OSError:
+        return False
+    try:
+        if time.time() - os.stat(lock_dir).st_mtime <= _CLAUDE_CONFIG_LOCK_STALE_S:
+            return False
+        os.rmdir(lock_dir)
+        return True
+    except OSError:
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            os.rmdir(takeover)
 
 
 def _atomic_write_user_json(path: Path, payload: _JsonObject) -> None:
@@ -5825,8 +5980,10 @@ def _restore_occupied_input(
             )
             return surface
         # Nothing an Escape can clear: launcher output before the input box
-        # mounts, or a dialog that offers no dismissal.
-        unclearable = surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane)
+        # mounts, a dialog that offers no dismissal, or one Escape would quit.
+        unclearable = surface == _OVERLAY_SURFACE and (
+            not _ESCAPE_DISMISS_HINT.search(pane) or _escape_quits_claude(pane)
+        )
         if not confirmed:
             # One sighting is not enough to spend an Escape on: on a bare
             # composer Escape interrupts the running turn, and a single frame
@@ -5845,6 +6002,18 @@ def _restore_occupied_input(
             last_escape = now
         unclearable_seen = unclearable
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _escape_quits_claude(pane: str) -> bool:
+    """
+    Whether an Escape would quit Claude Code rather than close what is on screen.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` for a startup dialog named in
+        :data:`_ESCAPE_QUITS_DIALOG_HEADLINES`.
+    """
+    headline = _terminal_dialog_headline(pane)
+    return headline is not None and headline.startswith(_ESCAPE_QUITS_DIALOG_HEADLINES)
 
 
 def _occupying_surface(pane: str) -> str | None:
