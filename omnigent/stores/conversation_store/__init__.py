@@ -782,6 +782,12 @@ class ConversationStore(ABC):
         of inserting a duplicate. The existence check rides the append's
         own transaction, so idempotency costs no extra query.
 
+        A ``stable_id`` item of an assistant-output type (an assistant
+        message, reasoning, a function call or its output) is also returned
+        ``deduplicated`` when a recent item in the conversation has the same
+        response id, type and payload: that is one output delivered twice
+        under two source ids, never two outputs.
+
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
         :param items: List of :class:`NewConversationItem` objects

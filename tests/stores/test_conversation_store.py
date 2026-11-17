@@ -8262,6 +8262,210 @@ def test_repeated_persisted_twin_batch_leaves_conversation_metadata_alone(
     assert len(conversation_store.list_items(conv.id).data) == 1
 
 
+# ── Repeated mirrored output (content dedupe) ─────────
+
+
+def _mirrored(item: NewConversationItem, stable_id: str) -> NewConversationItem:
+    """Return ``item`` as a forwarder would post it, keyed by ``stable_id``."""
+    return item.model_copy(update={"stable_id": stable_id})
+
+
+_MIRRORED_OUTPUTS = {
+    "assistant_message": NewConversationItem(
+        type="message",
+        response_id="resp_turn",
+        data=MessageData(
+            role="assistant",
+            content=[{"type": "output_text", "text": "The push landed."}],
+            agent="claude-native-ui",
+        ),
+    ),
+    "function_call": NewConversationItem(
+        type="function_call",
+        response_id="resp_turn",
+        data=FunctionCallData(
+            agent="claude-native-ui",
+            name="Bash",
+            arguments='{"command":"git push"}',
+            call_id="toolu_push",
+        ),
+    ),
+    "function_call_output": NewConversationItem(
+        type="function_call_output",
+        response_id="resp_turn",
+        data=FunctionCallOutputData(call_id="toolu_push", output="pushed"),
+    ),
+    "reasoning": NewConversationItem(
+        type="reasoning",
+        response_id="resp_turn",
+        data=ReasoningData(
+            agent="claude-native-ui",
+            summary=[],
+            content=[{"type": "reasoning_text", "text": "check the remote"}],
+        ),
+    ),
+}
+
+
+def _unrelated_output(index: int) -> NewConversationItem:
+    """Return a distinct mirrored tool output to sit between two copies."""
+    return NewConversationItem(
+        type="function_call_output",
+        response_id="resp_turn",
+        data=FunctionCallOutputData(call_id=f"toolu_other_{index}", output=str(index)),
+        stable_id=f"{index:032x}",
+    )
+
+
+@pytest.mark.parametrize("kind", sorted(_MIRRORED_OUTPUTS))
+def test_append_collapses_output_repeated_under_another_source_id(
+    conversation_store: SqlAlchemyConversationStore,
+    kind: str,
+) -> None:
+    """One output posted under two source ids keeps a single row.
+
+    A transcript forwarder that parses one Claude record twice (the record
+    plus Claude's request copy of it) derives two stable ids for the same
+    output; the second append must return the stored item, not insert.
+    """
+    conv = conversation_store.create_conversation()
+    output = _MIRRORED_OUTPUTS[kind]
+    [first] = conversation_store.append(conv.id, [_mirrored(output, "a1" * 16)])
+    conversation_store.append(conv.id, [_unrelated_output(1), _unrelated_output(2)])
+
+    [second] = conversation_store.append(conv.id, [_mirrored(output, "b2" * 16)])
+
+    assert second.deduplicated is True
+    assert second.id == first.id
+    stored = conversation_store.list_items(conv.id).data
+    assert [item.id for item in stored] == [first.id, f"{1:032x}", f"{2:032x}"]
+
+
+def test_append_collapses_repeated_output_within_one_batch(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Two source ids for one output in a single batch insert one row."""
+    conv = conversation_store.create_conversation()
+    output = _MIRRORED_OUTPUTS["function_call_output"]
+
+    first, middle, second = conversation_store.append(
+        conv.id,
+        [_mirrored(output, "c3" * 16), _unrelated_output(1), _mirrored(output, "d4" * 16)],
+    )
+
+    assert (first.deduplicated, middle.deduplicated, second.deduplicated) == (
+        False,
+        False,
+        True,
+    )
+    assert second.id == first.id
+    assert len(conversation_store.list_items(conv.id).data) == 2
+
+
+def test_repeated_output_only_append_leaves_conversation_metadata_alone(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch that only repeats stored output writes nothing at all."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    output = _MIRRORED_OUTPUTS["assistant_message"]
+    conversation_store.append(conv.id, [_mirrored(output, "e5" * 16)])
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    [repeat] = conversation_store.append(conv.id, [_mirrored(output, "f6" * 16)])
+    [later] = conversation_store.append(conv.id, [_unrelated_output(7)])
+
+    assert repeat.deduplicated is True
+    after = conversation_store.get_conversation(conv.id)
+    assert after is not None
+    assert after.updated_at == 2000, "only the later, genuinely new item bumps activity"
+    positions = conversation_store.list_items(conv.id).data
+    assert [item.id for item in positions] == [repeat.id, later.id]
+
+
+def test_append_keeps_items_that_legitimately_repeat(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Identical payloads that are separate events each get their own row.
+
+    A user can send the same text twice, a terminal is created and deleted
+    on every restart, errors recur, the same assistant text can open another
+    turn, and runtime-produced items carry no stable id.
+    """
+    conv = conversation_store.create_conversation()
+    assistant = _MIRRORED_OUTPUTS["assistant_message"]
+    pairs = [
+        (
+            NewConversationItem(
+                type="message",
+                response_id="resp_turn",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "yes"}]),
+            ),
+            True,
+        ),
+        (_deleted_terminal_event(conv.id), True),
+        (
+            NewConversationItem(
+                type="error",
+                response_id="resp_turn",
+                data=ErrorData(source="execution", code="rate_limited", message="Slow down."),
+            ),
+            True,
+        ),
+        (assistant, False),
+    ]
+    stable_index = 0
+    for item, stable in pairs:
+        for _copy in range(2):
+            stable_index += 1
+            conversation_store.append(
+                conv.id,
+                [_mirrored(item, f"{stable_index:032x}") if stable else item],
+            )
+    conversation_store.append(
+        conv.id,
+        [
+            _mirrored(assistant.model_copy(update={"response_id": "resp_next"}), "a7" * 16),
+            _mirrored(assistant.model_copy(update={"response_id": "resp_after"}), "b8" * 16),
+        ],
+    )
+
+    stored = conversation_store.list_items(conv.id, limit=100).data
+    assert [item.type for item in stored] == [
+        "message",
+        "message",
+        "resource_event",
+        "resource_event",
+        "error",
+        "error",
+        "message",
+        "message",
+        "message",
+        "message",
+    ]
+    assert not any(item.deduplicated for item in stored)
+
+
+def test_append_only_looks_back_over_recent_items(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A copy older than the lookback window is not searched for."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    conv = conversation_store.create_conversation()
+    output = _MIRRORED_OUTPUTS["function_call_output"]
+    conversation_store.append(conv.id, [_mirrored(output, "c9" * 16)])
+    filler = [_unrelated_output(index) for index in range(1, store_mod._CONTENT_DEDUPE_WINDOW + 1)]
+    conversation_store.append(conv.id, filler)
+
+    [late] = conversation_store.append(conv.id, [_mirrored(output, "d0" * 16)])
+
+    assert late.deduplicated is False
+    assert late.id == "d0" * 16
+
 # ── Connection-checkout budget ─────────────────────────
 
 

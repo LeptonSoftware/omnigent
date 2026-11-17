@@ -85,6 +85,7 @@ from omnigent.db.utils import (
 from omnigent.entities import (
     Conversation,
     ConversationItem,
+    MessageData,
     NewConversationItem,
     PagedList,
     parse_item_data,
@@ -177,6 +178,22 @@ _LIST_ITEMS_MAX_ROWS_PER_STATEMENT = 200
 # bound keeps the archived-filter query's ``IN`` list small and caps the work a
 # pathological directory can impose on a delete. Hitting it answers "in use".
 _WORKSPACE_SHARER_SCAN_LIMIT = 32
+
+# How far back, in positions, an append looks for a mirrored item it would
+# repeat. A producer that parses one transcript record twice under two source
+# ids lands both copies within a few positions; 128 covers every such copy
+# observed in production while keeping the probe a short index range scan.
+_CONTENT_DEDUPE_WINDOW = 128
+
+# Mirrored item types whose identical payload under one response can only be
+# the same output delivered twice: calls and outputs carry a provider-unique
+# call id. User messages, errors and resource lifecycle events legitimately
+# repeat byte-for-byte, so they are never collapsed by content.
+_CONTENT_DEDUPE_ITEM_TYPES = frozenset({"function_call", "function_call_output", "reasoning"})
+
+# ``(response_id, item type, serialized data)`` of an item eligible for
+# content dedupe.
+_ContentKey = tuple[str, str, str]
 
 # One statement versioning a session-list row: every source row is cast to text
 # and hashed in Postgres, so the caller materializes one short string per id.
@@ -766,6 +783,48 @@ def _to_item(row: SqlConversationItem, data_json: str) -> ConversationItem:
         created_at=row.created_at,
         data=parse_item_data(item_type, json.loads(data_json)),
         created_by=row.created_by,
+    )
+
+
+def _content_dedupe_eligible(item: NewConversationItem) -> bool:
+    """
+    Tell whether an append may collapse ``item`` onto an identical recent item.
+
+    Only mirrored items (those carrying a ``stable_id``) of assistant-output
+    types qualify; see :data:`_CONTENT_DEDUPE_ITEM_TYPES`.
+
+    :param item: The item about to be appended.
+    :returns: ``True`` when a recent item with the same response id, type and
+        payload is this item's result instead of a new row.
+    """
+    if item.stable_id is None:
+        return False
+    if item.type in _CONTENT_DEDUPE_ITEM_TYPES:
+        return True
+    return isinstance(item.data, MessageData) and item.data.role == "assistant"
+
+
+def _log_content_duplicate(
+    conversation_id: str, item: NewConversationItem, stored: ConversationItem
+) -> None:
+    """
+    Record that an append collapsed a mirrored item onto its stored twin.
+
+    A hit means a producer delivered one output twice under different source
+    ids, which is a producer bug worth seeing even though no row is written.
+
+    :param conversation_id: Conversation the append targeted.
+    :param item: The incoming item that was not inserted.
+    :param stored: The already-persisted item returned in its place.
+    """
+    _logger.warning(
+        "Dropped a repeated %s for session %s: identical to stored item %s "
+        "(incoming stable id %s)",
+        item.type,
+        conversation_id,
+        stored.id,
+        item.stable_id,
+        extra={"session_id": conversation_id},
     )
 
 
@@ -2529,6 +2588,67 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         return strip_nul_bytes(extract_search_text(item))
 
+    def _recent_items_by_content(
+        self,
+        session: Session,
+        conversation_id: str,
+        *,
+        next_position: int,
+        candidates: list[tuple[_ContentKey, str]],
+    ) -> dict[_ContentKey, ConversationItem]:
+        """
+        Find stored items repeating a candidate's response id, type and payload.
+
+        Scans only the last :data:`_CONTENT_DEDUPE_WINDOW` positions through the
+        ``(conversation_id, position)`` index. The SQL equality on the encoded
+        payload narrows the rows read; the exact comparison happens on decoded
+        payloads, so a case-insensitive collation can never merge two items.
+
+        :param session: The append transaction, already holding the
+            conversation lock.
+        :param conversation_id: Conversation being appended to.
+        :param next_position: The position the append would allocate next.
+        :param candidates: ``(content key, encoded data)`` per eligible item.
+        :returns: The earliest stored match per content key, flagged
+            ``deduplicated``.
+        """
+        if not candidates:
+            return {}
+        workspace_id = current_workspace_id()
+        matches_candidate = or_(
+            *(
+                and_(
+                    SqlConversationItem.response_id == response_id,
+                    SqlConversationItem.type == encode_item_type(item_type),
+                    SqlConversationItem.data == encoded,
+                )
+                for (response_id, item_type, _raw_json), encoded in candidates
+            )
+        )
+        with query_name_scope("omnigent.conversation_store.find_repeated_mirrored_items"):
+            rows = (
+                session.execute(
+                    select(SqlConversationItem)
+                    .where(
+                        SqlConversationItem.workspace_id == workspace_id,
+                        SqlConversationItem.conversation_id == conversation_id,
+                        SqlConversationItem.position >= next_position - _CONTENT_DEDUPE_WINDOW,
+                        matches_candidate,
+                    )
+                    .order_by(SqlConversationItem.position)
+                )
+                .scalars()
+                .all()
+            )
+        wanted = {key for key, _encoded in candidates}
+        found: dict[_ContentKey, ConversationItem] = {}
+        decoded = self._decode_item_data_batch([row.data for row in rows])
+        for row, data_json in zip(rows, decoded, strict=True):
+            key = (row.response_id, decode_item_type(row.type), data_json)
+            if key in wanted and key not in found:
+                found[key] = _to_item(row, data_json).model_copy(update={"deduplicated": True})
+        return found
+
     def append(
         self,
         conversation_id: str,
@@ -2590,6 +2710,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             if search is not None:
                 values["search_text"] = search
             prepared_rows.append((item, values, search))
+        # Payload identity of each mirrored assistant-output item, used to
+        # collapse a second delivery of the same output under another source id.
+        content_keys: list[_ContentKey | None] = [
+            (item.response_id, item.type, raw_json) if _content_dedupe_eligible(item) else None
+            for item, raw_json in zip(items, raw_jsons, strict=True)
+        ]
 
         def write(session: Session) -> list[ConversationItem]:
             # Built fresh on every attempt: a CockroachDB 40001 replay must
@@ -2642,13 +2768,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                     ]
 
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-            has_new_conversation_activity = any(
-                item.type != "resource_event"
-                and (item.stable_id is None or item.stable_id not in existing_by_id)
-                for item in items
-            )
-            if conv_row is not None and has_new_conversation_activity:
-                conv_row.updated_at = now
 
             # Allocate item positions from the conversation's maintained
             # next_position counter instead of running a MAX(position) aggregate
@@ -2676,10 +2795,44 @@ class SqlAlchemyConversationStore(ConversationStore):
                     + 1
                 )
 
+            existing_by_content = self._recent_items_by_content(
+                session,
+                conversation_id,
+                next_position=next_pos,
+                candidates=[
+                    (key, encoded)
+                    for item, key, encoded in zip(items, content_keys, encoded_data, strict=True)
+                    if key is not None and item.stable_id not in existing_by_id
+                ],
+            )
+            persisted_elsewhere = [
+                item.stable_id in existing_by_id
+                or (key is not None and key in existing_by_content)
+                for item, key in zip(items, content_keys, strict=True)
+            ]
+            if existing_by_content and all(persisted_elsewhere):
+                # Every item is already stored: same no-write contract as a pure
+                # stable-id re-post above.
+                for item, key in zip(items, content_keys, strict=True):
+                    if item.stable_id not in existing_by_id:
+                        twin = existing_by_content[cast(_ContentKey, key)]
+                        _log_content_duplicate(conversation_id, item, twin)
+                        persisted.append(twin)
+                    else:
+                        persisted.append(deduped_by_id[cast(str, item.stable_id)])
+                return persisted
+            has_new_conversation_activity = any(
+                item.type != "resource_event" and not already_stored
+                for item, already_stored in zip(items, persisted_elsewhere, strict=True)
+            )
+            if conv_row is not None and has_new_conversation_activity:
+                conv_row.updated_at = now
+
             fts_rows: list[tuple[str, str, str]] = []
             row_values: list[dict[str, object]] = []
             batch_stable: dict[str, ConversationItem] = {}
-            for item, prepared, search in prepared_rows:
+            batch_content: dict[_ContentKey, ConversationItem] = {}
+            for (item, prepared, search), key in zip(prepared_rows, content_keys, strict=True):
                 if item.stable_id is not None:
                     if item.stable_id in existing_by_id:
                         persisted.append(deduped_by_id[item.stable_id])
@@ -2691,6 +2844,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                         persisted.append(
                             batch_stable[item.stable_id].model_copy(update={"deduplicated": True})
                         )
+                        continue
+                if key is not None:
+                    twin = existing_by_content.get(key) or batch_content.get(key)
+                    if twin is not None:
+                        _log_content_duplicate(conversation_id, item, twin)
+                        persisted.append(twin.model_copy(update={"deduplicated": True}))
                         continue
                 position = next_pos
                 next_pos += 1
@@ -2716,6 +2875,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 if item.stable_id is not None:
                     batch_stable[item.stable_id] = persisted[-1]
+                if key is not None:
+                    batch_content[key] = persisted[-1]
             # One executemany for the batch: positions are pre-allocated above so
             # the rows carry no inter-row dependency, and a single round-trip
             # persists all N. A per-row ORM add round-trips per item, which

@@ -2310,6 +2310,13 @@ def test_read_transcript_items_since_ignores_observed_status_records(tmp_path: P
                                     "</system-reminder>",
                                 },
                                 {"type": "text", "text": "Run sleep 1."},
+                                # The request copy of the tool result below; parsing
+                                # it would mirror that output a second time.
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_bash_1",
+                                    "content": "(No output)",
+                                },
                             ],
                         },
                     }
