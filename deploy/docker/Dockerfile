@@ -103,7 +103,7 @@ ARG PYPI_INDEX_URL=https://pypi.org/simple
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-RUN apt-get update \
+RUN sed -i "s|http://|https://|g" /etc/apt/sources.list.d/debian.sources && apt-get update \
  && apt-get install -y --no-install-recommends build-essential \
  && rm -rf /var/lib/apt/lists/*
 
@@ -215,7 +215,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 # bzip2 ships on every host so the goose EXTRA_HARNESS_CLIS row works without
 # another package-list edit (goose's release archive is .tar.bz2).
-RUN apt-get update \
+RUN sed -i "s|http://|https://|g" /etc/apt/sources.list.d/debian.sources && apt-get update \
  && apt-get install -y --no-install-recommends \
       git tmux procps lsof bubblewrap curl ca-certificates unzip bzip2 \
       iproute2 nftables \
@@ -427,7 +427,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 # curl + ca-certificates only — for the HEALTHCHECK and for outbound
 # HTTPS to LLM gateways / external services.
-RUN apt-get update \
+RUN sed -i "s|http://|https://|g" /etc/apt/sources.list.d/debian.sources && apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
