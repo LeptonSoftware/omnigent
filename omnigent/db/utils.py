@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import os
@@ -16,9 +17,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
-from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy import Connection, Engine, create_engine, event, inspect, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import DBAPIError, NoSuchModuleError
+from sqlalchemy.exc import DBAPIError, DisconnectionError, NoSuchModuleError
 
 if TYPE_CHECKING:
     from alembic.config import Config
@@ -47,6 +48,8 @@ class NamedManagedSessionMaker(Protocol):
     query_name_prefix: str
 
     def __call__(self, query_name: str) -> AbstractContextManager[Session]: ...
+
+    def read(self, query_name: str) -> AbstractContextManager[Connection]: ...
 
 
 # A zero-argument callable returning a fresh database password (e.g. a
@@ -79,6 +82,11 @@ _LAKEBASE_INSTANCE_ENV = "OMNIGENT_LAKEBASE_INSTANCE"
 # for connections that sit idle in the pool across a rotation.
 _SERVER_POOL_RECYCLE_SECONDS = 1800
 _LAKEBASE_POOL_RECYCLE_SECONDS = 600
+
+# A pooled connection is pinged on checkout only after sitting idle this long.
+# Under load connections return within milliseconds, and a ping on every
+# checkout cost a round trip per store call; idle ones are the ones that die.
+_POOL_PING_IDLE_AFTER_SECONDS = 30.0
 
 # Process-wide override, primarily for tests and for callers that want to plug
 # in their own token source (e.g. a non-default Databricks auth flow) without
@@ -339,10 +347,6 @@ def _create_engine(db_uri: str) -> Engine:
         _LAKEBASE_POOL_RECYCLE_SECONDS if token_provider else _SERVER_POOL_RECYCLE_SECONDS
     )
     engine_kwargs: dict[str, Any] = {
-        # Verify connections are alive before checking them out
-        # from the pool. Prevents "server has gone away" errors
-        # after idle periods.
-        "pool_pre_ping": True,
         # Recycle connections older than this window. Prevents stale
         # connections when the database server restarts or closes idle
         # connections; in Lakebase token mode the shorter window also keeps
@@ -393,7 +397,35 @@ def _create_engine(db_uri: str) -> Engine:
         raise
     if token_provider:
         _install_lakebase_token_refresh(engine, token_provider)
+    _install_idle_ping(engine)
     return engine
+
+
+def _install_idle_ping(engine: Engine) -> None:
+    """Ping pooled connections on checkout once they have sat idle.
+
+    Replaces ``pool_pre_ping``, which pinged on every checkout. A failed ping
+    raises :class:`~sqlalchemy.exc.DisconnectionError`, which makes the pool
+    discard that connection and check out another.
+    """
+
+    @event.listens_for(engine, "checkin")
+    def _stamp_checkin(_dbapi_conn: Any, record: Any) -> None:
+        record.info["checked_in_at"] = time.monotonic()
+
+    @event.listens_for(engine, "checkout")
+    def _ping_if_idle(dbapi_conn: Any, record: Any, _proxy: Any) -> None:
+        checked_in_at = record.info.get("checked_in_at")
+        if checked_in_at is None:
+            return  # freshly connected
+        if time.monotonic() - checked_in_at < _POOL_PING_IDLE_AFTER_SECONDS:
+            return
+        try:
+            alive = engine.dialect.do_ping(dbapi_conn)
+        except Exception as exc:
+            raise DisconnectionError("pooled connection failed its idle ping") from exc
+        if not alive:
+            raise DisconnectionError("pooled connection failed its idle ping")
 
 
 def _translate_missing_driver_error(db_uri: str, exc: ModuleNotFoundError) -> ModuleNotFoundError:
@@ -850,26 +882,47 @@ def clear_engine_cache() -> None:
 # ── Managed session ────────────────────────────────────
 
 
-# Ambient per-engine sessions for a read-only "share one checkout" scope. When
-# active (see :func:`shared_read_scope`), ``managed_session()`` reuses the
-# scope's session for its engine instead of opening a fresh pool checkout,
-# collapsing several back-to-back reads (e.g. the access-control check's
+@dataclasses.dataclass
+class _SharedRead:
+    """One engine's checkout inside a :func:`shared_read_scope`.
+
+    The ORM session is bound to the connection and created only when an ORM
+    read asks for one, so a scope of Core reads never builds a Session.
+    """
+
+    connection: Connection
+    session: Session | None = None
+
+
+# Ambient per-engine checkouts for a read-only "share one checkout" scope. When
+# active (see :func:`shared_read_scope`), ``managed_session()`` and ``read()``
+# reuse the scope's connection for their engine instead of a fresh pool
+# checkout, collapsing back-to-back reads (e.g. the access-control check's
 # permission + conversation lookups) into a single connection round-trip.
 # Keyed by ``id(engine)`` so distinct engines (split-DB) still get independent
 # checkouts. Unset outside a scope, so it is a strict no-op for every ordinary
 # caller.
-_shared_read_sessions: ContextVar[dict[int, Session] | None] = ContextVar(
+_shared_read_sessions: ContextVar[dict[int, _SharedRead] | None] = ContextVar(
     "omnigent_shared_read_sessions", default=None
 )
+
+
+def _shared_read(shared: dict[int, _SharedRead], engine: Engine) -> _SharedRead:
+    """Return the scope's checkout for ``engine``, checking one out on first use."""
+    entry = shared.get(id(engine))
+    if entry is None:
+        entry = _SharedRead(connection=engine.connect())
+        shared[id(engine)] = entry
+    return entry
 
 
 @contextmanager
 def shared_read_scope() -> Iterator[None]:
     """Collapse back-to-back reads into one pool checkout per engine.
 
-    Within this scope, ``managed_session()`` reuses a single session per
-    engine rather than checking out a fresh pooled connection (plus a
-    ``pool_pre_ping`` round-trip) on every store call. Intended for a short,
+    Within this scope, ``managed_session()`` and ``read()`` reuse a single
+    connection per engine rather than checking out a fresh pooled connection
+    on every store call. Intended for a short,
     strictly READ-ONLY burst — an access-control check, a snapshot assembly —
     where the per-call checkout dominates the actual query time.
 
@@ -882,19 +935,25 @@ def shared_read_scope() -> Iterator[None]:
         # Already inside a scope — the outer one owns the sessions.
         yield
         return
-    sessions: dict[int, Session] = {}
-    token = _shared_read_sessions.set(sessions)
+    entries: dict[int, _SharedRead] = {}
+    token = _shared_read_sessions.set(entries)
     try:
         yield
-        for session in sessions.values():
-            session.commit()
+        for entry in entries.values():
+            if entry.session is not None:
+                entry.session.commit()
+            entry.connection.commit()
     except BaseException:
-        for session in sessions.values():
-            session.rollback()
+        for entry in entries.values():
+            if entry.session is not None:
+                entry.session.rollback()
+            entry.connection.rollback()
         raise
     finally:
-        for session in sessions.values():
-            session.close()
+        for entry in entries.values():
+            if entry.session is not None:
+                entry.session.close()
+            entry.connection.close()
         _shared_read_sessions.reset(token)
 
 
@@ -945,18 +1004,15 @@ def make_managed_session_maker(
         if not immediate:
             shared = _shared_read_sessions.get()
             if shared is not None:
-                key = id(engine)
-                session = shared.get(key)
-                if session is None:
-                    session = factory()
-                    # Register before the PRAGMAs: those executes force the pool
-                    # checkout, so if one raises the scope must already track the
-                    # session to close it (otherwise the connection would leak).
-                    shared[key] = session
+                entry = _shared_read(shared, engine)
+                if entry.session is None:
+                    # Register before the PRAGMAs so the scope closes the
+                    # session even if one of them raises.
+                    entry.session = factory(bind=entry.connection)
                     if is_sqlite:
-                        session.execute(text("PRAGMA foreign_keys = ON"))
-                        session.execute(text("PRAGMA busy_timeout = 20000"))  # 20s
-                yield session
+                        entry.session.execute(text("PRAGMA foreign_keys = ON"))
+                        entry.session.execute(text("PRAGMA busy_timeout = 20000"))  # 20s
+                yield entry.session
                 return
         with factory() as session:
             try:
@@ -1016,6 +1072,27 @@ def make_named_managed_session_maker(
                 raise ValueError("query_name must not be empty")
             with query_name_scope(f"{prefix}.{query_name}"), managed_session() as session:
                 yield session
+
+        @contextmanager
+        def read(self, query_name: str) -> Iterator[Connection]:
+            """Yield a Core connection for read-only work.
+
+            Skips the ORM Session and its per-row instance loading, which cost
+            more CPU than the query itself on short reads. Rows are Core rows
+            whose attributes are the selected column names. Inside a
+            :func:`shared_read_scope` this is the scope's connection.
+            """
+            if not query_name.strip():
+                raise ValueError("query_name must not be empty")
+            with query_name_scope(f"{prefix}.{query_name}"):
+                shared = _shared_read_sessions.get()
+                if shared is not None:
+                    yield _shared_read(shared, engine).connection
+                    return
+                # Returning the connection to the pool rolls back, which ends
+                # the read transaction; SQLite PRAGMAs are set per connection.
+                with engine.connect() as connection:
+                    yield connection
 
     return _NamedManagedSessionMaker()
 

@@ -11,10 +11,13 @@ from typing import Any, Protocol, cast
 
 from sqlalchemy import (
     ColumnElement,
+    Connection,
     LargeBinary,
+    Row,
     Select,
     and_,
     asc,
+    bindparam,
     delete,
     desc,
     func,
@@ -175,19 +178,38 @@ _LIST_ITEMS_MAX_ROWS_PER_STATEMENT = 200
 # pathological directory can impose on a delete. Hitting it answers "in use".
 _WORKSPACE_SHARER_SCAN_LIMIT = 32
 
+# Hot single-session reads, built once: a reused statement keeps its memoized
+# cache key, which SQLAlchemy otherwise recomputes for each new statement.
+_conversations_table = SqlConversation.__table__
+_metadata_table = SqlConversationMetadata.__table__
+_labels_table = SqlConversationLabel.__table__
+_SELECT_CONVERSATION = select(_conversations_table).where(
+    _conversations_table.c.workspace_id == bindparam("workspace_id"),
+    _conversations_table.c.id == bindparam("conversation_id"),
+)
+_SELECT_CONVERSATION_METADATA = select(_metadata_table).where(
+    _metadata_table.c.workspace_id == bindparam("workspace_id"),
+    _metadata_table.c.id == bindparam("conversation_id"),
+)
+_SELECT_CONVERSATION_LABELS = select(_labels_table.c.key, _labels_table.c.value).where(
+    _labels_table.c.workspace_id == bindparam("workspace_id"),
+    _labels_table.c.conversation_id == bindparam("conversation_id"),
+)
+
 
 class _RowCountResult(Protocol):
     rowcount: int
 
 
 def _to_conversation(
-    row: SqlConversation,
-    meta: SqlConversationMetadata | None = None,
+    row: SqlConversation | Row[Any],
+    meta: SqlConversationMetadata | Row[Any] | None = None,
     labels: dict[str, str] | None = None,
 ) -> Conversation:
     """
-    Convert a :class:`SqlConversation` ORM row (plus optional metadata) to a
-    :class:`Conversation` entity.
+    Convert a :class:`SqlConversation` row (plus optional metadata) to a
+    :class:`Conversation` entity. Either row may be an ORM instance or a Core
+    row selected from the model's table.
 
     The agent binding (``agent_id``) and per-session overrides live on the
     conversation row itself — the latter packed in the ``session_overrides``
@@ -561,7 +583,7 @@ def _dialect_upsert_labels(
 
 
 def _fetch_labels(
-    session: Session,
+    session: Session | Connection,
     conversation_id: str,
 ) -> dict[str, str]:
     """
@@ -580,10 +602,8 @@ def _fetch_labels(
     with query_name_scope("omnigent.conversation_store.select_conversation_labels"):
         rows = (
             session.execute(
-                select(SqlConversationLabel.key, SqlConversationLabel.value).where(
-                    SqlConversationLabel.workspace_id == current_workspace_id(),
-                    SqlConversationLabel.conversation_id == conversation_id,
-                )
+                _SELECT_CONVERSATION_LABELS,
+                {"workspace_id": current_workspace_id(), "conversation_id": conversation_id},
             )
             .tuples()
             .all()
@@ -592,7 +612,7 @@ def _fetch_labels(
 
 
 def _fetch_labels_bulk(
-    session: Session,
+    session: Session | Connection,
     conversation_ids: list[str],
 ) -> dict[str, dict[str, str]]:
     """
@@ -629,7 +649,7 @@ def _fetch_labels_bulk(
 
 
 def _fetch_search_snippets(
-    session: Session,
+    session: Session | Connection,
     conversation_ids: list[str],
     query: str,
 ) -> dict[str, str]:
@@ -905,7 +925,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         ensure_fts_table(self._conv_engine)
 
-    def _get_meta(self, conversation_id: str) -> SqlConversationMetadata | None:
+    def _get_meta(self, conversation_id: str) -> Row[Any] | None:
         """
         Fetch the metadata row for a conversation from the Omnigent DB.
 
@@ -915,10 +935,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         inside :func:`shared_read_scope` pays no second pool checkout for it
         when both logical databases share one engine.
         """
-        with self._session("select_conversation_metadata_by_id") as meta_sess:
-            return meta_sess.get(
-                SqlConversationMetadata, (current_workspace_id(), conversation_id)
-            )
+        with self._session.read("select_conversation_metadata_by_id") as connection:
+            return connection.execute(
+                _SELECT_CONVERSATION_METADATA,
+                {"workspace_id": current_workspace_id(), "conversation_id": conversation_id},
+            ).first()
 
     def _lock_conversation(self, session: Session, conversation_id: str) -> None:
         """
@@ -1221,12 +1242,18 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: The :class:`Conversation` if found, otherwise
             ``None``.
         """
-        with shared_read_scope(), self._conv_session("select_conversation_by_id") as session:
-            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+        with (
+            shared_read_scope(),
+            self._conv_session.read("select_conversation_by_id") as connection,
+        ):
+            row = connection.execute(
+                _SELECT_CONVERSATION,
+                {"workspace_id": current_workspace_id(), "conversation_id": conversation_id},
+            ).first()
             if row is None:
                 return None
             meta = self._get_meta(conversation_id)
-            return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
+            return _to_conversation(row, meta, _fetch_labels(connection, conversation_id))
 
     def find_conversation_by_external_session_id(
         self,
@@ -1308,34 +1335,38 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not conversation_ids:
             return {}
         unique_ids = list(set(conversation_ids))
-        # runner_id and host_id are in the Omnigent DB (metadata).
-        with self._session("get_session_connectivity") as session:
-            meta_rows = session.execute(
-                select(
-                    SqlConversationMetadata.id,
-                    SqlConversationMetadata.runner_id,
-                    SqlConversationMetadata.host_id,
-                    SqlConversationMetadata.runner_last_seen,
-                ).where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id.in_(unique_ids),
-                )
-            ).all()
-        # Connectivity markers are in the AP DB. Both signal on presence:
-        # the fork-source label forces an unbound clone to pick a workspace;
-        # the import-source label marks a transcript with no live executor.
-        with self._conv_session("get_session_connectivity") as ap_sess:
-            label_rows = ap_sess.execute(
-                select(
-                    SqlConversationLabel.conversation_id,
-                    SqlConversationLabel.key,
-                    SqlConversationLabel.value,
-                ).where(
-                    SqlConversationLabel.workspace_id == current_workspace_id(),
-                    SqlConversationLabel.conversation_id.in_(unique_ids),
-                    SqlConversationLabel.key.in_([FORK_SOURCE_LABEL_KEY, IMPORT_SOURCE_LABEL_KEY]),
-                )
-            ).all()
+        # One checkout for both reads when the two logical databases share an engine.
+        with shared_read_scope():
+            # runner_id and host_id are in the Omnigent DB (metadata).
+            with self._session.read("get_session_connectivity") as connection:
+                meta_rows = connection.execute(
+                    select(
+                        SqlConversationMetadata.id,
+                        SqlConversationMetadata.runner_id,
+                        SqlConversationMetadata.host_id,
+                        SqlConversationMetadata.runner_last_seen,
+                    ).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id.in_(unique_ids),
+                    )
+                ).all()
+            # Connectivity markers are in the AP DB. Both signal on presence:
+            # the fork-source label forces an unbound clone to pick a workspace;
+            # the import-source label marks a transcript with no live executor.
+            with self._conv_session.read("get_session_connectivity") as connection:
+                label_rows = connection.execute(
+                    select(
+                        SqlConversationLabel.conversation_id,
+                        SqlConversationLabel.key,
+                        SqlConversationLabel.value,
+                    ).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id.in_(unique_ids),
+                        SqlConversationLabel.key.in_(
+                            [FORK_SOURCE_LABEL_KEY, IMPORT_SOURCE_LABEL_KEY]
+                        ),
+                    )
+                ).all()
         needs_workspace_ids = {
             row.conversation_id for row in label_rows if row.key == FORK_SOURCE_LABEL_KEY
         }
@@ -1369,37 +1400,25 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not conversation_ids:
             return {}
         unique_ids = list(set(conversation_ids))
-        with self._conv_session("get_conversations") as session:
-            rows = list(
-                session.execute(
-                    select(SqlConversation).where(
-                        SqlConversation.workspace_id == current_workspace_id(),
-                        SqlConversation.id.in_(unique_ids),
-                    )
+        with shared_read_scope(), self._conv_session.read("get_conversations") as connection:
+            rows = connection.execute(
+                select(_conversations_table).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id.in_(unique_ids),
                 )
-                .scalars()
-                .all()
-            )
-            # Batch the labels in the same session so the bulk fetch sees a
-            # consistent snapshot and avoids the per-row label fan-out that
-            # get_conversation incurs. Build the entities inside the session
-            # too — _to_conversation reads ORM columns, which would raise
-            # DetachedInstanceError once the session closes.
-            labels_by_conv = _fetch_labels_bulk(session, [row.id for row in rows])
-        meta_rows: list[SqlConversationMetadata] = []
-        if rows:
-            row_ids = [r.id for r in rows]
-            with self._session("get_conversations") as meta_sess:
-                meta_rows = list(
-                    meta_sess.execute(
-                        select(SqlConversationMetadata).where(
+            ).all()
+            # Batch the labels on the same connection, avoiding the per-row
+            # label fan-out that get_conversation incurs.
+            labels_by_conv = _fetch_labels_bulk(connection, [row.id for row in rows])
+            meta_rows: list[Row[Any]] = []
+            if rows:
+                with self._session.read("get_conversations") as meta_connection:
+                    meta_rows = meta_connection.execute(
+                        select(_metadata_table).where(
                             SqlConversationMetadata.workspace_id == current_workspace_id(),
-                            SqlConversationMetadata.id.in_(row_ids),
+                            SqlConversationMetadata.id.in_([r.id for r in rows]),
                         )
-                    )
-                    .scalars()
-                    .all()
-                )
+                    ).all()
         meta_by_id = {m.id: m for m in meta_rows}
         return {
             row.id: _to_conversation(
@@ -1437,8 +1456,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not unique_ids:
             return result
 
-        with self._conv_session("list_child_conversation_ids_by_parent") as ap_sess:
-            rows = ap_sess.execute(
+        with self._conv_session.read("list_child_conversation_ids_by_parent") as connection:
+            rows = connection.execute(
                 select(SqlConversation.parent_conversation_id, SqlConversation.id)
                 .where(SqlConversation.workspace_id == current_workspace_id())
                 .where(SqlConversation.parent_conversation_id.in_(unique_ids))
@@ -1468,10 +1487,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         if after is not None:
             stmt = stmt.where(tuple_(SqlConversation.created_at, SqlConversation.id) < after)
-        with self._conv_session("list_child_conversation_ids_page") as ap_sess:
+        with self._conv_session.read("list_child_conversation_ids_page") as connection:
             return [
                 (child_id, created_at)
-                for child_id, created_at in ap_sess.execute(
+                for child_id, created_at in connection.execute(
                     stmt.order_by(
                         desc(SqlConversation.created_at), desc(SqlConversation.id)
                     ).limit(limit)
@@ -2918,24 +2937,22 @@ class SqlAlchemyConversationStore(ConversationStore):
                         accessible_set if accessible_set is not None else owned_set or set()
                     )
 
-        with self._conv_session("list_conversations") as session:
+        with self._conv_session.read("list_conversations") as connection:
             # Bound the content-search scan server-side (Postgres only). SET
             # LOCAL scopes to this transaction and reverts on commit, so it
             # can't leak to the connection's next pooled use. See
             # _SEARCH_STATEMENT_TIMEOUT_MS. A worker-thread query is not stopped
             # by a client disconnect, so this is the only server-side bound.
-            is_postgres = session.bind is not None and is_postgresql_family(
-                session.bind.dialect.name
-            )
+            is_postgres = is_postgresql_family(connection.dialect.name)
             if search_query and is_postgres:
                 # Postgres SET does not accept a bind parameter, so the value is
                 # inlined. Safe from injection: it is an int module constant, not
                 # caller input — coerced through int() to keep it that way.
-                session.execute(
+                connection.execute(
                     text(f"SET LOCAL statement_timeout = {int(_SEARCH_STATEMENT_TIMEOUT_MS)}")
                 )
 
-            stmt = select(SqlConversation).where(
+            stmt = select(_conversations_table).where(
                 SqlConversation.workspace_id == current_workspace_id()
             )
 
@@ -3150,7 +3167,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if after:
                 stmt = self._apply_cursor(
-                    session,
+                    connection,
                     stmt,
                     after,
                     sort_col,
@@ -3160,7 +3177,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if before:
                 stmt = self._apply_cursor(
-                    session,
+                    connection,
                     stmt,
                     before,
                     sort_col,
@@ -3172,7 +3189,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 sort_fn(sort_col),
                 sort_fn(self._tiebreaker_col),  # insertion-order tiebreaker for timestamp ties
             ).limit(limit + 1)
-            rows = list(session.execute(stmt).scalars().all())
+            rows = connection.execute(stmt).all()
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
@@ -3180,39 +3197,32 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Fetch labels for all returned conversations in a single IN-clause
             # query so the list-path is O(1) queries regardless of page size.
             # The agent binding + overrides ride on each conversation row.
-            labels_by_conv = _fetch_labels_bulk(session, row_ids)
+            labels_by_conv = _fetch_labels_bulk(connection, row_ids)
             # On a content search, fetch a preview excerpt of the matching
             # chat text so the UI can show *where* each session matched (the
             # match is often invisible in the title). Title-only matches keep
             # search_snippet=None — the title already shows the hit. Items
             # are AP-side, so this must run inside the conv session.
             snippets = (
-                _fetch_search_snippets(session, row_ids, search_query) if search_query else {}
+                _fetch_search_snippets(connection, row_ids, search_query) if search_query else {}
             )
             # Build AP-only entities; metadata fetched separately below.
             ap_entities = [(r, labels_by_conv.get(r.id, {})) for r in rows]
 
         # Fetch metadata from Omnigent DB and merge.
-        meta_by_id: dict[str, SqlConversationMetadata] = {}
+        convs = []
         if row_ids:
-            with self._session("list_conversations") as meta_sess:
-                meta_rows = (
-                    meta_sess.execute(
-                        select(SqlConversationMetadata).where(
-                            SqlConversationMetadata.workspace_id == current_workspace_id(),
-                            SqlConversationMetadata.id.in_(row_ids),
-                        )
+            with self._session.read("list_conversations") as meta_connection:
+                meta_rows = meta_connection.execute(
+                    select(_metadata_table).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id.in_(row_ids),
                     )
-                    .scalars()
-                    .all()
-                )
-                # Access .id inside the session to avoid DetachedInstanceError.
-                meta_by_id = {m.id: m for m in meta_rows}
-                convs = [
-                    _to_conversation(r, meta_by_id.get(r.id), labels) for r, labels in ap_entities
-                ]
-        else:
-            convs = []
+                ).all()
+            meta_by_id = {m.id: m for m in meta_rows}
+            convs = [
+                _to_conversation(r, meta_by_id.get(r.id), labels) for r, labels in ap_entities
+            ]
         for conv in convs:
             conv.search_snippet = snippets.get(conv.id)
         return PagedList(
@@ -3244,14 +3254,14 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     @staticmethod
     def _apply_cursor(
-        session: Session,
-        stmt: Select[tuple[SqlConversation]],
+        session: Session | Connection,
+        stmt: Select[Any],
         cursor_id: str,
         sort_col: QueryableAttribute[int],
         is_desc: bool,
         tiebreaker_col: ColumnElement[Any],
         forward: bool,
-    ) -> Select[tuple[SqlConversation]]:
+    ) -> Select[Any]:
         """
         Add a cursor-based WHERE clause to the query.
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import builtins
 from typing import cast
 
-from sqlalchemy import CursorResult, and_, asc, case, desc, or_, select, update
+from sqlalchemy import CursorResult, and_, asc, bindparam, case, desc, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -31,6 +31,14 @@ from omnigent.stores.agent_store import _UNSET, AgentStore
 # copies than this newer than an original sees that original only on a later
 # page; upgrade path is a column marking copies.
 _USER_AGENT_READ_CAP = 50
+
+# Built once: a reused statement keeps its memoized cache key, which SQLAlchemy
+# otherwise recomputes for each new statement.
+_agents_table = SqlAgent.__table__
+_SELECT_AGENT = select(_agents_table).where(
+    _agents_table.c.workspace_id == bindparam("workspace_id"),
+    _agents_table.c.id == bindparam("agent_id"),
+)
 
 
 def _is_original(row: SqlAgent) -> bool:
@@ -116,8 +124,8 @@ class SqlAlchemyAgentStore(AgentStore):
         :returns: The agent's spawn-tree root conversation id, or ``None`` when
             no conversation points at this agent.
         """
-        with self._conv_session("select_session_id_for_agent") as conv_sess:
-            return conv_sess.execute(
+        with self._conv_session.read("select_session_id_for_agent") as connection:
+            return connection.execute(
                 select(SqlConversation.root_conversation_id)
                 .where(
                     SqlConversation.workspace_id == current_workspace_id(),
@@ -185,10 +193,12 @@ class SqlAlchemyAgentStore(AgentStore):
             e.g. ``"agent_abc123"``.
         :returns: The :class:`Agent` if found, otherwise ``None``.
         """
-        with self._session("select_agent_by_id") as session:
-            row = session.get(SqlAgent, (current_workspace_id(), agent_id))
-            if row is None:
-                return None
+        with self._session.read("select_agent_by_id") as connection:
+            row = connection.execute(
+                _SELECT_AGENT, {"workspace_id": current_workspace_id(), "agent_id": agent_id}
+            ).first()
+        if row is None:
+            return None
         # For session-scoped agents, derive the owning conversation id
         # from the forward pointer so callers can use agent.session_id.
         # Runs outside the Omnigent session: the lookup targets the AP DB.
@@ -300,14 +310,14 @@ class SqlAlchemyAgentStore(AgentStore):
         """
         if not agent_ids:
             return {}
-        with self._session("select_agent_names") as session:
-            rows = session.execute(
+        with self._session.read("select_agent_names") as connection:
+            rows = connection.execute(
                 select(SqlAgent.id, SqlAgent.name).where(
                     SqlAgent.workspace_id == current_workspace_id(),
                     SqlAgent.id.in_(agent_ids),
                 )
             ).all()
-            return {row.id: row.name for row in rows}
+        return {row.id: row.name for row in rows}
 
     def update(
         self,

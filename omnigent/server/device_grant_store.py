@@ -26,9 +26,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
-from typing import cast
+from typing import Any, cast
 
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import Row, and_, delete, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
@@ -60,7 +60,7 @@ def hash_secret(secret: str, key: bytes) -> str:
     return hmac.new(key, secret.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _to_device_grant(row: SqlDeviceGrant) -> DeviceGrant:
+def _to_device_grant(row: SqlDeviceGrant | Row[Any]) -> DeviceGrant:
     """Convert a :class:`SqlDeviceGrant` row to a domain entity.
 
     Drops the hashed secrets — they never leave the store.
@@ -271,16 +271,14 @@ class DeviceGrantStore:
         its ``refresh_token_hash`` cleared to ``NULL``, so a revoked
         token never resolves here. Returns ``None`` if unknown.
         """
-        with self._session("select_device_grant_by_refresh_hash") as session:
-            row = (
-                session.query(SqlDeviceGrant)
-                .filter(
+        with self._session.read("select_device_grant_by_refresh_hash") as connection:
+            row = connection.execute(
+                select(SqlDeviceGrant.__table__).where(
                     SqlDeviceGrant.workspace_id == current_workspace_id(),
                     SqlDeviceGrant.refresh_token_hash == refresh_token_hash,
                 )
-                .one_or_none()
-            )
-            return _to_device_grant(row) if row is not None else None
+            ).one_or_none()
+        return _to_device_grant(row) if row is not None else None
 
     def approve(
         self,

@@ -188,10 +188,10 @@ class SqlAlchemyCommentStore(CommentStore):
             )
             .group_by(SqlComment.conversation_id)
         )
-        with self._session("select_comment_fingerprints") as session:
+        with self._session.read("select_comment_fingerprints") as connection:
             return {
                 conversation_id: CommentsFingerprint(count=count, last_updated_at=last_updated)
-                for conversation_id, count, last_updated in session.execute(stmt)
+                for conversation_id, count, last_updated in connection.execute(stmt)
             }
 
     def remove_conversation(self, conversation_id: str) -> None:

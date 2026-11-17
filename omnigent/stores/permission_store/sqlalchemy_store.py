@@ -7,9 +7,9 @@ import os
 import threading
 import time
 from collections.abc import Callable
-from typing import cast
+from typing import Any, cast
 
-from sqlalchemy import delete, exists, literal, select, update
+from sqlalchemy import Row, bindparam, delete, exists, literal, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -62,6 +62,22 @@ _DEFAULT_RESOLVE_ACCESS_CACHE_TTL_S = 5.0
 _RESOLVE_ACCESS_CACHE_MAX_ENTRIES_ENV = "OMNIGENT_ACL_RESOLVE_CACHE_MAX_ENTRIES"
 _DEFAULT_RESOLVE_ACCESS_CACHE_MAX_ENTRIES = 50_000
 
+# Access-check reads, built once: a reused statement keeps its memoized cache
+# key, which SQLAlchemy otherwise recomputes for each new statement.
+_users_table = SqlUser.__table__
+_grants_table = SqlSessionPermission.__table__
+_SELECT_USER_ADMIN_STATUS = select(_users_table.c.is_admin, _users_table.c.deleted_at).where(
+    _users_table.c.workspace_id == bindparam("workspace_id"),
+    _users_table.c.id == bindparam("user_id"),
+)
+_SELECT_USER_AND_PUBLIC_GRANT_LEVELS = select(
+    _grants_table.c.user_id, _grants_table.c.level
+).where(
+    _grants_table.c.workspace_id == bindparam("workspace_id"),
+    _grants_table.c.conversation_id == bindparam("conversation_id"),
+    _grants_table.c.user_id.in_([bindparam("user_id"), RESERVED_USER_PUBLIC]),
+)
+
 
 def _resolve_access_cache_ttl_s() -> float:
     """Read the resolve_access cache TTL (seconds) from the environment.
@@ -111,10 +127,10 @@ def _to_account(row: SqlUser) -> Account:
     )
 
 
-def _to_entity(row: SqlSessionPermission) -> SessionPermission:
-    """Convert a :class:`SqlSessionPermission` ORM row to a domain entity.
+def _to_entity(row: SqlSessionPermission | Row[Any]) -> SessionPermission:
+    """Convert a :class:`SqlSessionPermission` row to a domain entity.
 
-    :param row: The SQLAlchemy ORM row to convert.
+    :param row: An ORM instance, or a Core row selected from the model's table.
     :returns: A :class:`SessionPermission` dataclass instance.
     """
     return SessionPermission(
@@ -383,19 +399,15 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Return all grants for multiple sessions.  See base class for contract."""
         if not conversation_ids:
             return {}
-        with self._session("list_permissions_for_sessions") as session:
-            # Convert to entities inside the session so ORM attributes are
-            # accessed while the session is still open (avoids DetachedInstanceError).
+        with self._session.read("list_permissions_for_sessions") as connection:
             entities = [
                 _to_entity(r)
-                for r in session.execute(
-                    select(SqlSessionPermission).where(
+                for r in connection.execute(
+                    select(_grants_table).where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.conversation_id.in_(conversation_ids),
                     )
                 )
-                .scalars()
-                .all()
             ]
         result: dict[str, list[SessionPermission]] = {cid: [] for cid in conversation_ids}
         for entity in entities:
@@ -482,9 +494,12 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
     def is_admin(self, user_id: str) -> bool:
         """Check the admin flag. See base class for contract."""
-        with self._session("select_user_admin_status") as session:
-            row = session.get(SqlUser, (current_workspace_id(), user_id))
-            return row is not None and row.deleted_at is None and row.is_admin
+        with self._session.read("select_user_admin_status") as connection:
+            row = connection.execute(
+                _SELECT_USER_ADMIN_STATUS,
+                {"workspace_id": current_workspace_id(), "user_id": user_id},
+            ).first()
+        return row is not None and row.deleted_at is None and row.is_admin
 
     def set_admin(self, user_id: str, is_admin: bool) -> None:
         """Set the admin flag on an existing user. See base class for contract."""
@@ -631,28 +646,29 @@ class SqlAlchemyPermissionStore(PermissionStore):
             # below are being fetched makes this result unstorable, so a write
             # committed mid-read can't be undone by a stale positive.
             generation = self._resolve_cache_generation_now()
-        # One session = one connection checkout + transaction. Against a
-        # remote DB (Lakebase) this is the round-trip that matters; the three
-        # primary-key reads below pipeline on the same connection rather than
-        # paying three separate checkout/BEGIN/COMMIT cycles (which is what
-        # calling is_admin + check_access + get_permission_level separately
-        # did — see the GET /v1/sessions/{id} snapshot path).
-        with self._session("resolve_access") as session:
-            user_row = session.get(SqlUser, (workspace_id, user_id))
-            user_grant = session.get(
-                SqlSessionPermission, (workspace_id, user_id, conversation_id)
+        # One checkout for the admin flag and both grants: calling is_admin,
+        # check_access and get_permission_level separately paid three.
+        with self._session.read("resolve_access") as connection:
+            user_row = connection.execute(
+                _SELECT_USER_ADMIN_STATUS, {"workspace_id": workspace_id, "user_id": user_id}
+            ).first()
+            levels = dict(
+                connection.execute(
+                    _SELECT_USER_AND_PUBLIC_GRANT_LEVELS,
+                    {
+                        "workspace_id": workspace_id,
+                        "conversation_id": conversation_id,
+                        "user_id": user_id,
+                    },
+                )
+                .tuples()
+                .all()
             )
-            public_grant = session.get(
-                SqlSessionPermission,
-                (workspace_id, RESERVED_USER_PUBLIC, conversation_id),
-            )
-            access = ResolvedAccess(
-                is_admin=user_row is not None
-                and user_row.deleted_at is None
-                and user_row.is_admin,
-                user_grant_level=user_grant.level if user_grant is not None else None,
-                public_grant_level=public_grant.level if public_grant is not None else None,
-            )
+        access = ResolvedAccess(
+            is_admin=user_row is not None and user_row.deleted_at is None and user_row.is_admin,
+            user_grant_level=levels.get(user_id),
+            public_grant_level=levels.get(RESERVED_USER_PUBLIC),
+        )
         # Cache only a positive standing: a no-access result is left uncached so
         # a freshly granted user is authorized on their next request, not after
         # the TTL elapses.

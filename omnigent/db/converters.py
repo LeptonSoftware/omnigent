@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+from sqlalchemy import Row
+
 from omnigent.db.db_models import SqlAgent
 from omnigent.db.enum_codecs import AGENT_KIND, decode_agent_kind
 from omnigent.entities import Agent
 
 
-def sql_agent_to_entity(row: SqlAgent, session_id: str | None = None) -> Agent:
+def sql_agent_to_entity(row: SqlAgent | Row[Any], session_id: str | None = None) -> Agent:
     """
-    Convert a :class:`SqlAgent` ORM row to an :class:`Agent` entity.
+    Convert a :class:`SqlAgent` row to an :class:`Agent` entity.
 
-    :param row: The SQLAlchemy ORM row to convert.
+    :param row: An ORM instance, or a Core row selected from the model's table.
     :param session_id: Owning conversation id when this agent is
         session-scoped; ``None`` for template agents. Callers that know
         the owning conversation id (e.g. the conversation store) pass it

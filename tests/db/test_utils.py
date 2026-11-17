@@ -61,11 +61,13 @@ def test_non_sqlite_engine_has_pool_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Non-SQLite engines must be created with pool_pre_ping=True and
-    pool_recycle=1800 to prevent stale/dead connections.
+    Non-SQLite engines ping idle connections on checkout instead of every
+    checkout, and recycle connections after 1800 s.
     """
     captured_kwargs: dict[str, Any] = {}
     mock_engine = MagicMock()
+    idle_ping_engines: list[Any] = []
+    monkeypatch.setattr("omnigent.db.utils._install_idle_ping", idle_ping_engines.append)
 
     def _capturing_create_engine(uri: str, **kwargs: Any) -> MagicMock:
         captured_kwargs.update(kwargs)
@@ -83,15 +85,55 @@ def test_non_sqlite_engine_has_pool_settings(
 
     get_or_create_engine("postgresql://user:pass@localhost/testdb")
 
-    # pool_pre_ping=True prevents "server has gone away" errors
-    # after idle periods. Failure means dead connections won't be
-    # detected before checkout, causing intermittent query failures.
-    assert captured_kwargs.get("pool_pre_ping") is True
+    assert "pool_pre_ping" not in captured_kwargs
+    assert idle_ping_engines == [mock_engine]
 
     # pool_recycle=1800 (30 min) prevents stale connections when
     # the database server restarts or closes idle connections.
     # Failure means connections could persist indefinitely and break.
     assert captured_kwargs.get("pool_recycle") == 1800
+
+
+def test_idle_ping_pings_only_connections_idle_past_the_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recently returned connection is reused unpinged; one idle past the
+    threshold is pinged, and a failed ping swaps in a fresh connection."""
+    from omnigent.db import utils
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'ping.db'}", pool_size=1, max_overflow=0)
+    utils._install_idle_ping(engine)
+    now = [1000.0]
+    monkeypatch.setattr(utils.time, "monotonic", lambda: now[0])
+    pings: list[Any] = []
+    ping_ok = [True]
+
+    def fake_ping(dbapi_conn: Any) -> bool:
+        pings.append(dbapi_conn)
+        if not ping_ok[0]:
+            raise RuntimeError("connection reset")
+        return True
+
+    monkeypatch.setattr(engine.dialect, "do_ping", fake_ping)
+
+    def checkout_dbapi() -> Any:
+        with engine.connect() as connection:
+            return connection.connection.dbapi_connection
+
+    first = checkout_dbapi()
+    now[0] += utils._POOL_PING_IDLE_AFTER_SECONDS - 1
+    assert checkout_dbapi() is first
+    assert pings == [], "a recently returned connection must not be pinged"
+
+    now[0] += utils._POOL_PING_IDLE_AFTER_SECONDS
+    assert checkout_dbapi() is first
+    assert pings == [first], "an idle connection must be pinged before reuse"
+
+    now[0] += utils._POOL_PING_IDLE_AFTER_SECONDS + 1
+    ping_ok[0] = False
+    replacement = checkout_dbapi()
+    assert replacement is not first, "a connection that fails its ping must be replaced"
+    engine.dispose()
 
 
 def test_cockroachdb_dialect_helpers_and_url() -> None:
@@ -116,6 +158,7 @@ def test_cockroachdb_engine_settings(monkeypatch: pytest.MonkeyPatch) -> None:
         return mock_engine
 
     monkeypatch.setattr(utils, "create_engine", capture)
+    monkeypatch.setattr(utils, "_install_idle_ping", lambda engine: None)
     engine = utils._create_engine("cockroachdb://root@host/db")
 
     assert engine is mock_engine
@@ -326,6 +369,7 @@ def test_paas_postgres_scheme_is_normalized_by_the_engine_factory(
         return MagicMock()
 
     monkeypatch.setattr(utils, "create_engine", capture)
+    monkeypatch.setattr(utils, "_install_idle_ping", lambda engine: None)
     utils._create_engine("postgres://user:secret@host:5432/db")
 
     assert captured["uri"] == "postgresql+psycopg://user:secret@host:5432/db"
@@ -1222,6 +1266,48 @@ def test_shared_read_scope_nesting_reuses_outer(db_uri: str) -> None:
         with shared_read_scope():
             with maker() as inner:
                 assert inner is outer, "nested scope reuses the outer session"
+
+
+def test_named_read_yields_a_named_core_connection(db_uri: str) -> None:
+    """``read()`` hands out a Core connection, names its work, and rejects a
+    blank name like the session form does."""
+    from sqlalchemy import Connection
+
+    from omnigent.db import current_query_name
+    from omnigent.db.utils import make_named_managed_session_maker
+
+    maker = make_named_managed_session_maker(
+        get_or_create_engine(db_uri), query_name_prefix="omnigent.test"
+    )
+    with maker.read("probe") as connection:
+        assert isinstance(connection, Connection)
+        assert connection.execute(text("SELECT 1")).scalar_one() == 1
+        assert current_query_name() == "omnigent.test.probe"
+    with pytest.raises(ValueError), maker.read(" "):
+        pass
+
+
+def test_shared_read_scope_shares_one_checkout_between_reads_and_sessions(
+    db_uri: str,
+) -> None:
+    """In a scope, Core reads and ORM sessions on one engine share a single
+    checkout, and a scope of Core reads alone never builds a Session."""
+    from omnigent.db.utils import make_named_managed_session_maker
+
+    engine = get_or_create_engine(db_uri)
+    maker = make_named_managed_session_maker(engine, query_name_prefix="omnigent.test")
+    count, detach = _count_checkouts(engine)
+    try:
+        with shared_read_scope():
+            with maker.read("first") as first, maker.read("second") as second:
+                assert first is second
+            (entry,) = _shared_read_sessions.get().values()
+            assert entry.session is None, "Core reads alone must not build a Session"
+            with maker("orm") as session:
+                assert session.connection() is first
+        assert len(count) == 1, f"a scope must share one checkout, got {len(count)}"
+    finally:
+        detach()
 
 
 def test_shared_read_scope_closes_session_when_init_fails(
