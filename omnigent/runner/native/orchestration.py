@@ -8526,6 +8526,7 @@ async def _auto_create_claude_terminal(
         validate_claude_hook_interpreter_compatibility,
     )
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
+    from omnigent.inner.bundle_skills import claude_agents_skill_overlay
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     workspace = str(
@@ -9168,6 +9169,14 @@ async def _auto_create_claude_terminal(
         # actually route; otherwise every submit would pay its round trip.
         turn_routing=_claude_turn_router is not None,
     )
+    skill_overlay = claude_agents_skill_overlay(bridge_dir)
+    # A bridge dir under the claude-native root has that root trusted once,
+    # not its own overlay per session: Claude trusts a folder under a trusted
+    # one (2.1.329), so the global config gains one entry, not one a session.
+    from omnigent.harnesses.claude_native.bridge import _BRIDGE_ROOT
+
+    trust_root = _BRIDGE_ROOT if bridge_dir.parent == _BRIDGE_ROOT else skill_overlay
+    trusted_added_dirs = (trust_root,) if str(skill_overlay) in claude_args else ()
 
     # Apply the per-harness startup command/args override from config
     # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
@@ -9239,6 +9248,7 @@ async def _auto_create_claude_terminal(
         ensure_claude_workspace_trusted(
             _claude_terminal_launch_cwd(env_spec, agent_os_env),
             env=_claude_terminal_launch_env(env_spec),
+            added_dirs=trusted_added_dirs,
         )
     except BaseException as seed_error:
         # No forwarder owns the routers yet, so release the ones this launch started.

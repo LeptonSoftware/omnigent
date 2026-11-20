@@ -8493,15 +8493,20 @@ def test_ensure_trusted_creates_config_when_missing(
     A fresh host (no ``~/.claude.json``) gets both first-run gates set.
 
     This is the core workspace-trust case: an ``omnigent host`` machine that
-    has never run Claude interactively. Both the global onboarding gate
-    and the per-workspace trust gate must be pre-accepted so Claude does
-    not block on its TUI prompts.
+    has never run Claude interactively. The global onboarding gate and the
+    workspace and added-directory trust gates must be pre-accepted so Claude
+    does not block on its TUI prompts.
     """
     config_path = _redirect_home(monkeypatch, tmp_path / "home")
     workspace = tmp_path / "worktrees" / "feature-x"
     workspace.mkdir(parents=True)
+    added_dir = tmp_path / "bridge" / "agent-skills"
+    added_dir.mkdir(parents=True)
+    (tmp_path / "bridge-link").symlink_to(tmp_path / "bridge", target_is_directory=True)
 
-    ensure_claude_workspace_trusted(workspace)
+    ensure_claude_workspace_trusted(
+        workspace, added_dirs=(tmp_path / "bridge-link" / "agent-skills",)
+    )
 
     data = json.loads(config_path.read_text())
     # Global onboarding gate — without this Claude shows the theme/login
@@ -8510,6 +8515,9 @@ def test_ensure_trusted_creates_config_when_missing(
     # Per-directory trust gate, keyed by the RESOLVED absolute path —
     # without this Claude shows "Do you trust the files in this folder?".
     assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
+    # Without this Claude 2.1.326+ asks "Adding a new directory", and Escape exits.
+    assert data["projects"][str(added_dir.resolve())]["hasTrustDialogAccepted"] is True
+    assert str(tmp_path / "bridge-link" / "agent-skills") not in data["projects"]
 
 
 def test_ensure_trusted_preserves_existing_state(
@@ -8572,15 +8580,20 @@ def test_ensure_trusted_idempotent_does_not_rewrite(
     config_path = _redirect_home(monkeypatch, tmp_path / "home")
     workspace = tmp_path / "worktrees" / "feature-z"
     workspace.mkdir(parents=True)
+    added_dir = tmp_path / "bridge" / "agent-skills"
+    added_dir.mkdir(parents=True)
     already = {
         "hasCompletedOnboarding": True,
-        "projects": {str(workspace.resolve()): {"hasTrustDialogAccepted": True}},
+        "projects": {
+            str(workspace.resolve()): {"hasTrustDialogAccepted": True},
+            str(added_dir.resolve()): {"hasTrustDialogAccepted": True},
+        },
     }
     # Compact, no indentation — distinct from the helper's indent=2 output.
     config_path.write_text(json.dumps(already, separators=(",", ":")))
     before = config_path.read_bytes()
 
-    ensure_claude_workspace_trusted(workspace)
+    ensure_claude_workspace_trusted(workspace, added_dirs=(added_dir,))
 
     # Byte-identical → the helper detected no change and never wrote.
     assert config_path.read_bytes() == before
@@ -8619,6 +8632,130 @@ def test_ensure_trusted_refuses_malformed_config(
 
     # The original (malformed) bytes are preserved — no clobber occurred.
     assert config_path.read_text() == raw
+
+
+def test_ensure_trusted_waits_for_claudes_lock_and_writes_nothing_without_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A live holder of Claude Code's config lock is waited for, never written past.
+
+    Claude Code 2.1.329 saves its global config under ``<config>.lock``; a write
+    outside it can drop the trust just seeded, leaving a prompt nobody answers.
+    """
+    import functools
+
+    from omnigent.harnesses.claude_native import bridge
+
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    config_path.write_text(json.dumps({"k": 1}))
+    lock = Path(f"{config_path}.lock")
+    lock.mkdir()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        bridge, "_claude_config_lock", functools.partial(bridge._claude_config_lock, timeout=0.3)
+    )
+
+    with pytest.raises(TimeoutError):
+        ensure_claude_workspace_trusted(workspace)
+
+    assert json.loads(config_path.read_text()) == {"k": 1}
+    assert lock.is_dir()  # still the holder's
+
+
+def test_ensure_trusted_takes_over_a_dead_holders_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A lock untouched for over proper-lockfile's 10 s is a dead holder's.
+
+    It is taken over, the trust is written, and nothing is left behind.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    lock = Path(f"{config_path}.lock")
+    lock.mkdir()
+    old = time.time() - 30
+    os.utime(lock, (old, old))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    ensure_claude_workspace_trusted(workspace)
+
+    data = json.loads(config_path.read_text())
+    assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
+    assert not lock.exists()
+    assert not Path(f"{lock}.takeover").exists()
+
+
+def test_ensure_trusted_takes_the_lock_beside_a_symlinked_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Claude locks the path it opens, unresolved.
+
+    So a lock held beside a symlinked config blocks the write to its target.
+    """
+    import functools
+
+    from omnigent.harnesses.claude_native import bridge
+
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    target = tmp_path / "dotfiles.json"
+    target.write_text(json.dumps({"k": 1}))
+    config_path.symlink_to(target)
+    Path(f"{config_path}.lock").mkdir()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        bridge, "_claude_config_lock", functools.partial(bridge._claude_config_lock, timeout=0.3)
+    )
+
+    with pytest.raises(TimeoutError):
+        ensure_claude_workspace_trusted(workspace)
+
+    assert json.loads(target.read_text()) == {"k": 1}
+
+
+def test_ensure_trusted_concurrent_launches_all_keep_their_trust(tmp_path: Path) -> None:
+    """
+    Sessions launching at once, each seeding its own workspace in one config, all land.
+
+    Unlocked, a read-modify-replace racing another dropped the other's trust.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    config_path = home / ".claude.json"
+    config_path.write_text(json.dumps({"oauthAccount": {"x": 1}, "pad": "x" * 250_000}))
+    workspaces = [tmp_path / f"ws{i}" for i in range(12)]
+    for workspace in workspaces:
+        workspace.mkdir()
+    code = (
+        "import sys; from pathlib import Path; "
+        "from omnigent.harnesses.claude_native.bridge import ensure_claude_workspace_trusted; "
+        "ensure_claude_workspace_trusted(Path(sys.argv[1]))"
+    )
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_CUSTOM_OAUTH_URL")
+    }
+    env["HOME"] = str(home)
+    procs = [
+        subprocess.Popen([sys.executable, "-c", code, str(workspace)], env=env)
+        for workspace in workspaces
+    ]
+    assert [proc.wait(timeout=120) for proc in procs] == [0] * len(workspaces)
+
+    data = json.loads(config_path.read_text())
+    for workspace in workspaces:
+        assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
+    assert data["oauthAccount"] == {"x": 1}
+    assert len(data["pad"]) == 250_000
+    assert sorted(path.name for path in home.iterdir()) == [".claude.json"]
 
 
 def test_ensure_trusted_seeds_legacy_config_when_present(
