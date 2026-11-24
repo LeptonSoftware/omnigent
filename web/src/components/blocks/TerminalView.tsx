@@ -37,7 +37,15 @@ import {
   subscribeTerminalTheme,
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
+import {
+  readTerminalKeysMode,
+  resolveTerminalKeysVisible,
+  subscribeTerminalKeys,
+  type TerminalKeysMode,
+} from "@/lib/terminalKeysPreferences";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
+import { TerminalKeyRow, terminalRowKeyBytes, type TerminalRowKey } from "./TerminalKeyRow";
 import {
   TerminalClipboardPrompt,
   type TerminalClipboardDecision,
@@ -277,6 +285,10 @@ export function TerminalView({
   useEffect(() => subscribeTerminalTheme(setTerminalMode), []);
   const isDark = resolveTerminalIsDark(terminalMode, resolvedMode === "dark");
   const terminalBackground = terminalTheme(isDark).background;
+  const isCoarsePointer = useIsCoarsePointer();
+  const [keysMode, setKeysMode] = useState<TerminalKeysMode>(() => readTerminalKeysMode());
+  useEffect(() => subscribeTerminalKeys(setKeysMode), []);
+  const showKeyRow = !readOnly && resolveTerminalKeysVisible(keysMode, isCoarsePointer);
   // Stable ref so the theme-update effect can reach the live session
   // without adding isDark to the attachSession deps (which would
   // reconnect the WebSocket on every theme change).
@@ -470,6 +482,13 @@ export function TerminalView({
     },
     [clipboardPrompt, clipboardScope, clipboardScopeEpoch, queueSessionClipboardCopy, readOnly],
   );
+
+  // Read DECCKM per tap: the pane program can switch it at any time.
+  const sendRowKey = useCallback((key: TerminalRowKey) => {
+    const session = sessionRef.current;
+    if (session === null) return;
+    session.sendInput(terminalRowKeyBytes(key, session.usesApplicationCursorKeys()));
+  }, []);
 
   const dismissClipboardPrompt = useCallback(() => {
     clipboardRequestGenerationRef.current += 1;
@@ -790,6 +809,8 @@ export function TerminalView({
           />
         )}
       </div>
+      {/* A flex sibling, so the terminal area shrinks and its ResizeObserver re-fits xterm. */}
+      {showKeyRow && <TerminalKeyRow disabled={state.kind !== "connected"} onKey={sendRowKey} />}
     </div>
   );
 }

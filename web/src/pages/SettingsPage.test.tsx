@@ -11,6 +11,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import * as host from "@/lib/host";
+import { subscribeTerminalKeys } from "@/lib/terminalKeysPreferences";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -591,6 +592,40 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "false");
   });
 
+  it("renders Terminal keys after Terminal theme with Touch screens selected by default", () => {
+    renderPage("/settings/appearance");
+    const group = screen.getByRole("radiogroup", { name: "Terminal keys" });
+    expect(group).toHaveClass("inline-flex");
+    expect(screen.getByText("Terminal keys").closest("[data-testid]")).toHaveAttribute(
+      "data-testid",
+      "settings-group-theme",
+    );
+    const terminalTheme = screen.getByText("Terminal theme");
+    expect(
+      terminalTheme.compareDocumentPosition(screen.getByText("Terminal keys")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.getByTestId("terminal-keys-auto")).toHaveAccessibleName("Touch screens");
+    expect(screen.getByTestId("terminal-keys-auto")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("terminal-keys-on")).toHaveAccessibleName("Always");
+    expect(screen.getByTestId("terminal-keys-off")).toHaveAccessibleName("Never");
+    expect(localStorage.getItem("omnigent:terminal-keys")).toBeNull();
+  });
+
+  it("persists Terminal keys choices and reflects a stored one on mount", () => {
+    renderPage("/settings/appearance");
+    fireEvent.click(screen.getByTestId("terminal-keys-off"));
+    expect(localStorage.getItem("omnigent:terminal-keys")).toBe("off");
+    expect(screen.getByTestId("terminal-keys-off")).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(screen.getByTestId("terminal-keys-on"));
+    expect(localStorage.getItem("omnigent:terminal-keys")).toBe("on");
+    cleanup();
+
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("terminal-keys-on")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("terminal-keys-auto")).toHaveAttribute("aria-checked", "false");
+  });
+
   it("defaults transcripts to Chat and persists a Terminal default", () => {
     renderPage("/settings/appearance");
 
@@ -839,6 +874,7 @@ describe("SettingsPage", () => {
     mocks.theme = "dark";
     fireEvent.click(screen.getByTestId("theme-dark"));
     fireEvent.click(screen.getByTestId("terminal-theme-dark"));
+    fireEvent.click(screen.getByTestId("terminal-keys-off"));
     fireEvent.change(screen.getByTestId("color-theme-select") as HTMLSelectElement, {
       target: { value: "github" },
     });
@@ -860,6 +896,7 @@ describe("SettingsPage", () => {
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
+    expect(localStorage.getItem("omnigent:terminal-keys")).toBe("off");
     expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
     expect(localStorage.getItem("omnigent:default-workspace-panel")).toBe("open");
@@ -868,9 +905,15 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
 
+    // Mounted terminals hear the key row reset live.
+    const terminalKeysListener = vi.fn();
+    const unsubscribeTerminalKeys = subscribeTerminalKeys(terminalKeysListener);
+
     // Open the confirmation dialog and confirm the reset.
     fireEvent.click(screen.getByTestId("reset-appearance-button"));
     fireEvent.click(screen.getByTestId("reset-appearance-confirm"));
+    unsubscribeTerminalKeys();
+    expect(terminalKeysListener).toHaveBeenCalledWith("auto");
 
     // Mode is restored to "system".
     expect(mocks.setTheme).toHaveBeenCalledWith("system");
@@ -892,6 +935,8 @@ describe("SettingsPage", () => {
 
     // Terminal theme, transcript view, workspace defaults, and harness visibility are restored.
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("terminal-keys-auto")).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem("omnigent:terminal-keys")).toBeNull();
     expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
       "aria-checked",
       "true",

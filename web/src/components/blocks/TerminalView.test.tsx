@@ -22,6 +22,7 @@ import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
+import { writeTerminalKeysMode } from "@/lib/terminalKeysPreferences";
 import type { ConnectionState } from "./TerminalSession";
 import {
   TerminalView,
@@ -81,6 +82,8 @@ const terminalSessionMock = vi.hoisted(() => ({
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
+    sendInput: ReturnType<typeof vi.fn>;
+    usesApplicationCursorKeys: ReturnType<typeof vi.fn>;
   }[],
 }));
 
@@ -93,6 +96,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     focus = vi.fn();
+    sendInput = vi.fn();
+    usesApplicationCursorKeys = vi.fn(() => false);
 
     constructor(
       container: HTMLDivElement,
@@ -119,6 +124,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
+        sendInput: this.sendInput,
+        usesApplicationCursorKeys: this.usesApplicationCursorKeys,
       });
     }
   },
@@ -1135,6 +1142,121 @@ describe("terminal clipboard", () => {
     await requestClipboard("next selection");
     expect(clipboardMock.copyText).toHaveBeenCalledTimes(2);
     expect(visibleClipboardConsent()).toHaveTextContent("Copy needs a click");
+  });
+});
+
+describe("touch key row", () => {
+  function stubCoarsePointer(): void {
+    const matchMedia = window.matchMedia;
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...matchMedia(query),
+      matches: query.includes("pointer: coarse"),
+    }));
+  }
+
+  async function renderConnected(props: { readOnly?: boolean } = {}) {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" {...props} />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const inst = terminalSessionMock.instances[0];
+    act(() => inst.onState({ kind: "connected" }));
+    return inst;
+  }
+
+  it("sends the tapped key's bytes through the session", async () => {
+    stubCoarsePointer();
+    const inst = await renderConnected();
+
+    fireEvent.click(screen.getByRole("button", { name: "Down arrow" }));
+    fireEvent.click(screen.getByRole("button", { name: "Enter" }));
+    fireEvent.click(screen.getByRole("button", { name: "Control C" }));
+
+    expect(inst.sendInput.mock.calls).toEqual([["\x1b[B"], ["\r"], ["\x03"]]);
+    expect(inst.focus).not.toHaveBeenCalled();
+  });
+
+  it("reads application cursor mode at tap time", async () => {
+    stubCoarsePointer();
+    const inst = await renderConnected();
+
+    fireEvent.click(screen.getByRole("button", { name: "Up arrow" }));
+    inst.usesApplicationCursorKeys.mockReturnValue(true);
+    fireEvent.click(screen.getByRole("button", { name: "Up arrow" }));
+
+    expect(inst.sendInput.mock.calls).toEqual([["\x1b[A"], ["\x1bOA"]]);
+  });
+
+  it("prevents mousedown, not pointerdown, so a tap leaves the soft keyboard as it was", async () => {
+    stubCoarsePointer();
+    await renderConnected();
+    const escape = screen.getByRole("button", { name: "Escape" });
+    expect(fireEvent.mouseDown(escape)).toBe(false);
+    expect(fireEvent.pointerDown(escape)).toBe(true);
+  });
+
+  it("sits below the terminal area as a flex sibling, outside the status overlay", async () => {
+    stubCoarsePointer();
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const view = screen.getByTestId("terminal-view");
+    const row = screen.getByTestId("terminal-key-row");
+    // A direct child after the flex-1 terminal area, so xterm's area shrinks
+    // and its ResizeObserver re-fits instead of the row overlapping it.
+    expect(row.parentElement).toBe(view);
+    expect(view.lastElementChild).toBe(row);
+    expect(row.previousElementSibling).toHaveClass("flex-1", "min-h-0");
+    expect(row.previousElementSibling).toContainElement(screen.getByText("Connecting…"));
+  });
+
+  it("stays visible but disabled until the bridge connects", async () => {
+    stubCoarsePointer();
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const enter = screen.getByRole("button", { name: "Enter" });
+    expect(enter).toBeDisabled();
+
+    act(() => terminalSessionMock.instances[0].onState({ kind: "connected" }));
+    expect(enter).toBeEnabled();
+
+    act(() =>
+      terminalSessionMock.instances[0].onState({ kind: "closed", reason: "bye", code: 4405 }),
+    );
+    expect(enter).toBeDisabled();
+  });
+
+  it("hides the row for a read-only attach", async () => {
+    stubCoarsePointer();
+    await renderConnected({ readOnly: true });
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+  });
+
+  it("hides the row in auto mode with a fine pointer", async () => {
+    await renderConnected();
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+  });
+
+  it("hides the row when the preference is off, even on a touch screen", async () => {
+    stubCoarsePointer();
+    localStorage.setItem("omnigent:terminal-keys", "off");
+    await renderConnected();
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+  });
+
+  it("shows the row when the preference is on, even with a fine pointer", async () => {
+    localStorage.setItem("omnigent:terminal-keys", "on");
+    await renderConnected();
+    expect(screen.getByTestId("terminal-key-row")).toBeInTheDocument();
+  });
+
+  it("applies a Settings change to a mounted terminal live", async () => {
+    stubCoarsePointer();
+    await renderConnected();
+    expect(screen.getByTestId("terminal-key-row")).toBeInTheDocument();
+
+    act(() => writeTerminalKeysMode("off"));
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+
+    act(() => writeTerminalKeysMode("auto"));
+    expect(screen.getByTestId("terminal-key-row")).toBeInTheDocument();
   });
 });
 
