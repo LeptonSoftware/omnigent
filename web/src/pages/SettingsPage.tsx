@@ -11,8 +11,8 @@
  *
  * - **General** — app-wide behavior preferences.
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
- *   default transcript view, Workspace panel and tab defaults, and UI/code font
- *   controls.
+ *   terminal key row, default transcript view, Workspace panel and tab
+ *   defaults, and UI/code font controls.
  * - **Git** — Git behavior: the global "always use a random worktree" default
  *   and the default base branch pre-filled when naming a new worktree branch.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
@@ -51,6 +51,8 @@ import {
   FileDiffIcon,
   FilesIcon,
   GitPullRequestIcon,
+  KeyboardIcon,
+  KeyboardOffIcon,
   KeyRoundIcon,
   Loader2Icon,
   LogOutIcon,
@@ -64,6 +66,7 @@ import {
   SunIcon,
   SquareCheckIcon,
   SquareIcon,
+  TabletSmartphoneIcon,
   TerminalIcon,
   Trash2Icon,
   UploadIcon,
@@ -173,6 +176,12 @@ import {
   writeTerminalThemeMode,
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
+import {
+  readTerminalKeysMode,
+  TERMINAL_KEYS_DEFAULT,
+  writeTerminalKeysMode,
+  type TerminalKeysMode,
+} from "@/lib/terminalKeysPreferences";
 import {
   canRememberTerminalClipboardPreference,
   readTerminalClipboardPreference,
@@ -406,6 +415,12 @@ const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof
   { mode: "dark", label: "Dark", icon: MoonIcon },
 ];
 
+const terminalKeysCards: { mode: TerminalKeysMode; label: string; icon: typeof SunIcon }[] = [
+  { mode: "auto", label: "Touch screens", icon: TabletSmartphoneIcon },
+  { mode: "on", label: "Always", icon: KeyboardIcon },
+  { mode: "off", label: "Never", icon: KeyboardOffIcon },
+];
+
 const transcriptViewCards: {
   value: TranscriptViewDefault;
   label: string;
@@ -518,6 +533,38 @@ function TerminalThemeControl() {
         items={terminalThemeCards.map((card) => ({
           value: card.mode,
           testId: `terminal-theme-${card.mode}`,
+          label: card.label,
+          icon: card.icon,
+        }))}
+      />
+    </div>
+  );
+}
+
+/** Key row under the terminal (Esc, Tab, arrows, Enter, ^C) for touch screens. */
+function TerminalKeysControl() {
+  const [mode, setMode] = useState(() => readTerminalKeysMode());
+  const labelId = useId();
+  const choose = useCallback((next: TerminalKeysMode) => {
+    setMode(next);
+    writeTerminalKeysMode(next);
+  }, []);
+  return (
+    <div className="flex items-center justify-between gap-4">
+      <SettingsLabel
+        label="Terminal keys"
+        labelId={labelId}
+        description="Show Esc, Tab, arrow, Enter and ^C keys under the terminal."
+        className="flex-1"
+      />
+      <IconSegmentedControl<TerminalKeysMode>
+        labelledBy={labelId}
+        value={mode}
+        onSelect={choose}
+        componentId="settings.appearance.terminal_keys"
+        items={terminalKeysCards.map((card) => ({
+          value: card.mode,
+          testId: `terminal-keys-${card.mode}`,
           label: card.label,
           icon: card.icon,
         }))}
@@ -845,6 +892,7 @@ function AppearanceSection() {
     setTheme("system");
 
     writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
+    writeTerminalKeysMode(TERMINAL_KEYS_DEFAULT);
 
     writeThemePalette(DEFAULT_PALETTE);
     applyThemePalette(DEFAULT_PALETTE);
@@ -878,6 +926,7 @@ function AppearanceSection() {
           "omnigent:code-font-family",
           "omnigent:code-font-weight",
           "omnigent:terminal-theme",
+          "omnigent:terminal-keys",
           "omnigent:ui-theme-palette",
           "omnigent:custom-theme",
           "omnigent:default-transcript-view",
@@ -980,6 +1029,9 @@ function AppearanceSection() {
             )}
             <div className="mt-4 border-t border-border pt-4">
               <TerminalThemeControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <TerminalKeysControl />
             </div>
             <div className="mt-4 border-t border-border pt-4">
               <ColorThemeControl />

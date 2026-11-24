@@ -988,6 +988,19 @@ export class TerminalSession {
   }
 
   /**
+   * Send bytes as if typed (the on-screen key row). `term.input` fires the
+   * same `onData` path as a keystroke: input stamp, `onInput`, WS-open guard.
+   */
+  sendInput(data: string): void {
+    this.term.input(data, true);
+  }
+
+  /** Whether the pane program enabled application cursor keys (DECCKM). */
+  usesApplicationCursorKeys(): boolean {
+    return this.term.modes.applicationCursorKeysMode;
+  }
+
+  /**
    * Update the terminal's code font without reconnecting —
    * mirrors {@link setTheme}, mutating options in place. A new glyph size
    * changes the character-cell dimensions, so this re-fits the grid to the

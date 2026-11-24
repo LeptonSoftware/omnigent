@@ -1200,6 +1200,60 @@ describe("TerminalSession", () => {
     expect(socket.closed).toBe(false);
   });
 
+  it("sendInput takes the keystroke path: onInput, input stamp, then the socket", () => {
+    vi.spyOn(performance, "now").mockReturnValue(5000);
+    const onInput = vi.fn();
+    const { socket, session } = makeSession(undefined, onInput);
+    socket.open();
+    socket.sent = [];
+
+    session.sendInput("\x1b[B");
+
+    expect(onInput).toHaveBeenCalledTimes(1);
+    expect((session as unknown as { lastUserInputAt: number }).lastUserInputAt).toBe(5000);
+    expect(socket.sent).toEqual([new TextEncoder().encode("\x1b[B")]);
+    session.dispose();
+  });
+
+  it("sendInput drops the bytes while the socket is not open", () => {
+    const onInput = vi.fn();
+    const { socket, session } = makeSession(undefined, onInput);
+
+    session.sendInput("\r");
+
+    expect(onInput).toHaveBeenCalledTimes(1);
+    expect(socket.sent).toEqual([]);
+    session.dispose();
+  });
+
+  it("sendInput marks the bytes as user input (scroll to bottom, clear selection)", () => {
+    const { session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const inputSpy = vi.spyOn(term, "input");
+
+    session.sendInput("\x1b");
+
+    expect(inputSpy).toHaveBeenCalledWith("\x1b", true);
+    session.dispose();
+  });
+
+  it("reports the pane program's application cursor keys mode live", async () => {
+    const { session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    expect(session.usesApplicationCursorKeys()).toBe(false);
+
+    await new Promise<void>((resolve) => {
+      term.write("\x1b[?1h", resolve);
+    });
+    expect(session.usesApplicationCursorKeys()).toBe(true);
+
+    await new Promise<void>((resolve) => {
+      term.write("\x1b[?1l", resolve);
+    });
+    expect(session.usesApplicationCursorKeys()).toBe(false);
+    session.dispose();
+  });
+
   it("observes the container for resize", () => {
     // WHY: layout changes (window resize, font load) must propagate a resize
     // frame, so the session must register a ResizeObserver on its container.
