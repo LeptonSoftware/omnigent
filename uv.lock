@@ -1,12 +1,24 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
-    "python_full_version >= '3.14' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*'",
-    "python_full_version < '3.13' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and sys_platform != 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version >= '3.14' and sys_platform == 'win32' and extra == 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox' and extra != 'extra-8-omnigent-databricks' and extra != 'extra-8-omnigent-modal' and extra != 'group-8-omnigent-dev' and extra != 'group-8-omnigent-lint'",
+    "python_full_version >= '3.15' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version == '3.14.*' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version >= '3.14' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version >= '3.14' and sys_platform != 'win32' and extra == 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox' and extra != 'extra-8-omnigent-databricks' and extra != 'extra-8-omnigent-modal' and extra != 'group-8-omnigent-dev' and extra != 'group-8-omnigent-lint'",
+    "python_full_version >= '3.15' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version == '3.14.*' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version == '3.13.*' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version == '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox' and extra != 'extra-8-omnigent-databricks' and extra != 'extra-8-omnigent-modal' and extra != 'group-8-omnigent-dev' and extra != 'group-8-omnigent-lint'",
+    "python_full_version == '3.13.*' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version < '3.13' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version < '3.13' and sys_platform == 'win32' and extra == 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox' and extra != 'extra-8-omnigent-databricks' and extra != 'extra-8-omnigent-modal' and extra != 'group-8-omnigent-dev' and extra != 'group-8-omnigent-lint'",
+    "python_full_version < '3.13' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version < '3.13' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version < '3.13' and sys_platform != 'win32' and extra == 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox' and extra != 'extra-8-omnigent-databricks' and extra != 'extra-8-omnigent-modal' and extra != 'group-8-omnigent-dev' and extra != 'group-8-omnigent-lint'",
+    "python_full_version < '3.13' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
 ]
 conflicts = [[
     { package = "omnigent", extra = "antigravity" },
@@ -81,7 +93,7 @@ dependencies = [
     { name = "frozenlist" },
     { name = "multidict" },
     { name = "propcache" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
     { name = "yarl" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/58/d9/22ce5786ac0c1653ae8b6c23bded02c1686d11f0dbb45b31ce128e0df985/aiohttp-3.14.3.tar.gz", hash = "sha256:9491196535a88924a60afd5b5f434b5b203b6cc616250878dbdb223a8f7844bc", size = 7971213, upload-time = "2026-07-23T01:57:27.037Z" }
@@ -188,7 +200,7 @@ version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "frozenlist" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/61/62/06741b579156360248d1ec624842ad0edf697050bbaf7c3e46394e106ad1/aiosignal-1.4.0.tar.gz", hash = "sha256:f47eecd9468083c2029cc99945502cb7708b082c232f9aca65da147157b251c7", size = 25007, upload-time = "2025-07-03T22:54:43.528Z" }
 wheels = [
@@ -242,7 +254,7 @@ version = "4.14.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "idna" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/61/cc/a381afa6efea9f496eff839d4a6a1aed3bfafc7b3ab4b0d1b243a12573dd/anyio-4.14.2.tar.gz", hash = "sha256:cfa139f3ed1a23ee8f88a145ddb5ac7605b8bbfd8592baacd7ce3d8bb4313c7f", size = 260176, upload-time = "2026-07-12T20:29:07.082Z" }
 wheels = [
@@ -380,21 +392,21 @@ wheels = [
 
 [[package]]
 name = "boxlite"
-version = "0.9.5"
+version = "0.13.1"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/39/15/ba26c392e0e4d9dbde10ac8ece830e08c0fd3ef341852605d03c4394ddee/boxlite-0.9.5-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:4a9a8bbdadf51980e7791430f00e63fb8104e454b4efe266dde3d8535fd512f5", size = 34861042, upload-time = "2026-05-16T13:47:34.689Z" },
-    { url = "https://files.pythonhosted.org/packages/94/a4/fb96c5c94d88d784597f8c24e9984a7b7287075cb091afc7ddc556854efa/boxlite-0.9.5-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:3262b942e2157255428a3f371a49c72f65afe115ae12bfc19257a61fa153c002", size = 37011336, upload-time = "2026-05-16T13:47:37.907Z" },
-    { url = "https://files.pythonhosted.org/packages/61/cb/bcfa2dd8caa40f75c1640b9e50d2ba61fcc788263cb68070df095a28fd7b/boxlite-0.9.5-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:f195df633219be69fec6492bde7a66fe3bda2c02d76226f80ae1ddd46b388498", size = 33112198, upload-time = "2026-05-16T13:47:41.218Z" },
-    { url = "https://files.pythonhosted.org/packages/65/1c/0c6399665aeeb057312b50600aaf7b56791aa5d174e914363aa58542e5de/boxlite-0.9.5-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:a092252f8df79cb8da95d2c6f8d5865f6917e9d41b24b27b3dd301ee66988813", size = 34861292, upload-time = "2026-05-16T13:47:44.081Z" },
-    { url = "https://files.pythonhosted.org/packages/90/24/7f51aca1d85e0c0bda82cc10af0c82f39b316fbca062738b030324501f78/boxlite-0.9.5-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:515cbab5376b4a81ad67e1f3aacae4692978d13710c2a412874c9d9ff5475556", size = 37010785, upload-time = "2026-05-16T13:47:47.414Z" },
-    { url = "https://files.pythonhosted.org/packages/62/7d/ce13d093e4f2653f28efd4ae89989a286f4aa00d910b051e90e44c2ee30b/boxlite-0.9.5-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:4e2df5236136c9f263114671c649a27c15fb57c809e15a8771cf0c9176c70c02", size = 33110395, upload-time = "2026-05-16T13:47:50.382Z" },
-    { url = "https://files.pythonhosted.org/packages/ee/8f/03ddd8915aebde31534e7b28b4a40e5b386e84ac0774760f60c81ec20b44/boxlite-0.9.5-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:51ccae9d665189278a194451e2178ed60e5f0eab0f2993f863bc6f670a4da890", size = 34861146, upload-time = "2026-05-16T13:47:53.397Z" },
-    { url = "https://files.pythonhosted.org/packages/f8/80/9eede0dd4e36c77ee8fcab3161ef98d39efc6eff3ed78643517458e62c80/boxlite-0.9.5-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:1ea7405f6bc64467e9152ada50bd0beb1ef04de475789c762c0c13a6f2c7b7ee", size = 37011759, upload-time = "2026-05-16T13:47:56.802Z" },
-    { url = "https://files.pythonhosted.org/packages/28/11/debb90db06be5d00b8852669b59a559e8b1b498686b9bfd5ed7718ed10a4/boxlite-0.9.5-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:40b441fb5d602a737e085d9f2a5702f4aa609442c6ec972a7f7a3fa5562e2e36", size = 33109317, upload-time = "2026-05-16T13:47:59.616Z" },
-    { url = "https://files.pythonhosted.org/packages/d0/bf/375e3e8994786946ffe76ff02b814394aac4b05f7b3aa36e969dbd098341/boxlite-0.9.5-cp314-cp314t-macosx_14_0_arm64.whl", hash = "sha256:ae3dce0bf2ac1449f906aea62cb439a6778b8192581fc1d2bf9ff46321896b64", size = 34864330, upload-time = "2026-05-16T13:48:02.687Z" },
-    { url = "https://files.pythonhosted.org/packages/49/ae/f9e7e6da083e4846d598d0c795f86505df0e44c4b76e13dbb74c2ff15fbc/boxlite-0.9.5-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:4ac2ff04991807d97451c51f5fb25769559eddfb10a0017eabe8ce996c4d83f9", size = 37012881, upload-time = "2026-05-16T13:48:06.412Z" },
-    { url = "https://files.pythonhosted.org/packages/6a/db/25c828b044dea57058b148dafec2348243b782b1090aeb388eccd0407a53/boxlite-0.9.5-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:d8f00bb59724d5bd88452347f8f104f8fc8c8d1f3bca3b39df455d184eceb1eb", size = 33113959, upload-time = "2026-05-16T13:52:06.276Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/39/b5a1780730db9bb82e3f4c518c1482647c73db3c4658b395dbd8b18f1cf0/boxlite-0.13.1-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:563e1a211a8beb8a10f06423b2e1c148341d7bb013ce3d7444fa627c50c28f07", size = 41401539, upload-time = "2026-11-12T13:33:43.567Z" },
+    { url = "https://files.pythonhosted.org/packages/ff/1e/44aeec26f92c9545ea7aff05980765290edcc4210415b711eb97c5c496f9/boxlite-0.13.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:d2139a074f44d9162d7106f40c248ff1df98f1a797fb75c52c32f1976eea59d9", size = 43710599, upload-time = "2026-11-12T13:33:48.129Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/0b/269cfad786f4a80fd2abc62bd18a22ef767cb7471642cd346ee8d015e61d/boxlite-0.13.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:6943e0b482912cba3d6a2d692bac409a1c091661cb8eef96b793ae4c29f7f27c", size = 40087058, upload-time = "2026-11-12T13:33:53.245Z" },
+    { url = "https://files.pythonhosted.org/packages/88/04/7e3951cd35fb7260e1a74f764b568509e521e56f6bd0ca0727ef3bea31c9/boxlite-0.13.1-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:155e143034f12199b8f1489a353aaea1737e316984f645a2e8d12c7f12960946", size = 41403145, upload-time = "2026-11-12T13:33:58.31Z" },
+    { url = "https://files.pythonhosted.org/packages/89/28/f36960c7aa5b82a4565fde01d4583b82205af18e7f64833a453f6e392212/boxlite-0.13.1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:0b797066c5ac34b83ee9880d7ad8bbf39e10c267bc14653ba68a277913079f62", size = 43709157, upload-time = "2026-11-12T13:34:03.288Z" },
+    { url = "https://files.pythonhosted.org/packages/62/00/b1c9879ba5937222aff5197dd3159318d5fa9539ce0980e81fb737aa0bd5/boxlite-0.13.1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:5025165376379b7d908e2fe6f793f879c685e6574470c30ce45828235855363b", size = 40087172, upload-time = "2026-11-12T13:34:08.474Z" },
+    { url = "https://files.pythonhosted.org/packages/69/50/68f6b03b0afd2391507d4e1445eadb307002f4809325bef65c93ebedfcb5/boxlite-0.13.1-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:eb7215ed9a5c9a1815b6af417705e2a25dfe51d9e3a2d4bd475c9f6f1361ca42", size = 41396634, upload-time = "2026-11-12T13:34:12.966Z" },
+    { url = "https://files.pythonhosted.org/packages/e1/5a/4b2bdb6a3f2965d01f4c36fa967668a6c9ab19e6aa7b0674a60787050292/boxlite-0.13.1-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:c88ae3076918c7bf7693cebe60a13b7e3b5043535e6ca548b2090139a8b49f15", size = 43709413, upload-time = "2026-11-12T13:34:18.671Z" },
+    { url = "https://files.pythonhosted.org/packages/90/66/e6d2d048da59ceae70fd62bccfefe072221ce6b4110729e05a1a36bb134a/boxlite-0.13.1-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:e89f98303ad4f2bed52269c4214d37d71a4eb4e24e6772ff7e4d125b0cd28add", size = 40080914, upload-time = "2026-11-12T13:34:23.412Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/94/e8119bf8411eb64aac492ce6cd395a9c734204c7574d2eb186f5fff89e21/boxlite-0.13.1-cp314-cp314t-macosx_14_0_arm64.whl", hash = "sha256:36a5fc5a5141d58dfd30e70f41813c9ec2840a26d1aea50a3da641c3ab82845b", size = 41405387, upload-time = "2026-11-12T13:34:28.758Z" },
+    { url = "https://files.pythonhosted.org/packages/55/a6/53a65db73a8918e04271446c3d3bd3e02e68d91a6e66ef9785f7a7d47e7b/boxlite-0.13.1-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:40292dc96bcc8a3ef6cc9394a6faf019775f2704a2f8c3997a7746c0a0f50a91", size = 43716915, upload-time = "2026-11-12T13:34:33.754Z" },
+    { url = "https://files.pythonhosted.org/packages/f9/3d/1535b33d78cbfff43278414d28aa24d53aee25c3d98851e503cac663dafc/boxlite-0.13.1-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:753243bdd066d89c3563584153bcd206bc1deed4fe8b062949b6a6e9bda96c6f", size = 40090514, upload-time = "2026-11-12T13:34:39.143Z" },
 ]
 
 [[package]]
@@ -449,7 +461,7 @@ name = "build"
 version = "1.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "os_name == 'nt' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "colorama", marker = "os_name == 'nt'" },
     { name = "packaging" },
     { name = "pyproject-hooks" },
 ]
@@ -537,7 +549,7 @@ name = "cffi"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pycparser", marker = "implementation_name != 'PyPy' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "pycparser", marker = "implementation_name != 'PyPy'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/eb/56/b1ba7935a17738ae8453301356628e8147c79dbb825bcbc73dc7401f9846/cffi-2.0.0.tar.gz", hash = "sha256:44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529", size = 523588, upload-time = "2025-09-08T23:24:04.541Z" }
 wheels = [
@@ -694,7 +706,7 @@ name = "click"
 version = "8.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "colorama", marker = "sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/9b/98/518d8e5081007684232226f475082b30087d0f585e8457db087298259f49/click-8.4.1.tar.gz", hash = "sha256:918b5633eddf6b41c32d4f454bf0de810065c74e3f7dbf8ee5452f8be88d3e96", size = 353007, upload-time = "2026-05-22T04:08:37.769Z" }
 wheels = [
@@ -883,7 +895,7 @@ name = "cryptography"
 version = "50.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "cffi", marker = "platform_python_implementation != 'PyPy'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/bb/ad/5d6702db60b1e40b41ef513b6967ff5848f307d50f8449baf1634f5908f1/cryptography-50.0.1.tar.gz", hash = "sha256:5dd9bda1c12b4162f6ff568eeb5e0ff956c28d14406e875cfe8a63a2d414ff20", size = 880381, upload-time = "2026-08-25T19:45:45.499Z" }
 wheels = [
@@ -1040,16 +1052,23 @@ name = "databricks-sdk"
 version = "0.115.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.14' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*'",
-    "python_full_version < '3.13' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and sys_platform != 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version >= '3.15' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version == '3.14.*' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version >= '3.14' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version >= '3.15' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version == '3.14.*' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version == '3.13.*' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version == '3.13.*' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version < '3.13' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version < '3.13' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version < '3.13' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version < '3.13' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
 ]
 dependencies = [
-    { name = "google-auth", marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
-    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
-    { name = "requests", marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "google-auth", marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
+    { name = "requests", marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/be/49/1fd8121d4517849ea67fddbd827e535871b94037fab985235c011fdc60d1/databricks_sdk-0.115.0.tar.gz", hash = "sha256:a91f219313ea1afcde9575ea083825cbcb3dde2d00cb4c858c49d9dfd61b3129", size = 965481, upload-time = "2026-06-08T09:43:01.138Z" }
 wheels = [
@@ -1234,7 +1253,7 @@ dependencies = [
     { name = "httpcore" },
     { name = "httpx" },
     { name = "packaging" },
-    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
     { name = "python-dateutil" },
     { name = "rich" },
@@ -1470,8 +1489,8 @@ name = "gevent"
 version = "26.7.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "(platform_python_implementation == 'CPython' and sys_platform == 'win32') or (platform_python_implementation != 'CPython' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (platform_python_implementation != 'CPython' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (platform_python_implementation != 'CPython' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (platform_python_implementation != 'CPython' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (platform_python_implementation != 'CPython' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or (sys_platform != 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (sys_platform != 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (sys_platform != 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (sys_platform != 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (sys_platform != 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
-    { name = "greenlet", marker = "platform_python_implementation == 'CPython' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "cffi", marker = "platform_python_implementation == 'CPython' and sys_platform == 'win32'" },
+    { name = "greenlet", marker = "platform_python_implementation == 'CPython'" },
     { name = "zope-event" },
     { name = "zope-interface" },
 ]
@@ -1718,7 +1737,7 @@ name = "googleapis-common-protos"
 version = "1.75.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b5/c8/f439cffde755cffa462bfbb156278fa6f9d09119719af9814b858fd4f81f/googleapis_common_protos-1.75.0.tar.gz", hash = "sha256:53a062ff3c32552fbd62c11fe23768b78e4ddf0494d5e5fd97d3f4689c75fbbd", size = 151035, upload-time = "2026-05-07T08:04:49.423Z" }
@@ -2363,9 +2382,9 @@ dependencies = [
     { name = "jaraco-classes" },
     { name = "jaraco-context" },
     { name = "jaraco-functools" },
-    { name = "jeepney", marker = "sys_platform == 'linux' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
-    { name = "pywin32-ctypes", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
-    { name = "secretstorage", marker = "sys_platform == 'linux' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "jeepney", marker = "sys_platform == 'linux'" },
+    { name = "pywin32-ctypes", marker = "sys_platform == 'win32'" },
+    { name = "secretstorage", marker = "sys_platform == 'linux'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/43/4b/674af6ef2f97d56f0ab5153bf0bfa28ccb6c3ed4d1babf4305449668807b/keyring-25.7.0.tar.gz", hash = "sha256:fe01bd85eb3f8fb3dd0405defdeac9a5b4f6f0439edbb3149577f244a2e8245b", size = 63516, upload-time = "2025-11-16T16:26:09.482Z" }
 wheels = [
@@ -2504,7 +2523,7 @@ dependencies = [
     { name = "pytest" },
     { name = "python-engineio" },
     { name = "python-socketio", extra = ["client"] },
-    { name = "pywin32", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "pywin32", marker = "sys_platform == 'win32'" },
     { name = "pyzmq" },
     { name = "requests" },
     { name = "werkzeug" },
@@ -2668,12 +2687,12 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "pyjwt", extra = ["crypto"] },
     { name = "python-multipart" },
-    { name = "pywin32", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "pywin32", marker = "sys_platform == 'win32'" },
     { name = "sse-starlette" },
     { name = "starlette" },
     { name = "typing-extensions" },
     { name = "typing-inspection" },
-    { name = "uvicorn", marker = "sys_platform != 'emscripten' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "uvicorn", marker = "sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6e/77/9450b8f251a13affb6281997d0523c4615f8a8b35d0b21ff30db3a5aac9d/mcp-1.28.1.tar.gz", hash = "sha256:d51e36a5f5644faea4f85ea649bfffa6bc6c26770d42798ad6a3de3d2ba69683", size = 638501, upload-time = "2026-06-26T12:57:29.093Z" }
 wheels = [
@@ -3140,7 +3159,7 @@ name = "obstore"
 version = "0.8.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a3/8c/9ec984edd0f3b72226adfaa19b1c61b15823b35b52f311ca4af36d009d15/obstore-0.8.2.tar.gz", hash = "sha256:a467bc4e97169e2ba749981b4fd0936015428d9b8f3fb83a5528536b1b6f377f", size = 168852, upload-time = "2025-09-16T15:34:55.786Z" }
 wheels = [
@@ -3188,6 +3207,7 @@ wheels = [
 name = "omnigent"
 version = "0.19.0.dev0"
 source = { editable = "." }
+default-groups = []
 dependencies = [
     { name = "alembic" },
     { name = "anyio" },
@@ -3210,15 +3230,15 @@ dependencies = [
     { name = "openai-agents" },
     { name = "opentelemetry-api" },
     { name = "packaging" },
-    { name = "pexpect", marker = "sys_platform != 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "pexpect", marker = "sys_platform != 'win32'" },
     { name = "pillow" },
     { name = "prompt-toolkit" },
-    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
     { name = "psutil" },
     { name = "pydantic" },
     { name = "pyjwt", extra = ["crypto"] },
-    { name = "pyte", marker = "sys_platform != 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "pyte", marker = "sys_platform != 'win32'" },
     { name = "python-dateutil" },
     { name = "pyyaml" },
     { name = "rich" },
@@ -3226,7 +3246,7 @@ dependencies = [
     { name = "starlette" },
     { name = "tiktoken" },
     { name = "tomlkit" },
-    { name = "tzdata", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
     { name = "zstandard" },
@@ -3239,7 +3259,7 @@ agents-sdk = [
 ]
 all = [
     { name = "databricks-sdk", version = "0.67.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
-    { name = "databricks-sdk", version = "0.115.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "databricks-sdk", version = "0.115.0", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-instrumentation-fastapi" },
@@ -3279,7 +3299,7 @@ databricks = [
     { name = "databricks-mcp" },
     { name = "databricks-sdk", version = "0.115.0", source = { registry = "https://pypi.org/simple" } },
     { name = "opentelemetry-distro" },
-    { name = "psycopg", extra = ["binary"], marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "psycopg", extra = ["binary"], marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "pymysql" },
 ]
 daytona = [
@@ -3353,7 +3373,7 @@ dev = [
     { name = "filelock" },
     { name = "grpcio-tools" },
     { name = "hindsight-client" },
-    { name = "moto", extra = ["s3"], marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "moto", extra = ["s3"], marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "nimble-python" },
     { name = "pre-commit" },
     { name = "pyrefly" },
@@ -3567,7 +3587,7 @@ version = "0.2.1"
 source = { editable = ".github/triage_v2" }
 dependencies = [
     { name = "databricks-sdk", version = "0.67.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
-    { name = "databricks-sdk", version = "0.115.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "databricks-sdk", version = "0.115.0", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "pyjwt", extra = ["crypto"] },
 ]
 
@@ -3678,7 +3698,7 @@ dependencies = [
     { name = "cloudpickle" },
     { name = "grpcio" },
     { name = "httpx" },
-    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
 ]
 wheels = [
@@ -3876,7 +3896,7 @@ name = "opentelemetry-proto"
 version = "1.44.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint' or extra != 'extra-8-omnigent-antigravity'" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-databricks' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/64/01/40ac4ae9a149263cc52c2cee200ddd80cb6d8db1a4610abf8eabce0fe771/opentelemetry_proto-1.44.0.tar.gz", hash = "sha256:c547a79c2f8c0c515d31509154682e5921c7cfd5ca67b70e1f9266e2c3e103f3", size = 46488, upload-time = "2026-07-16T15:25:45.34Z" }
@@ -4091,7 +4111,7 @@ name = "pexpect"
 version = "4.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ptyprocess", marker = "python_full_version == '3.13.*' or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or sys_platform != 'win32'" },
+    { name = "ptyprocess" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/42/92/cc564bf6381ff43ce1f4d06852fc19a2f11d180f23dc32d9588bee2f149d/pexpect-4.9.0.tar.gz", hash = "sha256:ee7d41123f3c9911050ea2c2dac107568dc43b2d3b0c7557a33212c398ead30f", size = 166450, upload-time = "2023-11-25T09:07:26.339Z" }
 wheels = [
@@ -4354,11 +4374,18 @@ name = "protobuf"
 version = "6.33.6"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.14' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*'",
-    "python_full_version < '3.13' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and sys_platform != 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version >= '3.15' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version == '3.14.*' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version >= '3.14' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version >= '3.15' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version == '3.14.*' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version == '3.13.*' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version == '3.13.*' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version < '3.13' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version < '3.13' and sys_platform == 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
+    "python_full_version < '3.13' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox'",
+    "python_full_version < '3.13' and sys_platform != 'win32' and extra != 'extra-8-omnigent-antigravity' and extra != 'extra-8-omnigent-cwsandbox'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/66/70/e908e9c5e52ef7c3a6c7902c9dfbb34c7e29c25d2f81ade3856445fd5c94/protobuf-6.33.6.tar.gz", hash = "sha256:a6768d25248312c297558af96a9f9c929e8c4cee0659cb07e780731095f38135", size = 444531, upload-time = "2026-03-18T19:05:00.988Z" }
 wheels = [
@@ -4426,8 +4453,8 @@ name = "psycopg"
 version = "3.3.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
-    { name = "tzdata", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/db/2f/cb91e5502ec9de1de6f1b76cfbf69531932725361168bb06963620c77e2e/psycopg-3.3.4.tar.gz", hash = "sha256:e21207764952cff81b6b8bdacad9a3939f2793367fdac2987b3aac36a651b5bc", size = 165799, upload-time = "2026-05-01T23:31:55.179Z" }
 wheels = [
@@ -4436,7 +4463,7 @@ wheels = [
 
 [package.optional-dependencies]
 binary = [
-    { name = "psycopg-binary", marker = "implementation_name != 'pypy' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "psycopg-binary", marker = "implementation_name != 'pypy'" },
 ]
 
 [[package]]
@@ -4542,11 +4569,11 @@ wheels = [
 
 [[package]]
 name = "pyasn1"
-version = "0.6.4"
+version = "0.6.5"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/a4/9a/23310166d960def5897e91fe20e5b724601b02a22e84ba1f94232c0b7f67/pyasn1-0.6.4.tar.gz", hash = "sha256:9c447d8431c947fe4c8febc4ed9e760bc29011a5b01e5c74b67025bd9fb8ce81", size = 151262, upload-time = "2026-07-09T01:12:33.988Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/88/7e/3c0da41061a2021cac7cd524fd57092adbe5b515e8bf9005702e366802e2/pyasn1-0.6.5.tar.gz", hash = "sha256:6b11616a6bcf3a40e635f082bb232fa57b5e0dd7f517bd7ddd69ec3794508a47", size = 155152, upload-time = "2026-10-27T06:32:49.125Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9a/3b/6163796d69c3977d1e4287bea4a6979161cbbdd170ebb430511e8e1999ce/pyasn1-0.6.4-py3-none-any.whl", hash = "sha256:deda9277cfd454080ec40b207fb6df82206a3a2688735233cdcd8d3d565f088b", size = 84410, upload-time = "2026-07-09T01:12:32.92Z" },
+    { url = "https://files.pythonhosted.org/packages/19/1f/3eefd5c84c35cae44549ce1c7f7e58f7945b34f5a6bce07a135438522073/pyasn1-0.6.5-py3-none-any.whl", hash = "sha256:4017b0fce125096b8573b39c989fdb1a4b19cf761e683398184550fea0e66587", size = 84807, upload-time = "2026-10-27T06:32:48.045Z" },
 ]
 
 [[package]]
@@ -4760,7 +4787,7 @@ name = "pyte"
 version = "0.8.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "wcwidth", marker = "python_full_version == '3.13.*' or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or sys_platform != 'win32'" },
+    { name = "wcwidth" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ab/ab/b599762933eba04de7dc5b31ae083112a6c9a9db15b01d3109ad797559d9/pyte-0.8.2.tar.gz", hash = "sha256:5af970e843fa96a97149d64e170c984721f20e52227a2f57f0a54207f08f083f", size = 92301, upload-time = "2023-11-12T09:33:43.217Z" }
 wheels = [
@@ -4772,7 +4799,7 @@ name = "pytest"
 version = "9.0.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "colorama", marker = "sys_platform == 'win32'" },
     { name = "iniconfig" },
     { name = "packaging" },
     { name = "pluggy" },
@@ -4789,7 +4816,7 @@ version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pytest" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/43/7c/d36d04db312ecf4298932ef77e6e4a9e8ad017906e24e34f0b0c361a2473/pytest_asyncio-1.4.0.tar.gz", hash = "sha256:c6c0d2259945122819f171a32ecea2c349ead889ee28176caaf492143424be42", size = 58514, upload-time = "2026-05-26T09:56:04.083Z" }
 wheels = [
@@ -5085,7 +5112,7 @@ name = "pyzmq"
 version = "27.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "implementation_name == 'pypy' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "cffi", marker = "implementation_name == 'pypy'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/04/0b/3c9baedbdf613ecaa7aa07027780b8867f57b6293b6ee50de316c9f3222b/pyzmq-27.1.0.tar.gz", hash = "sha256:ac0765e3d44455adb6ddbf4417dcce460fc40a05978c08efdf2948072f6db540", size = 281750, upload-time = "2025-09-08T23:10:18.157Z" }
 wheels = [
@@ -5130,7 +5157,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "attrs" },
     { name = "rpds-py" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/22/f5/df4e9027acead3ecc63e50fe1e36aca1523e1719559c499951bb4b53188f/referencing-0.37.0.tar.gz", hash = "sha256:44aefc3142c5b842538163acb373e24cce6632bd54bdb01b21ad5863489f50d8", size = 78036, upload-time = "2025-10-13T15:30:48.871Z" }
 wheels = [
@@ -5544,8 +5571,8 @@ name = "secretstorage"
 version = "3.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cryptography", marker = "python_full_version == '3.13.*' or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or sys_platform != 'win32'" },
-    { name = "jeepney", marker = "python_full_version == '3.13.*' or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (python_full_version != '3.13.*' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or sys_platform != 'win32'" },
+    { name = "cryptography" },
+    { name = "jeepney" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/03/e834bcd866f2f8a49a85eaff47340affa3bfa391ee9912a952a1faa68c7b/secretstorage-3.5.0.tar.gz", hash = "sha256:f04b8e4689cbce351744d5537bf6b1329c6fc68f91fa666f60a380edddcd11be", size = 19884, upload-time = "2025-11-23T19:02:53.191Z" }
 wheels = [
@@ -5689,7 +5716,7 @@ name = "sqlalchemy"
 version = "2.0.50"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "greenlet", marker = "platform_machine == 'AMD64' or platform_machine == 'WIN32' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'ppc64le' or platform_machine == 'win32' or platform_machine == 'x86_64' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "greenlet", marker = "platform_machine == 'AMD64' or platform_machine == 'WIN32' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'ppc64le' or platform_machine == 'win32' or platform_machine == 'x86_64'" },
     { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/57/da/6fbf010c8ebb347679d0d100b22fe9ba5e13fd04046c5df7280d2f0bf706/sqlalchemy-2.0.50.tar.gz", hash = "sha256:af5607d11ef90fd6a5c0549fe0045dce1663d427426bcfb506dcb5346a85a3b9", size = 9907424, upload-time = "2026-05-24T19:20:04.018Z" }
@@ -5779,7 +5806,7 @@ version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/eb/e3/7c1dc7381d9f8ab7d854328ebfa884e62cb3f3d8549ddfd37c7814f42afa/starlette-1.3.1.tar.gz", hash = "sha256:05d0213193f2fbaae60e2ecb593b4add4262ad4e46536b54abe36f11a71724e0", size = 2703240, upload-time = "2026-06-12T09:23:11.602Z" }
 wheels = [
@@ -5972,7 +5999,7 @@ name = "tqdm"
 version = "4.68.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "colorama", marker = "sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/06/b3/36c8ecf72e8925200671613332db156d84b99b3aee742a41c1938ebb0808/tqdm-4.68.1.tar.gz", hash = "sha256:fc163d96b287bd031e1aa24421ce4411b25559bd0a1be4fe649bdaa4d2c02bf5", size = 171236, upload-time = "2026-06-05T17:23:15.267Z" }
 wheels = [
@@ -6063,11 +6090,11 @@ wheels = [
 
 [package.optional-dependencies]
 standard = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "colorama", marker = "sys_platform == 'win32'" },
     { name = "httptools" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
-    { name = "uvloop", marker = "(platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32') or (platform_python_implementation == 'PyPy' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (platform_python_implementation == 'PyPy' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (platform_python_implementation == 'PyPy' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (platform_python_implementation == 'PyPy' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (platform_python_implementation == 'PyPy' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or (sys_platform == 'cygwin' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (sys_platform == 'cygwin' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (sys_platform == 'cygwin' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (sys_platform == 'cygwin' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (sys_platform == 'cygwin' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint') or (sys_platform == 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-cwsandbox') or (sys_platform == 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-databricks') or (sys_platform == 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'extra-8-omnigent-modal') or (sys_platform == 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-dev') or (sys_platform == 'win32' and extra == 'extra-8-omnigent-antigravity' and extra == 'group-8-omnigent-lint')" },
+    { name = "uvloop", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'" },
     { name = "watchfiles" },
     { name = "websockets" },
 ]
