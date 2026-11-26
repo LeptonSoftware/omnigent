@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
@@ -82,11 +82,14 @@ class _TerminalMatcher:
     :param predicate: Returns ``True`` when this rule explains the failure,
         given the normalized :class:`_Signal`.
     :param diagnosis: The :class:`FailureDiagnosis` to return on a match.
+    :param refine: Optional hook that specializes *diagnosis* from the
+        terminal's original-case output.
     """
 
     name: str
     predicate: Callable[[_Signal], bool]
     diagnosis: FailureDiagnosis
+    refine: Callable[[FailureDiagnosis, str], FailureDiagnosis] | None = None
 
 
 # --- root + --dangerously-skip-permissions -----------------------------------
@@ -107,12 +110,78 @@ _AUTH_MARKERS = (
 )
 
 # --- binary missing -----------------------------------------------------------
-_MISSING_MARKERS = (
+# Exit 127 is the shell reporting that the command never started. Output alone
+# is not evidence: any tool can print "no such file or directory" before a
+# later, unrelated exit.
+_COMMAND_NOT_FOUND_EXIT = 127
+_NOT_FOUND_LINE_MARKERS = (
     "command not found",
     "no such file or directory",
     "not recognized as an internal or external command",
     "executable file not found",
 )
+_ERROR_LINE_MAX = 140
+# Narrower rows are ordinary short lines, not a pane wrapping a long one.
+_MIN_WRAP_WIDTH = 60
+
+
+def _last_error_line(output: str) -> str | None:
+    """The shell's last not-found message in *output*, re-joined if the pane wrapped it.
+
+    The message ends the row the marker ends on, so only rows before it are joined: those
+    filled to the pane width. ``None`` when no row carries a marker.
+    """
+    rows = [r for r in (ln.rstrip() for ln in output.splitlines()) if r]
+    width = max((len(r) for r in rows), default=0)
+    # One longest row is just a long line; a pane that wrapped fills several rows to its width.
+    wraps = width >= _MIN_WRAP_WIDTH and sum(len(r) == width for r in rows) >= 2
+
+    def wrapped(i: int) -> bool:
+        return wraps and len(rows[i]) == width
+
+    def has_marker(text: str) -> bool:
+        return any(m in text.lower() for m in _NOT_FOUND_LINE_MARKERS)
+
+    # A marker can itself straddle a wrap, so test each row joined to a wrapped row above.
+    end = next(
+        (
+            i
+            for i in range(len(rows) - 1, -1, -1)
+            if has_marker(rows[i])
+            or (
+                i > 0
+                and wrapped(i - 1)
+                and not has_marker(rows[i - 1])
+                and has_marker(rows[i - 1] + rows[i])
+            )
+        ),
+        None,
+    )
+    if end is None:
+        return None
+    start = end
+    while start > 0 and wrapped(start - 1):
+        start -= 1
+    line = "".join(rows[start : end + 1]).strip()
+    if len(line) > _ERROR_LINE_MAX:
+        head = _ERROR_LINE_MAX * 2 // 3
+        line = f"{line[:head]}…{line[-(_ERROR_LINE_MAX - head - 1) :]}"
+    return line
+
+
+def _quote_error_line(diagnosis: FailureDiagnosis, output: str) -> FailureDiagnosis:
+    line = _last_error_line(output)
+    if line is None:
+        return diagnosis
+    return replace(
+        diagnosis,
+        cause=f"The terminal's command exited 127 before it could start. Its last error: {line}",
+        remediation=(
+            "Check the command named in that error. If it is the agent's CLI, install the "
+            f"harness on the host (e.g. run `{cli_invocation()} setup`)."
+        ),
+    )
+
 
 # --- CLI rejected its arguments -----------------------------------------------
 # Usage errors from the agent CLI or a wrapper around it, e.g. a flag added by a
@@ -144,7 +213,7 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     ),
     _TerminalMatcher(
         "missing_binary",
-        lambda s: s.exit_code == 127 or s.output_contains_any(_MISSING_MARKERS),
+        lambda s: s.exit_code == _COMMAND_NOT_FOUND_EXIT,
         FailureDiagnosis(
             title="Agent command not found",
             cause=(
@@ -153,6 +222,7 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             ),
             remediation=f"Install the harness on the host (e.g. run `{cli_invocation()} setup`).",
         ),
+        refine=_quote_error_line,
     ),
     _TerminalMatcher(
         "not_authenticated",
@@ -210,6 +280,8 @@ def classify_terminal_failure(
     )
     for matcher in _TERMINAL_EXIT_MATCHERS:
         if matcher.predicate(signal):
+            if matcher.refine is not None and output:
+                return matcher.refine(matcher.diagnosis, output)
             return matcher.diagnosis
     return None
 
