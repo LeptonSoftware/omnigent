@@ -564,6 +564,26 @@ def test_post_evaluate_with_retry_bounds_retry_after(
     assert sleeps == [10.0]
 
 
+def test_post_evaluate_with_retry_floors_a_tiny_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``Retry-After`` of 0.01 s waits the initial backoff, not a near-busy loop."""
+    request = httpx.Request("POST", "https://ap/x")
+    responses = [
+        httpx.Response(429, headers={"Retry-After": "0.01"}, request=request),
+        httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"}, request=request),
+    ]
+    sleeps: list[float] = []
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _make_sequence_client(responses, []))
+    monkeypatch.setattr(native_policy_hook.time, "sleep", sleeps.append)
+
+    resp, error = post_evaluate_with_retry("https://ap/x", {}, {"event": {}}, 5.0, "hook")
+
+    assert resp is responses[1]
+    assert error is None
+    assert sleeps == [1.0]
+
+
 def test_post_evaluate_with_retry_fails_closed_after_repeated_429(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -829,6 +849,44 @@ def test_post_evaluate_with_retry_fast_5xx_still_exhausts_the_budget(
     assert resp is None
     assert error is not None and "retry budget exhausted" in error
     assert 2 <= len(posts) <= 8, "retried within the budget, then gave up"
+
+
+def test_post_evaluate_with_retry_reads_the_shared_budget_at_call_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With no ``retry_budget_s``, the shared budget is read when the call runs.
+
+    Callers and tests that lower ``_EVALUATE_POLICY_RETRY_BUDGET_S`` must see
+    it take effect; a default bound when the function is defined would not.
+    """
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook.time, "sleep", lambda s: None)
+    posts: list[str] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            posts.append(url)
+            return httpx.Response(503, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, 86400.0, "evaluate-policy hook"
+    )
+
+    assert resp is None and error is not None and "retry budget exhausted" in error
+    assert len(posts) == 1
 
 
 def test_post_evaluate_with_retry_reauths_on_403_invalid_token(

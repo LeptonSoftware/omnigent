@@ -2523,6 +2523,9 @@ def build_hook_settings(
         evaluate_policy_hook: _JsonObject = {
             "type": "command",
             "command": evaluate_policy_command,
+            # A timed-out hook lets the call through, and the default (600 s;
+            # 30 s on UserPromptSubmit) is shorter than a parked ASK.
+            "timeout": 86400,
         }
 
         # AskUserQuestion needs no PreToolUse forwarder: Claude Code raises its
@@ -6853,13 +6856,17 @@ def _tool_relay_handler_factory(
             import httpx
 
             from omnigent.native.native_policy_hook import (
-                _EVALUATE_POLICY_RETRY_BUDGET_S,
+                _EVALUATE_POLICY_HELD_POLL_FLOOR_S,
+                _EVALUATE_POLICY_MAX_RETRY_AFTER_S,
                 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S,
                 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S,
+                claude_native_give_up_after_s,
+                claude_native_retry_budget_s,
                 evaluation_response_to_hook_output,
                 fail_ask_hook_output,
                 hook_payload_to_evaluation_request,
             )
+            from omnigent.util.http_retry import bounded_retry_after_seconds
 
             raw_event = payload.get("hook_event_name")
             hook_event = raw_event if isinstance(raw_event, str) else ""
@@ -6889,14 +6896,40 @@ def _tool_relay_handler_factory(
             last_error: str | None = None
             attempts = 0
             non_connect_failures = 0
-            deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
+            budget_s = claude_native_retry_budget_s(hook_event)
+            deadline = time.monotonic() + budget_s
+            give_up_at = time.monotonic() + claude_native_give_up_after_s(hook_event)
             backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
             retry_delay = 0.4
+
+            def _back_off_within_budget(delay_s: float | None = None) -> bool:
+                """Schedule the next backoff, or say the budget is spent."""
+                nonlocal retry_delay, backoff_s
+                wait_s = backoff_s if delay_s is None else delay_s
+                if time.monotonic() + wait_s >= deadline:
+                    return False
+                retry_delay = wait_s
+                backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)
+                return True
+
+            def _rearm_if_held(started: float) -> bool:
+                """Re-arm the budget when a failure ended a held poll (a gateway sever)."""
+                nonlocal deadline, backoff_s
+                if time.monotonic() - started < _EVALUATE_POLICY_HELD_POLL_FLOOR_S:
+                    return False
+                deadline = time.monotonic() + budget_s
+                backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
+                return True
+
             while non_connect_failures < 3:
                 if attempts:
+                    if time.monotonic() + retry_delay >= give_up_at:
+                        last_error = f"gave up before the hook timeout ({last_error})"
+                        break
                     time.sleep(retry_delay)
                 attempts += 1
                 retry_delay = 0.4
+                attempt_started = time.monotonic()
                 future = asyncio.run_coroutine_threadsafe(
                     policy_client.post(url, json=request_body), loop
                 )
@@ -6906,16 +6939,37 @@ def _tool_relay_handler_factory(
                     last_error = str(exc).strip() or type(exc).__name__
                     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
                         # Resolver failures can outlast three quick attempts.
-                        if time.monotonic() + backoff_s >= deadline:
+                        if not _back_off_within_budget():
                             break
-                        retry_delay = backoff_s
-                        backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)
                     else:
+                        _rearm_if_held(attempt_started)
                         non_connect_failures += 1
                     continue
                 if resp.status_code != HTTPStatus.OK:
                     last_error = f"server returned HTTP {resp.status_code}"
-                    non_connect_failures += 1
+                    # A restarting server's proxy answers these at once for as long
+                    # as the restart takes, so they back off like a refused connect.
+                    severed = _rearm_if_held(attempt_started)
+                    if severed or resp.status_code not in (
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                        HTTPStatus.BAD_GATEWAY,
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        HTTPStatus.GATEWAY_TIMEOUT,
+                    ):
+                        non_connect_failures += 1
+                    elif not _back_off_within_budget(
+                        max(
+                            _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S,
+                            bounded_retry_after_seconds(
+                                resp,
+                                fallback=backoff_s,
+                                max_delay=_EVALUATE_POLICY_MAX_RETRY_AFTER_S,
+                            ),
+                        )
+                        if resp.status_code == HTTPStatus.TOO_MANY_REQUESTS
+                        else None
+                    ):
+                        break
                     continue
                 try:
                     verdict = json.loads(resp.content)

@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -76,7 +76,7 @@ from omnigent.inner.datamodel import (
     CredentialSourceSpec,
     OSEnvSandboxSpec,
 )
-from omnigent.native import native_cost_popup
+from omnigent.native import native_cost_popup, native_policy_hook
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 
@@ -12206,10 +12206,19 @@ class _ScriptedPolicyClient:
 
     :param steps: Replayed in order, the last one repeating: a dict body
         answers 200, an int answers that status with an empty body, an
-        exception is raised, and ``None`` raises a connection failure.
+        exception is raised, ``None`` raises a connection failure, a
+        ``SimpleNamespace`` is returned as the response, and a callable is
+        called and its result replayed as the step.
     """
 
-    def __init__(self, *steps: dict[str, object] | int | BaseException | None) -> None:
+    def __init__(
+        self,
+        *steps: dict[str, object]
+        | int
+        | BaseException
+        | Callable[[], dict[str, object] | int | BaseException | None]
+        | None,
+    ) -> None:
         self.steps = list(steps)
         self.calls = 0
         self.bodies: list[dict[str, object] | None] = []
@@ -12227,12 +12236,16 @@ class _ScriptedPolicyClient:
         self.bodies.append(json)
         step = self.steps[min(self.calls, len(self.steps) - 1)]
         self.calls += 1
+        if callable(step):
+            step = step()
         if step is None:
             raise ConnectionError("scripted transport failure")
         if isinstance(step, BaseException):
             raise step
         if isinstance(step, int):
             return SimpleNamespace(status_code=step, content=b"", headers={})
+        if isinstance(step, SimpleNamespace):
+            return step
         raw = _json.dumps(step).encode("utf-8")
         return SimpleNamespace(
             status_code=200, content=raw, headers={"Content-Type": "application/json"}
@@ -12447,6 +12460,231 @@ async def test_hook_evaluate_endpoint_retries_connect_failures_within_budget(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [502, 503, 504, 429])
+async def test_hook_evaluate_endpoint_waits_out_a_60s_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock, status: int
+) -> None:
+    """A server restart's fast 502/503/504/429 for 60 s ends in the verdict, not a prompt.
+
+    While the server restarts, its proxy answers these at once; three quick
+    tries would give up in a second and leave the call on an approval prompt.
+    """
+
+    def _restarting() -> dict[str, object] | int:
+        if _policy_retry_clock.monotonic() < 60.0:
+            return status
+        return {"result": "POLICY_ACTION_ALLOW"}
+
+    client = _ScriptedPolicyClient(_restarting)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        assert body == "", f"a 60 s restart must end in the ALLOW verdict, got {body!r}"
+        assert _policy_retry_clock.monotonic() >= 60.0
+        assert len({b["_omnigent_elicitation_id"] for b in client.bodies if b}) == 1
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_exhausts_the_restart_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
+) -> None:
+    """A 502 that never clears asks once the claude-native budget is spent, not before."""
+    client = _ScriptedPolicyClient(502)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        output = json.loads(body)
+        assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert "HTTP 502" in output["hookSpecificOutput"]["permissionDecisionReason"]
+        waited = _policy_retry_clock.monotonic()
+        budget = native_policy_hook.claude_native_retry_budget_s("PreToolUse")
+        assert budget - 10 <= waited < budget, waited
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_user_prompt_gives_up_inside_its_default_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
+) -> None:
+    """A prompt blocks before Claude Code's 30 s UserPromptSubmit default kills the hook.
+
+    A session launched without an explicit hook timeout keeps that default,
+    and a killed UserPromptSubmit hook lets the prompt through unchecked.
+    """
+    client = _ScriptedPolicyClient(502)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _USER_PROMPT_SUBMIT_PAYLOAD,
+        )
+        assert json.loads(body)["decision"] == "block"
+        # it rode out the first seconds, and stopped well before the 30 s default
+        assert 5 <= _policy_retry_clock.monotonic() <= 15, _policy_retry_clock.monotonic()
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_prompt_never_outlives_its_hook_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
+) -> None:
+    """
+    Fast 502s between held 504s still block a prompt inside the 30 s default.
+
+    Each 12 s 504 counts as a severed held poll, which re-arms the retry
+    budget; only the give-up limit ends the sequence before Claude Code
+    kills the hook and lets the prompt through.
+    """
+    clock = _policy_retry_clock
+
+    def _restarting_with_held_polls() -> int:
+        if client.calls % 4:
+            return 502
+        clock.monotonic.return_value += 12.0
+        return 504
+
+    client = _ScriptedPolicyClient(_restarting_with_held_polls)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _USER_PROMPT_SUBMIT_PAYLOAD,
+        )
+        assert json.loads(body)["decision"] == "block"
+        assert clock.monotonic() < 30.0, clock.monotonic()
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_tool_call_never_outlives_its_hook_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
+) -> None:
+    """Held 504s that each re-arm a fresh window of fast 502s still ask inside 600 s."""
+    clock = _policy_retry_clock
+    state = {"held_next": True}
+
+    def _held_then_restarting() -> int:
+        if state["held_next"]:
+            state["held_next"] = False
+            clock.monotonic.return_value += 100.0
+            return 504
+        if clock.sleep.call_count and clock.sleep.call_args.args[0] >= 10:
+            state["held_next"] = True
+        return 502
+
+    client = _ScriptedPolicyClient(_held_then_restarting)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        assert json.loads(body)["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert clock.monotonic() < 600.0, clock.monotonic()
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_rearms_the_budget_after_a_held_poll_is_severed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
+) -> None:
+    """An ASK parked past the budget still rides out a restart once its poll is cut.
+
+    The gateway severs the held poll after 130 s; the server is then
+    restarting (fast 502s) and comes back with the verdict.
+    """
+    clock = _policy_retry_clock
+
+    def _held_then_restarting() -> dict[str, object] | int:
+        if client.calls == 1:
+            clock.monotonic.return_value += 130.0
+            return 504
+        return 502 if clock.monotonic() < 160.0 else {"result": "POLICY_ACTION_ALLOW"}
+
+    client = _ScriptedPolicyClient(_held_then_restarting)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        assert body == "", f"a restart after a severed poll must end in the verdict, got {body!r}"
+        assert len({b["_omnigent_elicitation_id"] for b in client.bodies if b}) == 1
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_floors_a_tiny_retry_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
+) -> None:
+    """A Retry-After of 0.01 s waits the initial backoff, not a near-busy loop."""
+    limited = SimpleNamespace(
+        status_code=429, content=b"", headers=httpx.Headers({"Retry-After": "0.01"})
+    )
+    client = _ScriptedPolicyClient(limited, {"result": "POLICY_ACTION_ALLOW"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        assert body == ""
+        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [1.0]
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_honours_retry_after_on_429(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
+) -> None:
+    """A 429's Retry-After sets the next wait, as on the direct hook path."""
+    limited = SimpleNamespace(
+        status_code=429, content=b"", headers=httpx.Headers({"Retry-After": "3"})
+    )
+    client = _ScriptedPolicyClient(limited, {"result": "POLICY_ACTION_ALLOW"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        assert body == ""
+        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [3]
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("hook_event", ["UserPromptSubmit", "PreToolUse", "PostToolUse"])
 async def test_hook_evaluate_endpoint_exhausts_connect_retry_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock, hook_event: str
@@ -12476,14 +12714,14 @@ async def test_hook_evaluate_endpoint_exhausts_connect_retry_budget(
             assert json.loads(body)["hookSpecificOutput"]["permissionDecision"] == "ask"
         else:
             assert body == "", "PostToolUse must still fail open"
-        assert client.calls == 6
-        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [
-            1,
-            2,
-            4,
-            8,
-            10,
-        ]
+        sleeps = [call.args[0] for call in _policy_retry_clock.sleep.call_args_list]
+        budget = native_policy_hook.claude_native_retry_budget_s(hook_event)
+        # 1, 2, 4, 8, then 10 s, for as long as the next wait still ends inside the budget
+        expected: list[float] = []
+        while sum(expected) + min(2 ** len(expected), 10) < budget:
+            expected.append(min(2 ** len(expected), 10))
+        assert sleeps == expected, sleeps
+        assert client.calls == len(sleeps) + 1
     finally:
         relay.close()
 
@@ -12491,16 +12729,28 @@ async def test_hook_evaluate_endpoint_exhausts_connect_retry_budget(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
-    [401, 504, httpx.RequestError("no auth token"), httpx.ReadError("torn poll")],
+    [401, 500, "held 504", httpx.RequestError("no auth token"), httpx.ReadError("torn poll")],
 )
 async def test_hook_evaluate_endpoint_preserves_non_connect_retries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _policy_retry_clock: Mock,
-    failure: int | Exception,
+    failure: int | str | Exception,
 ) -> None:
-    """HTTP, auth, and held-poll failures retain the existing three attempts."""
-    client = _ScriptedPolicyClient(failure)
+    """HTTP, auth, and held-poll failures retain the existing three attempts.
+
+    A 500 is a server bug, not a restart. A 504 after the poll was held past
+    the floor is a gateway severing a parked ASK: it re-parks quickly.
+    """
+    if failure == "held 504":
+
+        def _held_504() -> int:
+            _policy_retry_clock.monotonic.return_value += 15.0
+            return 504
+
+        client = _ScriptedPolicyClient(_held_504)
+    else:
+        client = _ScriptedPolicyClient(failure)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
         body = await asyncio.to_thread(
@@ -12560,23 +12810,43 @@ async def test_curl_evaluate_policy_command_round_trips(
 
     # No relay env file (fresh session before its first dispatched turn,
     # or runner gone): stdin replays into the Python hook, which takes
-    # its direct-server path (unreachable here) and fails closed with
-    # its own shaping — the pre-curl behavior.
+    # its direct-server path and fails closed with its own shaping — the
+    # pre-curl behavior. The server answers a final 404: an unreachable one
+    # is retried for the whole restart budget.
+
+    class _NotFoundHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args: object) -> None:
+            del args
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _NotFoundHandler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
     bare_dir = tmp_path / "no-relay"
     bare_dir.mkdir()
-    args = augment_claude_args((), bridge_dir=bare_dir, ap_server_url="http://127.0.0.1:9")
+    args = augment_claude_args(
+        (), bridge_dir=bare_dir, ap_server_url=f"http://127.0.0.1:{httpd.server_address[1]}"
+    )
     (bare_dir / "bridge.json").write_text(
         json.dumps({"active_session_id": "conv_no_relay"}), encoding="utf-8"
     )
     settings = _load_invocation_settings(args)
     pre_entries = [entry for entry in settings["hooks"]["PreToolUse"] if "matcher" not in entry]
-    result = subprocess.run(
-        ["/bin/sh", "-c", pre_entries[0]["hooks"][0]["command"]],
-        input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    try:
+        result = subprocess.run(
+            ["/bin/sh", "-c", pre_entries[0]["hooks"][0]["command"]],
+            input=json.dumps(_PRE_TOOL_USE_PAYLOAD),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
     assert result.returncode == 0, result.stderr
     output = json.loads(result.stdout)
     assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
