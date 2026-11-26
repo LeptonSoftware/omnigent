@@ -1031,6 +1031,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     """
     _skip_httpx_cli_import()
     from omnigent.native.native_policy_hook import (
+        _CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGET_S,
         evaluation_response_to_hook_output,
         fail_ask_hook_output,
         hook_payload_to_evaluation_request,
@@ -1110,6 +1111,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         _EVALUATE_POLICY_TIMEOUT_S,
         "evaluate-policy hook",
         reauth=reauth,
+        retry_budget_s=_CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGET_S,
     )
     if resp is None:
         return _fail_closed(api_error or (reauth.failure_reason if reauth else None))

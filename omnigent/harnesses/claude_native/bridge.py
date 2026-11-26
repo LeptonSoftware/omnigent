@@ -2523,6 +2523,12 @@ def build_hook_settings(
         evaluate_policy_hook: _JsonObject = {
             "type": "command",
             "command": evaluate_policy_command,
+            # Claude Code kills a hook at its own default timeout, and a
+            # killed PreToolUse hook doesn't block the tool. This hook may
+            # wait out a server restart (the claude-native retry budget) or
+            # a parked ASK, as long as the curl's --max-time above, so its
+            # timeout matches that rather than the default (VIN-30522).
+            "timeout": 86400,
         }
 
         # AskUserQuestion needs no PreToolUse forwarder: Claude Code raises its
@@ -6853,7 +6859,8 @@ def _tool_relay_handler_factory(
             import httpx
 
             from omnigent.native.native_policy_hook import (
-                _EVALUATE_POLICY_RETRY_BUDGET_S,
+                _CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGET_S,
+                _EVALUATE_POLICY_HELD_POLL_FLOOR_S,
                 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S,
                 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S,
                 evaluation_response_to_hook_output,
@@ -6889,14 +6896,25 @@ def _tool_relay_handler_factory(
             last_error: str | None = None
             attempts = 0
             non_connect_failures = 0
-            deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
+            deadline = time.monotonic() + _CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGET_S
             backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
             retry_delay = 0.4
+
+            def _back_off_within_budget() -> bool:
+                """Schedule the next backoff, or say the budget is spent."""
+                nonlocal retry_delay, backoff_s
+                if time.monotonic() + backoff_s >= deadline:
+                    return False
+                retry_delay = backoff_s
+                backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)
+                return True
+
             while non_connect_failures < 3:
                 if attempts:
                     time.sleep(retry_delay)
                 attempts += 1
                 retry_delay = 0.4
+                attempt_started = time.monotonic()
                 future = asyncio.run_coroutine_threadsafe(
                     policy_client.post(url, json=request_body), loop
                 )
@@ -6906,16 +6924,26 @@ def _tool_relay_handler_factory(
                     last_error = str(exc).strip() or type(exc).__name__
                     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
                         # Resolver failures can outlast three quick attempts.
-                        if time.monotonic() + backoff_s >= deadline:
+                        if not _back_off_within_budget():
                             break
-                        retry_delay = backoff_s
-                        backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)
                     else:
                         non_connect_failures += 1
                     continue
                 if resp.status_code != HTTPStatus.OK:
                     last_error = f"server returned HTTP {resp.status_code}"
-                    non_connect_failures += 1
+                    # While the server restarts, its proxy answers 502/503 at
+                    # once, for as long as the restart takes: treat a fast 5xx
+                    # or 429 like a refused connection. A 5xx after a held
+                    # poll is a gateway severing a parked ASK, which keeps the
+                    # quick re-park retries below (VIN-30522).
+                    fast_transient = (
+                        resp.status_code == HTTPStatus.TOO_MANY_REQUESTS
+                        or resp.status_code >= HTTPStatus.INTERNAL_SERVER_ERROR
+                    ) and time.monotonic() - attempt_started < _EVALUATE_POLICY_HELD_POLL_FLOOR_S
+                    if not fast_transient:
+                        non_connect_failures += 1
+                    elif not _back_off_within_budget():
+                        break
                     continue
                 try:
                     verdict = json.loads(resp.content)

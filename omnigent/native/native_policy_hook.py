@@ -39,6 +39,13 @@ from omnigent.util.http_retry import bounded_retry_after_seconds
 # hosted-deployment failures. A gateway-severed held poll resets
 # it — see :func:`post_evaluate_with_retry`.
 _EVALUATE_POLICY_RETRY_BUDGET_S = 30.0
+# Claude-native's budget: long enough to outlast an Omnigent server restart.
+# A swap on 2026-11-25 had the front proxy answering 502 for ~26 s, which
+# put an approval prompt on every session that called a tool in that window
+# (VIN-30522). Only claude-native uses it, because only its evaluate hook
+# sets a Claude Code ``timeout`` above it (see ``bridge``); the other
+# harnesses' hook timeouts were not checked, so they keep the shared budget.
+_CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGET_S = 120.0
 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S = 1.0
 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S = 10.0
 _EVALUATE_POLICY_MAX_RETRY_AFTER_S = 10.0
@@ -591,13 +598,14 @@ def post_evaluate_with_retry(
     read_timeout: float,
     hook_label: str,
     reauth: Callable[[], dict[str, str] | None] | None = None,
+    retry_budget_s: float = _EVALUATE_POLICY_RETRY_BUDGET_S,
 ) -> tuple[httpx.Response, None] | tuple[None, str]:
     """
     POST to the Omnigent policy evaluate endpoint, retrying on transient errors.
 
     Retries on explicit 429 and 5xx HTTP responses and connection-level errors
     (:class:`httpx.ConnectError`, :class:`httpx.ConnectTimeout`) within
-    :data:`_EVALUATE_POLICY_RETRY_BUDGET_S`. Returns the successful response,
+    ``retry_budget_s``. Returns the successful response,
     or ``None`` if the budget is exhausted or a non-retryable error occurs.
     A 429 ``Retry-After`` hint takes precedence over exponential backoff but
     is capped by :data:`_EVALUATE_POLICY_MAX_RETRY_AFTER_S`.
@@ -643,6 +651,9 @@ def post_evaluate_with_retry(
         normal failure handling (the caller fails closed). A poll the server
         held past the floor re-arms the one-shot, so a wait longer than the
         token lifetime survives every lapse.
+    :param retry_budget_s: Seconds to keep retrying transient failures, e.g.
+        :data:`_CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGET_S`. Must stay under
+        the caller's hook timeout, or the harness kills the hook first.
     :returns: ``(response, error)`` — on success, ``(response, None)``; on
         failure, ``(None, short_error_string)`` describing the last error so
         callers can surface it in the deny/block reason shown to the user.
@@ -653,7 +664,7 @@ def post_evaluate_with_retry(
     # server-side by ``_EVALUATE_HOOK_ELICITATION_ID_RE``.
     elicitation_id = f"elicit_evaluate_{secrets.token_hex(16)}"
     request_body = {**eval_request, "_omnigent_elicitation_id": elicitation_id}
-    deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
+    deadline = time.monotonic() + retry_budget_s
     backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
     timeout = httpx.Timeout(read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S)
     reauthed = False
@@ -772,7 +783,7 @@ def post_evaluate_with_retry(
             # The re-park mechanism working as intended, not a transient fault:
             # the budget and backoff are for fast failures, and the accepted
             # poll re-arms the one-shot re-mint for the next token lapse.
-            deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
+            deadline = time.monotonic() + retry_budget_s
             backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
             reauthed = False
             time.sleep(backoff_s)

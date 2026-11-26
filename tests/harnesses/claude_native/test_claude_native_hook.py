@@ -1215,6 +1215,110 @@ def test_build_hook_settings_omits_policy_hooks_without_omnigent_server_url(
         )
 
 
+def test_evaluate_policy_hook_timeout_outlasts_the_restart_budget(tmp_path: Path) -> None:
+    """
+    Every evaluate-policy hook entry gives Claude Code a timeout past the retry budget.
+
+    Claude Code kills a hook at its default timeout, and a killed PreToolUse
+    hook doesn't block the tool. Without an explicit timeout above
+    ``_CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGET_S``, a hook still waiting
+    out a server restart would let the tool run unchecked (VIN-30522).
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    settings = build_hook_settings(
+        bridge_dir,
+        python_executable="/venv/bin/python",
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer t"},
+    )
+    entries = [
+        hook
+        for event in ("PreToolUse", "PostToolUse", "UserPromptSubmit")
+        for group in settings["hooks"][event]
+        for hook in group["hooks"]
+        if "evaluate-policy" in str(hook.get("command", ""))
+    ]
+    assert len(entries) == 3, entries
+    budget = native_policy_hook._CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGET_S
+    for hook in entries:
+        assert isinstance(hook.get("timeout"), int), hook
+        assert hook["timeout"] > budget, hook
+
+
+def test_evaluate_policy_direct_path_waits_out_a_60s_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    With no relay, the hook keeps retrying a 502 for 60 s and returns the verdict.
+
+    The shared budget is 30 s, so this only passes if the claude-native hook
+    passes its own, longer budget (VIN-30522: a 2026-11-25 server swap put
+    an approval prompt on every session that called a tool during it).
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+
+    def _sleep(seconds: float) -> None:
+        """
+        Advance the fake clock instead of waiting.
+
+        :param seconds: Backoff the loop asked for.
+        :returns: None.
+        """
+        clock["t"] += seconds
+
+    monkeypatch.setattr(native_policy_hook.time, "sleep", _sleep)
+    posts: list[float] = []
+
+    class _RestartingServer:
+        """Answer 502 until 60 s have passed on the fake clock, then ALLOW."""
+
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _RestartingServer:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            posts.append(clock["t"])
+            if clock["t"] < 60.0:
+                return httpx.Response(502, request=httpx.Request("POST", url))
+            return httpx.Response(
+                200, text='{"result":"POLICY_ACTION_ALLOW"}', request=httpx.Request("POST", url)
+            )
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RestartingServer)
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_restart", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer test-token"},
+    )
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert posts[-1] >= 60.0, posts
+    assert '"ask"' not in out, f"a 60 s restart must not leave an approval prompt: {out!r}"
+
+
 def test_evaluate_policy_pre_tool_use_converts_and_returns_deny(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
