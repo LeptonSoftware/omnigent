@@ -1219,10 +1219,8 @@ def test_evaluate_policy_hook_timeout_outlasts_the_restart_budget(tmp_path: Path
     """
     Every evaluate-policy hook entry gives Claude Code a timeout past the retry budget.
 
-    Claude Code kills a hook at its default timeout, and a killed PreToolUse
-    hook doesn't block the tool. Without an explicit timeout above
-    ``_CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGET_S``, a hook still waiting
-    out a server restart would let the tool run unchecked (VIN-30522).
+    A timed-out PreToolUse hook lets the tool run unchecked, so the hook must
+    outlast its retry budget and a parked ASK, not Claude Code's default.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -1240,10 +1238,24 @@ def test_evaluate_policy_hook_timeout_outlasts_the_restart_budget(tmp_path: Path
         if "evaluate-policy" in str(hook.get("command", ""))
     ]
     assert len(entries) == 3, entries
-    budget = native_policy_hook._CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGET_S
+    budget = max(native_policy_hook._CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGETS_S.values())
     for hook in entries:
         assert isinstance(hook.get("timeout"), int), hook
         assert hook["timeout"] > budget, hook
+
+
+def test_claude_native_budgets_stay_under_claude_code_default_timeouts() -> None:
+    """
+    Each event's budget fits inside Claude Code's default hook timeout.
+
+    A session launched before the hook entries carried an explicit timeout
+    runs with the defaults (600 s; 30 s for UserPromptSubmit). A budget past
+    one would get the hook killed and the call let through.
+    """
+    budget = native_policy_hook.claude_native_retry_budget_s
+    assert 60.0 <= budget("PreToolUse") < 600.0
+    assert budget("UserPromptSubmit") < 30.0
+    assert budget("PostToolUse") == native_policy_hook._EVALUATE_POLICY_RETRY_BUDGET_S
 
 
 def test_evaluate_policy_direct_path_waits_out_a_60s_restart(
@@ -1255,8 +1267,7 @@ def test_evaluate_policy_direct_path_waits_out_a_60s_restart(
     With no relay, the hook keeps retrying a 502 for 60 s and returns the verdict.
 
     The shared budget is 30 s, so this only passes if the claude-native hook
-    passes its own, longer budget (VIN-30522: a 2026-11-25 server swap put
-    an approval prompt on every session that called a tool during it).
+    passes its own, longer PreToolUse budget.
     """
     clock = {"t": 0.0}
     monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
@@ -1316,7 +1327,57 @@ def test_evaluate_policy_direct_path_waits_out_a_60s_restart(
     out = capsys.readouterr().out
     assert exit_code == 0
     assert posts[-1] >= 60.0, posts
-    assert '"ask"' not in out, f"a 60 s restart must not leave an approval prompt: {out!r}"
+    assert out.strip() == "", f"the ALLOW verdict is empty hook output, got {out!r}"
+
+
+def test_evaluate_policy_direct_path_blocks_a_prompt_inside_its_default_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    With no relay, a UserPromptSubmit that keeps getting 502 blocks within 30 s.
+
+    Claude Code's UserPromptSubmit default timeout is 30 s, and a killed hook
+    lets the prompt through, so the direct path must give up before that.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        native_policy_hook.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+
+    class _AlwaysBadGateway:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _AlwaysBadGateway:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            return httpx.Response(502, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _AlwaysBadGateway)
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_prompt", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer test-token"},
+    )
+    payload = {"hook_event_name": "UserPromptSubmit", "prompt": "hello"}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    assert claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)]) == 0
+
+    assert json.loads(capsys.readouterr().out)["decision"] == "block"
+    assert 10.0 <= clock["t"] < 30.0, clock["t"]
 
 
 def test_evaluate_policy_pre_tool_use_converts_and_returns_deny(
@@ -1661,6 +1722,7 @@ def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client(mode))
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook, "_CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGETS_S", {})
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
@@ -1696,6 +1758,7 @@ def test_evaluate_policy_user_prompt_submit_fails_closed_on_error(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook, "_CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGETS_S", {})
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
@@ -1728,6 +1791,7 @@ def test_evaluate_policy_post_tool_use_fails_open_on_error(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook, "_CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGETS_S", {})
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")

@@ -39,13 +39,6 @@ from omnigent.util.http_retry import bounded_retry_after_seconds
 # hosted-deployment failures. A gateway-severed held poll resets
 # it — see :func:`post_evaluate_with_retry`.
 _EVALUATE_POLICY_RETRY_BUDGET_S = 30.0
-# Claude-native's budget: long enough to outlast an Omnigent server restart.
-# A swap on 2026-11-25 had the front proxy answering 502 for ~26 s, which
-# put an approval prompt on every session that called a tool in that window
-# (VIN-30522). Only claude-native uses it, because only its evaluate hook
-# sets a Claude Code ``timeout`` above it (see ``bridge``); the other
-# harnesses' hook timeouts were not checked, so they keep the shared budget.
-_CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGET_S = 120.0
 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S = 1.0
 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S = 10.0
 _EVALUATE_POLICY_MAX_RETRY_AFTER_S = 10.0
@@ -74,6 +67,30 @@ _POST_TOOL_USE = "PostToolUse"
 # this hook is the sole REQUEST gate and covers both web-UI-injected and
 # direct-terminal prompts). It can block the prompt before the model runs.
 _USER_PROMPT_SUBMIT = "UserPromptSubmit"
+
+# Claude-native budgets per hook event: long enough to ride out a server restart,
+# each under that event's default Claude Code hook timeout (600 s, or 30 s for
+# UserPromptSubmit), which a session launched without an explicit timeout keeps.
+_CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGETS_S: dict[str, float] = {
+    _PRE_TOOL_USE: 120.0,
+    _USER_PROMPT_SUBMIT: 20.0,
+}
+
+
+def claude_native_retry_budget_s(hook_event: str) -> float:
+    """
+    Seconds a claude-native evaluate call retries transient failures.
+
+    PostToolUse fails open on an unavailable verdict, so waiting longer there
+    gains nothing and it keeps the shared budget.
+
+    :param hook_event: Hook event name, e.g. ``"PreToolUse"``.
+    :returns: The retry budget in seconds, e.g. ``120.0``.
+    """
+    return _CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGETS_S.get(
+        hook_event, _EVALUATE_POLICY_RETRY_BUDGET_S
+    )
+
 
 # Reason surfaced when a tool call is denied because its policy verdict
 # could not be obtained (server unreachable / non-2xx / empty or malformed
@@ -598,7 +615,7 @@ def post_evaluate_with_retry(
     read_timeout: float,
     hook_label: str,
     reauth: Callable[[], dict[str, str] | None] | None = None,
-    retry_budget_s: float = _EVALUATE_POLICY_RETRY_BUDGET_S,
+    retry_budget_s: float | None = None,
 ) -> tuple[httpx.Response, None] | tuple[None, str]:
     """
     POST to the Omnigent policy evaluate endpoint, retrying on transient errors.
@@ -652,8 +669,9 @@ def post_evaluate_with_retry(
         held past the floor re-arms the one-shot, so a wait longer than the
         token lifetime survives every lapse.
     :param retry_budget_s: Seconds to keep retrying transient failures, e.g.
-        :data:`_CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGET_S`. Must stay under
-        the caller's hook timeout, or the harness kills the hook first.
+        ``claude_native_retry_budget_s("PreToolUse")``; ``None`` uses
+        :data:`_EVALUATE_POLICY_RETRY_BUDGET_S`. Must stay under the caller's
+        hook timeout, or the harness kills the hook first.
     :returns: ``(response, error)`` — on success, ``(response, None)``; on
         failure, ``(None, short_error_string)`` describing the last error so
         callers can surface it in the deny/block reason shown to the user.
@@ -664,7 +682,8 @@ def post_evaluate_with_retry(
     # server-side by ``_EVALUATE_HOOK_ELICITATION_ID_RE``.
     elicitation_id = f"elicit_evaluate_{secrets.token_hex(16)}"
     request_body = {**eval_request, "_omnigent_elicitation_id": elicitation_id}
-    deadline = time.monotonic() + retry_budget_s
+    budget_s = _EVALUATE_POLICY_RETRY_BUDGET_S if retry_budget_s is None else retry_budget_s
+    deadline = time.monotonic() + budget_s
     backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
     timeout = httpx.Timeout(read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S)
     reauthed = False
@@ -783,7 +802,7 @@ def post_evaluate_with_retry(
             # The re-park mechanism working as intended, not a transient fault:
             # the budget and backoff are for fast failures, and the accepted
             # poll re-arms the one-shot re-mint for the next token lapse.
-            deadline = time.monotonic() + retry_budget_s
+            deadline = time.monotonic() + budget_s
             backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
             reauthed = False
             time.sleep(backoff_s)

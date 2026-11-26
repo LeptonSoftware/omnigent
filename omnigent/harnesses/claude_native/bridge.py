@@ -2523,11 +2523,8 @@ def build_hook_settings(
         evaluate_policy_hook: _JsonObject = {
             "type": "command",
             "command": evaluate_policy_command,
-            # Claude Code kills a hook at its own default timeout, and a
-            # killed PreToolUse hook doesn't block the tool. This hook may
-            # wait out a server restart (the claude-native retry budget) or
-            # a parked ASK, as long as the curl's --max-time above, so its
-            # timeout matches that rather than the default (VIN-30522).
+            # A timed-out PreToolUse hook lets the tool run, and the default
+            # (600 s; 30 s on UserPromptSubmit) is shorter than a parked ASK.
             "timeout": 86400,
         }
 
@@ -6859,14 +6856,16 @@ def _tool_relay_handler_factory(
             import httpx
 
             from omnigent.native.native_policy_hook import (
-                _CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGET_S,
                 _EVALUATE_POLICY_HELD_POLL_FLOOR_S,
+                _EVALUATE_POLICY_MAX_RETRY_AFTER_S,
                 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S,
                 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S,
+                claude_native_retry_budget_s,
                 evaluation_response_to_hook_output,
                 fail_ask_hook_output,
                 hook_payload_to_evaluation_request,
             )
+            from omnigent.util.http_retry import bounded_retry_after_seconds
 
             raw_event = payload.get("hook_event_name")
             hook_event = raw_event if isinstance(raw_event, str) else ""
@@ -6896,17 +6895,28 @@ def _tool_relay_handler_factory(
             last_error: str | None = None
             attempts = 0
             non_connect_failures = 0
-            deadline = time.monotonic() + _CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGET_S
+            budget_s = claude_native_retry_budget_s(hook_event)
+            deadline = time.monotonic() + budget_s
             backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
             retry_delay = 0.4
 
-            def _back_off_within_budget() -> bool:
+            def _back_off_within_budget(delay_s: float | None = None) -> bool:
                 """Schedule the next backoff, or say the budget is spent."""
                 nonlocal retry_delay, backoff_s
-                if time.monotonic() + backoff_s >= deadline:
+                wait_s = backoff_s if delay_s is None else delay_s
+                if time.monotonic() + wait_s >= deadline:
                     return False
-                retry_delay = backoff_s
+                retry_delay = wait_s
                 backoff_s = min(backoff_s * 2, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S)
+                return True
+
+            def _rearm_if_held(started: float) -> bool:
+                """Re-arm the budget when a failure ended a held poll (a gateway sever)."""
+                nonlocal deadline, backoff_s
+                if time.monotonic() - started < _EVALUATE_POLICY_HELD_POLL_FLOOR_S:
+                    return False
+                deadline = time.monotonic() + budget_s
+                backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
                 return True
 
             while non_connect_failures < 3:
@@ -6927,22 +6937,29 @@ def _tool_relay_handler_factory(
                         if not _back_off_within_budget():
                             break
                     else:
+                        _rearm_if_held(attempt_started)
                         non_connect_failures += 1
                     continue
                 if resp.status_code != HTTPStatus.OK:
                     last_error = f"server returned HTTP {resp.status_code}"
-                    # While the server restarts, its proxy answers 502/503 at
-                    # once, for as long as the restart takes: treat a fast 5xx
-                    # or 429 like a refused connection. A 5xx after a held
-                    # poll is a gateway severing a parked ASK, which keeps the
-                    # quick re-park retries below (VIN-30522).
-                    fast_transient = (
-                        resp.status_code == HTTPStatus.TOO_MANY_REQUESTS
-                        or resp.status_code >= HTTPStatus.INTERNAL_SERVER_ERROR
-                    ) and time.monotonic() - attempt_started < _EVALUATE_POLICY_HELD_POLL_FLOOR_S
-                    if not fast_transient:
+                    # A restarting server's proxy answers these at once for as long
+                    # as the restart takes, so they back off like a refused connect.
+                    if _rearm_if_held(attempt_started) or resp.status_code not in (
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                        HTTPStatus.BAD_GATEWAY,
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        HTTPStatus.GATEWAY_TIMEOUT,
+                    ):
                         non_connect_failures += 1
-                    elif not _back_off_within_budget():
+                    elif not _back_off_within_budget(
+                        bounded_retry_after_seconds(
+                            resp,
+                            fallback=backoff_s,
+                            max_delay=_EVALUATE_POLICY_MAX_RETRY_AFTER_S,
+                        )
+                        if resp.status_code == HTTPStatus.TOO_MANY_REQUESTS
+                        else None
+                    ):
                         break
                     continue
                 try:

@@ -831,6 +831,44 @@ def test_post_evaluate_with_retry_fast_5xx_still_exhausts_the_budget(
     assert 2 <= len(posts) <= 8, "retried within the budget, then gave up"
 
 
+def test_post_evaluate_with_retry_reads_the_shared_budget_at_call_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With no ``retry_budget_s``, the shared budget is read when the call runs.
+
+    Callers and tests that lower ``_EVALUATE_POLICY_RETRY_BUDGET_S`` must see
+    it take effect; a default bound when the function is defined would not.
+    """
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(native_policy_hook.time, "sleep", lambda s: None)
+    posts: list[str] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            posts.append(url)
+            return httpx.Response(503, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, 86400.0, "evaluate-policy hook"
+    )
+
+    assert resp is None and error is not None and "retry budget exhausted" in error
+    assert len(posts) == 1
+
+
 def test_post_evaluate_with_retry_reauths_on_403_invalid_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
