@@ -12534,7 +12534,8 @@ async def test_hook_evaluate_endpoint_user_prompt_gives_up_inside_its_default_ti
             _USER_PROMPT_SUBMIT_PAYLOAD,
         )
         assert json.loads(body)["decision"] == "block"
-        assert 10 <= _policy_retry_clock.monotonic() < 30, _policy_retry_clock.monotonic()
+        # it rode out the first seconds, and stopped well before the 30 s default
+        assert 5 <= _policy_retry_clock.monotonic() <= 15, _policy_retry_clock.monotonic()
     finally:
         relay.close()
 
@@ -12543,16 +12544,22 @@ async def test_hook_evaluate_endpoint_user_prompt_gives_up_inside_its_default_ti
 async def test_hook_evaluate_endpoint_prompt_never_outlives_its_hook_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
 ) -> None:
-    """Fast 502s, then 500s that take 9.5 s each, still block inside the 30 s default."""
+    """
+    Fast 502s between held 504s still block a prompt inside the 30 s default.
+
+    Each 12 s 504 counts as a severed held poll, which re-arms the retry
+    budget; only the give-up limit ends the sequence before Claude Code
+    kills the hook and lets the prompt through.
+    """
     clock = _policy_retry_clock
 
-    def _fast_then_slow() -> int:
-        if client.calls <= 4:
+    def _restarting_with_held_polls() -> int:
+        if client.calls % 4:
             return 502
-        clock.monotonic.return_value += 9.5
-        return 500
+        clock.monotonic.return_value += 12.0
+        return 504
 
-    client = _ScriptedPolicyClient(_fast_then_slow)
+    client = _ScriptedPolicyClient(_restarting_with_held_polls)
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
     try:
         body = await asyncio.to_thread(
@@ -12708,10 +12715,12 @@ async def test_hook_evaluate_endpoint_exhausts_connect_retry_budget(
         else:
             assert body == "", "PostToolUse must still fail open"
         sleeps = [call.args[0] for call in _policy_retry_clock.sleep.call_args_list]
-        assert sleeps[:4] == [1, 2, 4, 8]
-        assert all(delay == 10 for delay in sleeps[4:]), sleeps
         budget = native_policy_hook.claude_native_retry_budget_s(hook_event)
-        assert budget - 10 <= sum(sleeps) < budget, sleeps
+        # 1, 2, 4, 8, then 10 s, for as long as the next wait still ends inside the budget
+        expected: list[float] = []
+        while sum(expected) + min(2 ** len(expected), 10) < budget:
+            expected.append(min(2 ** len(expected), 10))
+        assert sleeps == expected, sleeps
         assert client.calls == len(sleeps) + 1
     finally:
         relay.close()

@@ -1406,7 +1406,7 @@ def test_evaluate_policy_direct_path_blocks_a_prompt_inside_its_default_timeout(
     assert claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)]) == 0
 
     assert json.loads(capsys.readouterr().out)["decision"] == "block"
-    assert 10.0 <= clock["t"] < 30.0, clock["t"]
+    assert 5.0 <= clock["t"] <= 15.0, clock["t"]
 
 
 @pytest.mark.parametrize(

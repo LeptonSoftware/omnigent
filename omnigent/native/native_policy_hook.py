@@ -71,13 +71,13 @@ _USER_PROMPT_SUBMIT = "UserPromptSubmit"
 # Claude-native retry budgets per hook event: long enough to ride out a server restart.
 _CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGETS_S: dict[str, float] = {
     _PRE_TOOL_USE: 120.0,
-    _USER_PROMPT_SUBMIT: 20.0,
+    _USER_PROMPT_SUBMIT: 15.0,
 }
 # Claude Code's default command-hook timeout: 600 s, 30 s on UserPromptSubmit. A
 # timed-out hook lets the call through, so claude-native gives up this much sooner.
 _CLAUDE_CODE_HOOK_TIMEOUTS_S: dict[str, float] = {_USER_PROMPT_SUBMIT: 30.0}
 _CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S = 600.0
-_CLAUDE_NATIVE_HOOK_TIMEOUT_MARGIN_S = 10.0
+_CLAUDE_NATIVE_HOOK_TIMEOUT_MARGIN_S = 15.0
 
 
 def claude_native_retry_budget_s(hook_event: str) -> float:
@@ -103,7 +103,7 @@ def claude_native_give_up_after_s(hook_event: str) -> float:
     hook must answer (failing closed) before that.
 
     :param hook_event: Hook event name, e.g. ``"UserPromptSubmit"``.
-    :returns: The hard limit in seconds, e.g. ``20.0``.
+    :returns: The hard limit in seconds, e.g. ``15.0``.
     """
     timeout_s = _CLAUDE_CODE_HOOK_TIMEOUTS_S.get(hook_event, _CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S)
     return timeout_s - _CLAUDE_NATIVE_HOOK_TIMEOUT_MARGIN_S
