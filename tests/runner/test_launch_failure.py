@@ -150,6 +150,23 @@ def test_missing_binary_quotes_a_short_shell_message_alone() -> None:
     assert diagnosis.cause.endswith("Its last error: bash: qwen: command not found")
 
 
+def test_missing_binary_quotes_the_latest_not_found_line() -> None:
+    output = "ls: /srv/x: No such file or directory\nretrying\nbash: qwen: command not found\n"
+    diagnosis = classify_terminal_failure(command="qwen", exit_status=127, output=output)
+    assert diagnosis is not None
+    assert diagnosis.cause.endswith("Its last error: bash: qwen: command not found")
+
+
+def test_missing_binary_does_not_join_short_rows_of_equal_length() -> None:
+    # Equal-length rows narrower than any real pane are separate lines, not a wrap.
+    rows = ["step one of launch is ok!!", "bash: q: command not found"]
+    assert len(rows[0]) == len(rows[1])
+    output = "\n".join(rows)
+    diagnosis = classify_terminal_failure(command="q", exit_status=127, output=output)
+    assert diagnosis is not None
+    assert "step one" not in diagnosis.cause
+
+
 def test_missing_binary_falls_back_to_the_last_line() -> None:
     diagnosis = classify_terminal_failure(
         command="claude", exit_status=127, output="loading\nexec failed: permission\n"
