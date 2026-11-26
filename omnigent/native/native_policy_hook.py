@@ -68,13 +68,16 @@ _POST_TOOL_USE = "PostToolUse"
 # direct-terminal prompts). It can block the prompt before the model runs.
 _USER_PROMPT_SUBMIT = "UserPromptSubmit"
 
-# Claude-native budgets per hook event: long enough to ride out a server restart,
-# each under that event's default Claude Code hook timeout (600 s, or 30 s for
-# UserPromptSubmit), which a session launched without an explicit timeout keeps.
+# Claude-native retry budgets per hook event: long enough to ride out a server restart.
 _CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGETS_S: dict[str, float] = {
     _PRE_TOOL_USE: 120.0,
     _USER_PROMPT_SUBMIT: 20.0,
 }
+# Claude Code's default command-hook timeout: 600 s, 30 s on UserPromptSubmit. A
+# timed-out hook lets the call through, so claude-native gives up this much sooner.
+_CLAUDE_CODE_HOOK_TIMEOUTS_S: dict[str, float] = {_USER_PROMPT_SUBMIT: 30.0}
+_CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S = 600.0
+_CLAUDE_NATIVE_HOOK_TIMEOUT_MARGIN_S = 10.0
 
 
 def claude_native_retry_budget_s(hook_event: str) -> float:
@@ -90,6 +93,20 @@ def claude_native_retry_budget_s(hook_event: str) -> float:
     return _CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGETS_S.get(
         hook_event, _EVALUATE_POLICY_RETRY_BUDGET_S
     )
+
+
+def claude_native_give_up_after_s(hook_event: str) -> float:
+    """
+    Seconds after which a claude-native evaluate call stops retrying, whatever re-armed it.
+
+    Claude Code kills a hook at its timeout and lets the call through, so the
+    hook must answer (failing closed) before that.
+
+    :param hook_event: Hook event name, e.g. ``"UserPromptSubmit"``.
+    :returns: The hard limit in seconds, e.g. ``20.0``.
+    """
+    timeout_s = _CLAUDE_CODE_HOOK_TIMEOUTS_S.get(hook_event, _CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S)
+    return timeout_s - _CLAUDE_NATIVE_HOOK_TIMEOUT_MARGIN_S
 
 
 # Reason surfaced when a tool call is denied because its policy verdict
@@ -616,6 +633,7 @@ def post_evaluate_with_retry(
     hook_label: str,
     reauth: Callable[[], dict[str, str] | None] | None = None,
     retry_budget_s: float | None = None,
+    give_up_after_s: float | None = None,
 ) -> tuple[httpx.Response, None] | tuple[None, str]:
     """
     POST to the Omnigent policy evaluate endpoint, retrying on transient errors.
@@ -672,6 +690,9 @@ def post_evaluate_with_retry(
         ``claude_native_retry_budget_s("PreToolUse")``; ``None`` uses
         :data:`_EVALUATE_POLICY_RETRY_BUDGET_S`. Must stay under the caller's
         hook timeout, or the harness kills the hook first.
+    :param give_up_after_s: Hard limit in seconds on all retrying, which no
+        held-poll re-arm extends, e.g. ``claude_native_give_up_after_s(event)``;
+        ``None`` sets none.
     :returns: ``(response, error)`` — on success, ``(response, None)``; on
         failure, ``(None, short_error_string)`` describing the last error so
         callers can surface it in the deny/block reason shown to the user.
@@ -684,6 +705,7 @@ def post_evaluate_with_retry(
     request_body = {**eval_request, "_omnigent_elicitation_id": elicitation_id}
     budget_s = _EVALUATE_POLICY_RETRY_BUDGET_S if retry_budget_s is None else retry_budget_s
     deadline = time.monotonic() + budget_s
+    give_up_at = None if give_up_after_s is None else time.monotonic() + give_up_after_s
     backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
     timeout = httpx.Timeout(read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S)
     reauthed = False
@@ -744,10 +766,14 @@ def post_evaluate_with_retry(
                 f": {body_preview}" if body_preview else ""
             )
             if status == 429:
-                retry_delay_s = bounded_retry_after_seconds(
-                    exc.response,
-                    fallback=backoff_s,
-                    max_delay=_EVALUATE_POLICY_MAX_RETRY_AFTER_S,
+                # Floored, so a tiny Retry-After can't spin through the budget.
+                retry_delay_s = max(
+                    _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S,
+                    bounded_retry_after_seconds(
+                        exc.response,
+                        fallback=backoff_s,
+                        max_delay=_EVALUATE_POLICY_MAX_RETRY_AFTER_S,
+                    ),
                 )
                 print(
                     f"omnigent {hook_label}: Omnigent returned 429; retrying",
@@ -798,6 +824,12 @@ def post_evaluate_with_retry(
                 f"omnigent {hook_label}: held poll severed by the gateway; re-parking: {exc}",
                 file=sys.stderr,
             )
+        next_wait_s = (
+            _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S if held_poll_severed else retry_delay_s
+        )
+        if give_up_at is not None and time.monotonic() + next_wait_s >= give_up_at:
+            print(f"omnigent {hook_label}: giving up before the hook timeout", file=sys.stderr)
+            return None, f"gave up before the hook timeout (last error: {last_error})"
         if held_poll_severed:
             # The re-park mechanism working as intended, not a transient fault:
             # the budget and backoff are for fast failures, and the accepted

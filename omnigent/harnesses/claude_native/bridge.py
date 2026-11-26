@@ -2523,8 +2523,8 @@ def build_hook_settings(
         evaluate_policy_hook: _JsonObject = {
             "type": "command",
             "command": evaluate_policy_command,
-            # A timed-out PreToolUse hook lets the tool run, and the default
-            # (600 s; 30 s on UserPromptSubmit) is shorter than a parked ASK.
+            # A timed-out hook lets the call through, and the default (600 s;
+            # 30 s on UserPromptSubmit) is shorter than a parked ASK.
             "timeout": 86400,
         }
 
@@ -6860,6 +6860,7 @@ def _tool_relay_handler_factory(
                 _EVALUATE_POLICY_MAX_RETRY_AFTER_S,
                 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S,
                 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S,
+                claude_native_give_up_after_s,
                 claude_native_retry_budget_s,
                 evaluation_response_to_hook_output,
                 fail_ask_hook_output,
@@ -6897,6 +6898,7 @@ def _tool_relay_handler_factory(
             non_connect_failures = 0
             budget_s = claude_native_retry_budget_s(hook_event)
             deadline = time.monotonic() + budget_s
+            give_up_at = time.monotonic() + claude_native_give_up_after_s(hook_event)
             backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
             retry_delay = 0.4
 
@@ -6921,6 +6923,9 @@ def _tool_relay_handler_factory(
 
             while non_connect_failures < 3:
                 if attempts:
+                    if time.monotonic() + retry_delay >= give_up_at:
+                        last_error = f"gave up before the hook timeout ({last_error})"
+                        break
                     time.sleep(retry_delay)
                 attempts += 1
                 retry_delay = 0.4
@@ -6944,7 +6949,8 @@ def _tool_relay_handler_factory(
                     last_error = f"server returned HTTP {resp.status_code}"
                     # A restarting server's proxy answers these at once for as long
                     # as the restart takes, so they back off like a refused connect.
-                    if _rearm_if_held(attempt_started) or resp.status_code not in (
+                    severed = _rearm_if_held(attempt_started)
+                    if severed or resp.status_code not in (
                         HTTPStatus.TOO_MANY_REQUESTS,
                         HTTPStatus.BAD_GATEWAY,
                         HTTPStatus.SERVICE_UNAVAILABLE,
@@ -6952,10 +6958,13 @@ def _tool_relay_handler_factory(
                     ):
                         non_connect_failures += 1
                     elif not _back_off_within_budget(
-                        bounded_retry_after_seconds(
-                            resp,
-                            fallback=backoff_s,
-                            max_delay=_EVALUATE_POLICY_MAX_RETRY_AFTER_S,
+                        max(
+                            _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S,
+                            bounded_retry_after_seconds(
+                                resp,
+                                fallback=backoff_s,
+                                max_delay=_EVALUATE_POLICY_MAX_RETRY_AFTER_S,
+                            ),
                         )
                         if resp.status_code == HTTPStatus.TOO_MANY_REQUESTS
                         else None

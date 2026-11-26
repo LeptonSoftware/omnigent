@@ -1215,12 +1215,13 @@ def test_build_hook_settings_omits_policy_hooks_without_omnigent_server_url(
         )
 
 
-def test_evaluate_policy_hook_timeout_outlasts_the_restart_budget(tmp_path: Path) -> None:
+def test_evaluate_policy_hooks_answer_before_claude_code_times_them_out(tmp_path: Path) -> None:
     """
-    Every evaluate-policy hook entry gives Claude Code a timeout past the retry budget.
+    Every evaluate-policy hook stops retrying before Claude Code could time it out.
 
-    A timed-out PreToolUse hook lets the tool run unchecked, so the hook must
-    outlast its retry budget and a parked ASK, not Claude Code's default.
+    A timed-out hook lets the call through. New sessions set an explicit timeout
+    that outlasts a parked ASK, but a session launched before it has Claude Code's
+    default (600 s; 30 s on UserPromptSubmit), so the give-up limit sits under that.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -1230,32 +1231,60 @@ def test_evaluate_policy_hook_timeout_outlasts_the_restart_budget(tmp_path: Path
         ap_server_url="http://127.0.0.1:8787",
         ap_auth_headers={"Authorization": "Bearer t"},
     )
-    entries = [
-        hook
-        for event in ("PreToolUse", "PostToolUse", "UserPromptSubmit")
-        for group in settings["hooks"][event]
-        for hook in group["hooks"]
-        if "evaluate-policy" in str(hook.get("command", ""))
-    ]
-    assert len(entries) == 3, entries
-    budget = max(native_policy_hook._CLAUDE_NATIVE_EVALUATE_POLICY_RETRY_BUDGETS_S.values())
-    for hook in entries:
-        assert isinstance(hook.get("timeout"), int), hook
-        assert hook["timeout"] > budget, hook
+    defaults = {"PreToolUse": 600.0, "PostToolUse": 600.0, "UserPromptSubmit": 30.0}
+    seen = 0
+    for event, default_timeout_s in defaults.items():
+        for group in settings["hooks"][event]:
+            for hook in group["hooks"]:
+                if "evaluate-policy" not in str(hook.get("command", "")):
+                    continue
+                seen += 1
+                assert hook["timeout"] == 86400, (event, hook)
+                give_up_s = native_policy_hook.claude_native_give_up_after_s(event)
+                assert native_policy_hook.claude_native_retry_budget_s(event) <= give_up_s
+                assert give_up_s <= default_timeout_s - 5.0, event
+    assert seen == 3
 
 
-def test_claude_native_budgets_stay_under_claude_code_default_timeouts() -> None:
-    """
-    Each event's budget fits inside Claude Code's default hook timeout.
+@pytest.mark.parametrize("event", ["PreToolUse", "PostToolUse", "UserPromptSubmit"])
+def test_evaluate_policy_direct_path_passes_each_events_own_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    event: str,
+) -> None:
+    """The direct path passes each event its own budget and give-up limit, not PreToolUse's."""
+    seen: dict[str, object] = {}
 
-    A session launched before the hook entries carried an explicit timeout
-    runs with the defaults (600 s; 30 s for UserPromptSubmit). A budget past
-    one would get the hook killed and the call let through.
-    """
-    budget = native_policy_hook.claude_native_retry_budget_s
-    assert 60.0 <= budget("PreToolUse") < 600.0
-    assert budget("UserPromptSubmit") < 30.0
-    assert budget("PostToolUse") == native_policy_hook._EVALUATE_POLICY_RETRY_BUDGET_S
+    def _capture(*args: object, **kwargs: object) -> tuple[None, str]:
+        del args
+        seen.update(kwargs)
+        return None, "server unreachable"
+
+    monkeypatch.setattr(native_policy_hook, "post_evaluate_with_retry", _capture)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_limits", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer test-token"},
+    )
+    payload: dict[str, object] = {"hook_event_name": event}
+    if event == "UserPromptSubmit":
+        payload["prompt"] = "hello"
+    else:
+        payload.update(tool_name="Bash", tool_input={"command": "ls"})
+        if event == "PostToolUse":
+            payload["tool_response"] = {"stdout": ""}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    assert claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)]) == 0
+    capsys.readouterr()
+
+    assert seen["retry_budget_s"] == native_policy_hook.claude_native_retry_budget_s(event)
+    assert seen["give_up_after_s"] == native_policy_hook.claude_native_give_up_after_s(event)
 
 
 def test_evaluate_policy_direct_path_waits_out_a_60s_restart(
@@ -1378,6 +1407,75 @@ def test_evaluate_policy_direct_path_blocks_a_prompt_inside_its_default_timeout(
 
     assert json.loads(capsys.readouterr().out)["decision"] == "block"
     assert 10.0 <= clock["t"] < 30.0, clock["t"]
+
+
+@pytest.mark.parametrize(
+    ("event", "default_timeout_s", "decision_path"),
+    [
+        ("UserPromptSubmit", 30.0, ("decision",)),
+        ("PreToolUse", 600.0, ("hookSpecificOutput", "permissionDecision")),
+    ],
+)
+def test_evaluate_policy_direct_path_answers_before_the_hook_timeout_on_slow_5xx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    event: str,
+    default_timeout_s: float,
+    decision_path: tuple[str, ...],
+) -> None:
+    """
+    A 502 that takes 12 s each time re-arms as a severed poll, but never past the hook timeout.
+
+    Each slow 5xx looks like a gateway cutting a parked poll, which re-arms
+    the budget. Only the give-up limit stops it before Claude Code kills the
+    hook and lets the call through.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        native_policy_hook.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
+    )
+
+    class _SlowBadGateway:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _SlowBadGateway:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            clock["t"] += 12.0
+            return httpx.Response(502, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _SlowBadGateway)
+    bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_slow", workspace=tmp_path)
+    write_active_session_id(bridge_dir, "conv_active")
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer test-token"},
+    )
+    payload = (
+        {"hook_event_name": event, "prompt": "hello"}
+        if event == "UserPromptSubmit"
+        else {"hook_event_name": event, "tool_name": "Bash", "tool_input": {"command": "ls"}}
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    assert claude_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    for key in decision_path:
+        output = output[key]
+    assert output in ("block", "ask")
+    assert clock["t"] < default_timeout_s, clock["t"]
 
 
 def test_evaluate_policy_pre_tool_use_converts_and_returns_deny(

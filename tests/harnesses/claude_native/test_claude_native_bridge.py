@@ -12540,6 +12540,66 @@ async def test_hook_evaluate_endpoint_user_prompt_gives_up_inside_its_default_ti
 
 
 @pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_prompt_never_outlives_its_hook_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
+) -> None:
+    """Fast 502s, then 500s that take 9.5 s each, still block inside the 30 s default."""
+    clock = _policy_retry_clock
+
+    def _fast_then_slow() -> int:
+        if client.calls <= 4:
+            return 502
+        clock.monotonic.return_value += 9.5
+        return 500
+
+    client = _ScriptedPolicyClient(_fast_then_slow)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _USER_PROMPT_SUBMIT_PAYLOAD,
+        )
+        assert json.loads(body)["decision"] == "block"
+        assert clock.monotonic() < 30.0, clock.monotonic()
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_tool_call_never_outlives_its_hook_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
+) -> None:
+    """Held 504s that each re-arm a fresh window of fast 502s still ask inside 600 s."""
+    clock = _policy_retry_clock
+    state = {"held_next": True}
+
+    def _held_then_restarting() -> int:
+        if state["held_next"]:
+            state["held_next"] = False
+            clock.monotonic.return_value += 100.0
+            return 504
+        if clock.sleep.call_count and clock.sleep.call_args.args[0] >= 10:
+            state["held_next"] = True
+        return 502
+
+    client = _ScriptedPolicyClient(_held_then_restarting)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        assert json.loads(body)["hookSpecificOutput"]["permissionDecision"] == "ask"
+        assert clock.monotonic() < 600.0, clock.monotonic()
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
 async def test_hook_evaluate_endpoint_rearms_the_budget_after_a_held_poll_is_severed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
 ) -> None:
@@ -12567,6 +12627,29 @@ async def test_hook_evaluate_endpoint_rearms_the_budget_after_a_held_poll_is_sev
         )
         assert body == "", f"a restart after a severed poll must end in the verdict, got {body!r}"
         assert len({b["_omnigent_elicitation_id"] for b in client.bodies if b}) == 1
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_floors_a_tiny_retry_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
+) -> None:
+    """A Retry-After of 0.01 s waits the initial backoff, not a near-busy loop."""
+    limited = SimpleNamespace(
+        status_code=429, content=b"", headers=httpx.Headers({"Retry-After": "0.01"})
+    )
+    client = _ScriptedPolicyClient(limited, {"result": "POLICY_ACTION_ALLOW"})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        assert body == ""
+        assert [call.args[0] for call in _policy_retry_clock.sleep.call_args_list] == [1.0]
     finally:
         relay.close()
 

@@ -564,6 +564,26 @@ def test_post_evaluate_with_retry_bounds_retry_after(
     assert sleeps == [10.0]
 
 
+def test_post_evaluate_with_retry_floors_a_tiny_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``Retry-After`` of 0.01 s waits the initial backoff, not a near-busy loop."""
+    request = httpx.Request("POST", "https://ap/x")
+    responses = [
+        httpx.Response(429, headers={"Retry-After": "0.01"}, request=request),
+        httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"}, request=request),
+    ]
+    sleeps: list[float] = []
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _make_sequence_client(responses, []))
+    monkeypatch.setattr(native_policy_hook.time, "sleep", sleeps.append)
+
+    resp, error = post_evaluate_with_retry("https://ap/x", {}, {"event": {}}, 5.0, "hook")
+
+    assert resp is responses[1]
+    assert error is None
+    assert sleeps == [1.0]
+
+
 def test_post_evaluate_with_retry_fails_closed_after_repeated_429(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
