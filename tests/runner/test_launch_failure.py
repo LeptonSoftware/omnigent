@@ -109,6 +109,64 @@ def test_classifies_missing_binary_when_launch_exits_127_with_shell_message() ->
     assert diagnosis.title == "Agent command not found"
 
 
+# The cswap rescue's broken respawn, as the pane showed it: env's message
+# wrapped at 80 columns, then env's hint and tmux's footer.
+_ENV_ERROR = (
+    "env: ‘claude --model claude-opus-5-5 --mcp-config "
+    '{"mcpServers":{"omnigent":{"command":"/home/u/.local/share/uv/tools/omnigent/bin/python"}}}'
+    " --add-dir /tmp/omnigent-1000/claude-native/67b67d2ec12b7c1fa68fd79df453a0aa/agent-skills’"
+    ": No such file or directory"
+)
+_RESPAWN_PANE = "\n".join(
+    [
+        *(_ENV_ERROR[i : i + 80] for i in range(0, len(_ENV_ERROR), 80)),
+        "env: use -[v]S to pass options in shebang lines",
+        "Pane is dead (status 127, Wed Nov 25 19:15:03 2026)",
+        "",
+    ]
+)
+
+
+def test_missing_binary_quotes_the_wrapped_error_line() -> None:
+    diagnosis = classify_terminal_failure(command="claude", exit_status=127, output=_RESPAWN_PANE)
+    assert diagnosis is not None
+    assert diagnosis.title == "Agent command not found"
+    assert "Its last error: env: ‘claude --model" in diagnosis.cause
+    assert diagnosis.cause.endswith("agent-skills’: No such file or directory")
+    assert "Pane is dead" not in diagnosis.cause
+    assert "shebang" not in diagnosis.cause
+    assert len(diagnosis.cause) <= 256
+    assert diagnosis.remediation is not None
+    assert "Check the command named in that error" in diagnosis.remediation
+
+
+def test_missing_binary_quotes_a_short_shell_message_alone() -> None:
+    diagnosis = classify_terminal_failure(
+        command="qwen",
+        exit_status=127,
+        output="starting qwen\nbash: qwen: command not found\n\nPane is dead (status 127)\n",
+    )
+    assert diagnosis is not None
+    assert diagnosis.cause.endswith("Its last error: bash: qwen: command not found")
+
+
+def test_missing_binary_falls_back_to_the_last_line() -> None:
+    diagnosis = classify_terminal_failure(
+        command="claude", exit_status=127, output="loading\nexec failed: permission\n"
+    )
+    assert diagnosis is not None
+    assert diagnosis.cause.endswith("Its last error: exec failed: permission")
+
+
+@pytest.mark.parametrize("output", ["", "\n\n", "Pane is dead (status 127)\n"])
+def test_missing_binary_without_an_error_line_keeps_the_generic_cause(output: str) -> None:
+    diagnosis = classify_terminal_failure(command="claude", exit_status=127, output=output)
+    assert diagnosis is not None
+    assert "Its last error" not in diagnosis.cause
+    assert diagnosis.remediation is not None
+    assert "setup" in diagnosis.remediation
+
+
 # A running agent's scrollback often holds a tool's "No such file or directory";
 # only the launch's own exit 127 means the command never started.
 _TOOL_SCROLLBACK = (
