@@ -195,6 +195,18 @@ def test_missing_binary_does_not_join_a_long_unrelated_row_above_the_error() -> 
     assert diagnosis.cause.endswith("Its last error: bash: claude: command not found")
 
 
+def test_missing_binary_stops_at_a_full_width_not_found_row() -> None:
+    # The error fills its last row exactly; the hint after it is not part of it.
+    tail = "agent-skills: No such file or directory"
+    rows = ["env: ‘claude " + "x" * 67, "y" * (80 - len(tail)) + tail, "env: use -[v]S"]
+    assert len(rows[0]) == len(rows[1]) == 80
+    diagnosis = classify_terminal_failure(
+        command="claude", exit_status=127, output="\n".join(rows)
+    )
+    assert diagnosis is not None
+    assert diagnosis.cause.endswith(tail)
+
+
 def test_missing_binary_quotes_an_already_joined_capture() -> None:
     # capture-pane -J output: the error is one long row, followed by env's hint.
     hint = "env: use -[v]S to pass options in shebang lines"

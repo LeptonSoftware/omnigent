@@ -131,8 +131,7 @@ def _last_error_line(output: str) -> str | None:
     The message ends the row the marker ends on, so only rows before it are joined: those
     filled to the pane width. ``None`` when no row carries a marker.
     """
-    rows = [r.rstrip() for r in output.splitlines()]
-    rows = [r for r in rows if r and not r.startswith("Pane is dead")]
+    rows = [r for r in (ln.rstrip() for ln in output.splitlines()) if r]
     width = max((len(r) for r in rows), default=0)
     # One longest row is just a long line; a pane that wrapped fills several rows to its width.
     wraps = width >= _MIN_WRAP_WIDTH and sum(len(r) == width for r in rows) >= 2
