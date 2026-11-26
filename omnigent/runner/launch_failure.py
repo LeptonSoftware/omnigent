@@ -125,32 +125,45 @@ _ERROR_LINE_MAX = 140
 _MIN_WRAP_WIDTH = 60
 
 
-def _logical_lines(output: str) -> list[str]:
-    """Non-empty pane lines, with rows the pane wrapped joined back together."""
+def _last_error_line(output: str) -> str | None:
+    """The shell's last not-found message in *output*, re-joined if the pane wrapped it.
+
+    The message ends the row the marker ends on, so only rows before it are joined: those
+    filled to the pane width. ``None`` when no row carries a marker.
+    """
     rows = [r.rstrip() for r in output.splitlines()]
     rows = [r for r in rows if r and not r.startswith("Pane is dead")]
     width = max((len(r) for r in rows), default=0)
-    lines: list[str] = []
-    joining = False
-    for row in rows:
-        if joining:
-            lines[-1] += row
-        else:
-            lines.append(row)
-        # A wrapped message fills every row but its last to the pane width.
-        joining = width >= _MIN_WRAP_WIDTH and len(row) == width
-    return lines
+    # One longest row is just a long line; a pane that wrapped fills several rows to its width.
+    wraps = width >= _MIN_WRAP_WIDTH and sum(len(r) == width for r in rows) >= 2
 
+    def wrapped(i: int) -> bool:
+        return wraps and len(rows[i]) == width
 
-def _last_error_line(output: str) -> str | None:
-    """The shell's not-found message from *output*, else its last line."""
-    lines = _logical_lines(output)
-    if not lines:
+    def has_marker(text: str) -> bool:
+        return any(m in text.lower() for m in _NOT_FOUND_LINE_MARKERS)
+
+    # A marker can itself straddle a wrap, so test each row joined to a wrapped row above.
+    end = next(
+        (
+            i
+            for i in range(len(rows) - 1, -1, -1)
+            if has_marker(rows[i])
+            or (
+                i > 0
+                and wrapped(i - 1)
+                and not has_marker(rows[i - 1])
+                and has_marker(rows[i - 1] + rows[i])
+            )
+        ),
+        None,
+    )
+    if end is None:
         return None
-    line = next(
-        (ln for ln in reversed(lines) if any(m in ln.lower() for m in _NOT_FOUND_LINE_MARKERS)),
-        lines[-1],
-    ).strip()
+    start = end
+    while start > 0 and wrapped(start - 1):
+        start -= 1
+    line = "".join(rows[start : end + 1]).strip()
     if len(line) > _ERROR_LINE_MAX:
         head = _ERROR_LINE_MAX * 2 // 3
         line = f"{line[:head]}…{line[-(_ERROR_LINE_MAX - head - 1) :]}"

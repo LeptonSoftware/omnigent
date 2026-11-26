@@ -167,12 +167,42 @@ def test_missing_binary_does_not_join_short_rows_of_equal_length() -> None:
     assert "step one" not in diagnosis.cause
 
 
-def test_missing_binary_falls_back_to_the_last_line() -> None:
+def test_missing_binary_without_a_not_found_line_keeps_the_generic_cause() -> None:
     diagnosis = classify_terminal_failure(
         command="claude", exit_status=127, output="loading\nexec failed: permission\n"
     )
     assert diagnosis is not None
-    assert diagnosis.cause.endswith("Its last error: exec failed: permission")
+    assert "Its last error" not in diagnosis.cause
+
+
+def test_missing_binary_never_joins_the_row_after_the_error() -> None:
+    # The not-found line is the longest row; the short row after it is not a wrap.
+    output = (
+        "bash: /home/user/.local/bin/claude-wrapper-script-xyz: No such file or directory\nexit\n"
+    )
+    diagnosis = classify_terminal_failure(command="claude", exit_status=127, output=output)
+    assert diagnosis is not None
+    assert diagnosis.cause.endswith("claude-wrapper-script-xyz: No such file or directory")
+
+
+def test_missing_binary_does_not_join_a_long_unrelated_row_above_the_error() -> None:
+    output = (
+        "Launching claude with config /home/user/.config/omnigent/agents/claude.yaml now\n"
+        "bash: claude: command not found\n"
+    )
+    diagnosis = classify_terminal_failure(command="claude", exit_status=127, output=output)
+    assert diagnosis is not None
+    assert diagnosis.cause.endswith("Its last error: bash: claude: command not found")
+
+
+def test_missing_binary_quotes_an_already_joined_capture() -> None:
+    # capture-pane -J output: the error is one long row, followed by env's hint.
+    hint = "env: use -[v]S to pass options in shebang lines"
+    output = f"{_ENV_ERROR}\n{hint}\nPane is dead (status 127)\n"
+    diagnosis = classify_terminal_failure(command="claude", exit_status=127, output=output)
+    assert diagnosis is not None
+    assert "Its last error: env: ‘claude --model" in diagnosis.cause
+    assert diagnosis.cause.endswith("agent-skills’: No such file or directory")
 
 
 @pytest.mark.parametrize("output", ["", "\n\n", "Pane is dead (status 127)\n"])
