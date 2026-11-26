@@ -99,14 +99,42 @@ def test_classifies_missing_binary_by_exit_code() -> None:
     assert diagnosis.title == "Agent command not found"
 
 
-def test_classifies_missing_binary_by_output() -> None:
+def test_classifies_missing_binary_when_launch_exits_127_with_shell_message() -> None:
     diagnosis = classify_terminal_failure(
-        command="qwen",
-        exit_status=None,
-        output="bash: qwen: command not found",
+        command="claude",
+        exit_status=127,
+        output="bash: claude: command not found",
     )
     assert diagnosis is not None
     assert diagnosis.title == "Agent command not found"
+
+
+# A running agent's scrollback often holds a tool's "No such file or directory";
+# only the launch's own exit 127 means the command never started.
+_TOOL_SCROLLBACK = (
+    "● Bash(ls /srv/missing)\n"
+    "  ⎿  ls: cannot access '/srv/missing': No such file or directory\n"
+    "● Bash(foo --version)\n"
+    "  ⎿  bash: foo: command not found\n"
+)
+
+
+@pytest.mark.parametrize(
+    "exit_status",
+    [
+        pytest.param(None, id="status-unknown"),
+        pytest.param(137, id="killed-after-tool-printed-phrase"),
+        pytest.param(1, id="agent-error-exit"),
+        pytest.param(0, id="clean-exit"),
+    ],
+)
+def test_later_exit_with_missing_phrase_in_scrollback_is_not_missing_binary(
+    exit_status: int | None,
+) -> None:
+    diagnosis = classify_terminal_failure(
+        command="claude", exit_status=exit_status, output=_TOOL_SCROLLBACK
+    )
+    assert diagnosis is None
 
 
 def test_root_wins_over_generic_auth_when_both_markers_present() -> None:

@@ -107,12 +107,10 @@ _AUTH_MARKERS = (
 )
 
 # --- binary missing -----------------------------------------------------------
-_MISSING_MARKERS = (
-    "command not found",
-    "no such file or directory",
-    "not recognized as an internal or external command",
-    "executable file not found",
-)
+# Exit 127 is the shell reporting that the command never started. Output alone
+# is not evidence: any tool can print "no such file or directory" before a
+# later, unrelated exit.
+_COMMAND_NOT_FOUND_EXIT = 127
 
 # --- CLI rejected its arguments -----------------------------------------------
 # Usage errors from the agent CLI or a wrapper around it, e.g. a flag added by a
@@ -144,7 +142,7 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     ),
     _TerminalMatcher(
         "missing_binary",
-        lambda s: s.exit_code == 127 or s.output_contains_any(_MISSING_MARKERS),
+        lambda s: s.exit_code == _COMMAND_NOT_FOUND_EXIT,
         FailureDiagnosis(
             title="Agent command not found",
             cause=(
